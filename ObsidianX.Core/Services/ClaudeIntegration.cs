@@ -74,7 +74,7 @@ public class ClaudeIntegration
         File.WriteAllText(_claudeMdPath, sb.ToString());
     }
 
-    public async Task<string> QueryClaude(string prompt, string context = "")
+    public async Task<string> QueryClaude(string prompt, string context = "", int timeoutSeconds = 120)
     {
         var fullPrompt = string.IsNullOrEmpty(context)
             ? prompt
@@ -94,16 +94,25 @@ public class ClaudeIntegration
         using var proc = Process.Start(psi);
         if (proc == null) return "Error: Could not start Claude Code";
 
-        var outputTask = proc.StandardOutput.ReadToEndAsync();
-        var errorTask = proc.StandardError.ReadToEndAsync();
-        await proc.WaitForExitAsync();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+        try
+        {
+            var outputTask = proc.StandardOutput.ReadToEndAsync(cts.Token);
+            var errorTask = proc.StandardError.ReadToEndAsync(cts.Token);
+            await proc.WaitForExitAsync(cts.Token);
 
-        var error = await errorTask;
-        if (proc.ExitCode != 0 && !string.IsNullOrEmpty(error))
-            return $"Error: {error.Trim()}";
+            var error = await errorTask;
+            if (proc.ExitCode != 0 && !string.IsNullOrEmpty(error))
+                return $"Error: {error.Trim()}";
 
-        var output = await outputTask;
-        return output.Trim();
+            var output = await outputTask;
+            return output.Trim();
+        }
+        catch (OperationCanceledException)
+        {
+            try { proc.Kill(entireProcessTree: true); } catch { /* best effort */ }
+            return $"Error: Claude query timed out after {timeoutSeconds} seconds. Try a shorter question.";
+        }
     }
 
     public ConnectionStatus CheckConnection()

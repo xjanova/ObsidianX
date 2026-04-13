@@ -85,6 +85,7 @@ public partial class MainWindow : Window
         pulse.Begin();
 
         InitializeIdentity();
+        LoadSettingsFromFile();
         IndexVault();
         CheckClaudeConnection();
 
@@ -110,7 +111,14 @@ public partial class MainWindow : Window
         // Initialize markdown editor
         _mdEditor = new MarkdownEditor(MarkdownEditorControl, MarkdownPreview, _vaultPath);
         _mdEditor.WikiLinkClicked += OnWikiLinkClicked;
-        _mdEditor.FileSaved += f => { StatusText.Text = $"Saved: {Path.GetFileName(f)}"; IndexVault(); };
+        _mdEditor.FileSaved += f =>
+        {
+            StatusText.Text = $"Saved: {Path.GetFileName(f)}";
+            IndexVault();
+            _dashPhysics.LoadFromGraph(_graph);
+            _graphPhysics.LoadFromGraph(_graph);
+            UpdateUI();
+        };
         _mdEditor.DirtyStateChanged += dirty => EditorDirtyIndicator.Text = dirty ? " *" : "";
         MarkdownEditorControl.TextArea.Caret.PositionChanged += (_, _) =>
         {
@@ -582,7 +590,11 @@ public partial class MainWindow : Window
                 var uri = $"obsidian://open?vault={Uri.EscapeDataString(Path.GetFileName(_vaultPath))}&file={Uri.EscapeDataString(Path.GetRelativePath(_vaultPath, file))}";
                 Process.Start(new ProcessStartInfo(uri) { UseShellExecute = true });
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Open in Obsidian failed: {ex.Message}");
+                StatusText.Text = "Could not open file in Obsidian";
+            }
         }
     }
 
@@ -744,6 +756,8 @@ public partial class MainWindow : Window
         if (tag == "Peers") RefreshPeersList();
         if (tag == "Editor") RefreshBacklinks();
         if (tag == "Search") SearchBox.Focus();
+        if (tag == "Network") _ = RefreshNetworkStats();
+        if (tag == "Vault") RefreshVaultTree();
     }
 
     // ═══════════════════════════════════════
@@ -767,11 +781,48 @@ public partial class MainWindow : Window
         // Save any unsaved editor work
         _mdEditor?.Save();
 
+        // Persist settings
+        SaveSettingsToFile();
+
         // Unsubscribe render loop
         CompositionTarget.Rendering -= OnRenderFrame;
 
         // Disconnect from network
-        try { await _network.DisconnectAsync(); } catch { }
+        try { await _network.DisconnectAsync(); }
+        catch (Exception ex) { Debug.WriteLine($"Disconnect error: {ex.Message}"); }
+    }
+
+    // ═══════════════════════════════════════
+    // NETWORK STATS
+    // ═══════════════════════════════════════
+    private async Task RefreshNetworkStats()
+    {
+        if (!_network.IsConnected)
+        {
+            NetStatNodes.Text = "—";
+            NetStatWords.Text = "—";
+            NetStatShares.Text = "—";
+            return;
+        }
+
+        try
+        {
+            var stats = await _network.GetNetworkStatsAsync();
+            if (stats is Newtonsoft.Json.Linq.JObject obj)
+            {
+                NetworkPeerCount.Text = obj["TotalPeers"]?.ToString() ?? "0";
+                NetStatNodes.Text = (obj["TotalKnowledge"]?.ToObject<int>() ?? 0).ToString("N0");
+                NetStatWords.Text = (obj["TotalWords"]?.ToObject<int>() ?? 0).ToString("N0");
+
+                var categories = obj["Categories"] as Newtonsoft.Json.Linq.JObject;
+                NetStatShares.Text = categories?.Count.ToString() ?? "0";
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Network stats error: {ex.Message}");
+            StatusText.Text = "Could not fetch network stats";
+        }
     }
 
     private void CopyAddress_Click(object s, MouseButtonEventArgs e)
@@ -864,7 +915,10 @@ public partial class MainWindow : Window
         {
             await _network.DisconnectAsync();
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Disconnect error: {ex.Message}");
+        }
         JoinNetworkBtn.Content = "\U0001F310 Join ObsidianX Network";
         JoinNetworkBtn.IsEnabled = true;
         LeaveNetworkBtn.Visibility = Visibility.Collapsed;
@@ -1046,7 +1100,8 @@ public partial class MainWindow : Window
                 parent.Items.Add(new TreeViewItem { Header = $"\U0001F4C4 {name}", Foreground = color, Tag = file });
             }
         }
-        catch { }
+        catch (UnauthorizedAccessException) { /* Skip folders we can't read */ }
+        catch (IOException ex) { Debug.WriteLine($"Tree scan error: {ex.Message}"); }
     }
 
     private static Color GetCategoryColor(KnowledgeCategory cat) => cat switch
@@ -1461,7 +1516,41 @@ public partial class MainWindow : Window
         var url = SettingsServerUrl.Text.Trim();
         if (string.IsNullOrEmpty(url)) return;
         _serverUrl = url;
-        StatusText.Text = $"Server URL updated to: {url}";
+        SaveSettingsToFile();
+        StatusText.Text = $"Server URL saved: {url}";
+    }
+
+    private string SettingsFilePath => Path.Combine(_vaultPath, ".obsidianx", "settings.json");
+
+    private void SaveSettingsToFile()
+    {
+        try
+        {
+            var dir = Path.GetDirectoryName(SettingsFilePath)!;
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            var settings = new Dictionary<string, string>
+            {
+                ["ServerUrl"] = _serverUrl,
+                ["BrainName"] = _identity.DisplayName
+            };
+            File.WriteAllText(SettingsFilePath,
+                Newtonsoft.Json.JsonConvert.SerializeObject(settings, Newtonsoft.Json.Formatting.Indented));
+        }
+        catch (Exception ex) { Debug.WriteLine($"Settings save error: {ex.Message}"); }
+    }
+
+    private void LoadSettingsFromFile()
+    {
+        try
+        {
+            if (!File.Exists(SettingsFilePath)) return;
+            var json = File.ReadAllText(SettingsFilePath);
+            var settings = Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, string>>(json);
+            if (settings == null) return;
+            if (settings.TryGetValue("ServerUrl", out var url) && !string.IsNullOrEmpty(url))
+                _serverUrl = url;
+        }
+        catch (Exception ex) { Debug.WriteLine($"Settings load error: {ex.Message}"); }
     }
 
     // ═══════════════════════════════════════
@@ -1649,7 +1738,7 @@ public partial class MainWindow : Window
                     results.Add((file, title, context, matches.Count));
                 }
             }
-            catch { }
+            catch (IOException) { /* Skip files that can't be read */ }
         }
 
         if (results.Count == 0)
@@ -1990,7 +2079,7 @@ public partial class MainWindow : Window
                 if (updated != content)
                     File.WriteAllText(file, updated);
             }
-            catch { }
+            catch (IOException ex) { Debug.WriteLine($"Wiki-link update skipped for {file}: {ex.Message}"); }
         }
     }
 

@@ -546,6 +546,36 @@
                                                     </StackPanel>
                                                 </Grid>
                                             </Border>
+                                            <!-- Network Stats -->
+                                            <Grid Margin="0,12,0,0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <StackPanel Grid.Column="0" HorizontalAlignment="Center">
+                                                    <TextBlock x:Name="NetStatNodes" Text="0" FontSize="18" FontWeight="Bold"
+                                                               Foreground="{StaticResource NeonCyanBrush}" HorizontalAlignment="Center"
+                                                               FontFamily="{StaticResource MonoFont}"/>
+                                                    <TextBlock Text="Nodes" FontSize="9" Foreground="{StaticResource TextMutedBrush}"
+                                                               HorizontalAlignment="Center"/>
+                                                </StackPanel>
+                                                <StackPanel Grid.Column="1" HorizontalAlignment="Center">
+                                                    <TextBlock x:Name="NetStatWords" Text="0" FontSize="18" FontWeight="Bold"
+                                                               Foreground="{StaticResource NeonGreenBrush}" HorizontalAlignment="Center"
+                                                               FontFamily="{StaticResource MonoFont}"/>
+                                                    <TextBlock Text="Words" FontSize="9" Foreground="{StaticResource TextMutedBrush}"
+                                                               HorizontalAlignment="Center"/>
+                                                </StackPanel>
+                                                <StackPanel Grid.Column="2" HorizontalAlignment="Center">
+                                                    <TextBlock x:Name="NetStatShares" Text="0" FontSize="18" FontWeight="Bold"
+                                                               Foreground="{StaticResource NeonPinkBrush}" HorizontalAlignment="Center"
+                                                               FontFamily="{StaticResource MonoFont}"/>
+                                                    <TextBlock Text="Shares" FontSize="9" Foreground="{StaticResource TextMutedBrush}"
+                                                               HorizontalAlignment="Center"/>
+                                                </StackPanel>
+                                            </Grid>
+
                                             <Button x:Name="JoinNetworkBtn" Content="&#x1F310; Join ObsidianX Network"
                                                     Click="JoinNetwork_Click"
                                                     Style="{StaticResource NeonButtonFilled}" HorizontalAlignment="Center" Margin="0,20,0,0"/>

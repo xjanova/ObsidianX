@@ -171,7 +171,6 @@ public partial class MarkdownEditor
         var lines = text.Split('\n');
         bool inCodeBlock = false;
         bool inYaml = false;
-        bool yamlDone = false;
         var codeLines = new List<string>();
 
         for (int i = 0; i < lines.Length; i++)
@@ -182,7 +181,7 @@ public partial class MarkdownEditor
             if (i == 0 && line == "---") { inYaml = true; continue; }
             if (inYaml)
             {
-                if (line == "---") { inYaml = false; yamlDone = true; continue; }
+                if (line == "---") { inYaml = false; continue; }
                 continue; // Skip YAML in preview
             }
 
@@ -557,7 +556,11 @@ public partial class MarkdownEditor
 /// <summary>Simple ICommand for keybindings.</summary>
 internal class RelayCommand(Action execute) : ICommand
 {
-    public event EventHandler? CanExecuteChanged;
+    public event EventHandler? CanExecuteChanged
+    {
+        add => CommandManager.RequerySuggested += value;
+        remove => CommandManager.RequerySuggested -= value;
+    }
     public bool CanExecute(object? parameter) => true;
     public void Execute(object? parameter) => execute();
 }
