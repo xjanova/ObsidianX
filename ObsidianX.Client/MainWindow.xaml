@@ -3,6 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:ae="http://icsharpcode.net/sharpdevelop/avalonedit"
         mc:Ignorable="d"
         Title="ObsidianX — Neural Knowledge Engine"
         Width="1400" Height="900" MinWidth="1100" MinHeight="700"
@@ -154,8 +155,12 @@
                                         Style="{StaticResource NavButton}" Click="Nav_Click" Tag="BrainGraph"/>
                                 <Button x:Name="NavNetwork" Content="&#x2B22;  Network"
                                         Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Network"/>
+                                <Button x:Name="NavEditor" Content="&#x270F;  Editor"
+                                        Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Editor"/>
                                 <Button x:Name="NavVault" Content="&#x1F4C1;  Vault Explorer"
                                         Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Vault"/>
+                                <Button x:Name="NavSearch" Content="&#x1F50D;  Search"
+                                        Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Search"/>
                                 <Button x:Name="NavClaude" Content="&#x1F916;  Claude AI"
                                         Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Claude"/>
 
@@ -617,9 +622,28 @@
                                 </Grid.RowDefinitions>
                                 <TextBlock Text="Vault Explorer" FontSize="24" FontWeight="Bold"
                                            Foreground="{StaticResource TextPrimaryBrush}" Margin="0,0,0,16"/>
+                                <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,12">
+                                    <Button Content="New Note" Style="{StaticResource NeonButtonFilled}"
+                                            Click="VaultNewNote_Click" Padding="12,6" Margin="0,0,8,0" FontSize="11"/>
+                                    <Button Content="New Folder" Style="{StaticResource NeonButton}"
+                                            Click="VaultNewFolder_Click" Padding="12,6" Margin="0,0,8,0" FontSize="11"/>
+                                    <Button Content="Refresh" Style="{StaticResource NavButton}"
+                                            Click="VaultRefresh_Click" Padding="12,6" FontSize="11"/>
+                                </StackPanel>
                                 <Border Grid.Row="1" Style="{StaticResource CardPanel}">
                                     <TreeView x:Name="VaultTree" Background="Transparent"
-                                              Foreground="{StaticResource TextPrimaryBrush}" BorderThickness="0"/>
+                                              Foreground="{StaticResource TextPrimaryBrush}" BorderThickness="0"
+                                              MouseDoubleClick="VaultTree_DoubleClick">
+                                        <TreeView.ContextMenu>
+                                            <ContextMenu Background="{StaticResource DarkPanelBrush}"
+                                                         Foreground="{StaticResource TextPrimaryBrush}" BorderBrush="{StaticResource SurfaceLightBrush}">
+                                                <MenuItem Header="Open in Editor" Click="VaultOpenInEditor_Click"/>
+                                                <MenuItem Header="Rename" Click="VaultRename_Click"/>
+                                                <Separator/>
+                                                <MenuItem Header="Delete" Click="VaultDelete_Click" Foreground="#FF4444"/>
+                                            </ContextMenu>
+                                        </TreeView.ContextMenu>
+                                    </TreeView>
                                 </Border>
                             </Grid>
                         </Grid>
@@ -719,6 +743,144 @@
                             </Grid>
                         </Grid>
 
+                        <!-- ═══ EDITOR VIEW ═══ -->
+                        <Grid x:Name="EditorView" Visibility="Collapsed">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="*"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+
+                                <!-- Editor toolbar -->
+                                <Border Grid.Row="0" Background="{StaticResource DarkPanelBrush}"
+                                        BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="0,0,0,1"
+                                        Padding="8,4">
+                                    <Grid>
+                                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                            <TextBlock x:Name="EditorFileTitle" Text="No file open" FontSize="13"
+                                                       FontWeight="SemiBold" Foreground="{StaticResource NeonCyanBrush}"
+                                                       VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                            <TextBlock x:Name="EditorDirtyIndicator" Text="" FontSize="13"
+                                                       FontWeight="Bold" Foreground="{StaticResource NeonPinkBrush}"
+                                                       VerticalAlignment="Center" Margin="4,0,0,0"/>
+                                        </StackPanel>
+                                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                            <Button Content="New" Style="{StaticResource NavButton}" Click="EditorNew_Click"
+                                                    Padding="10,4" FontSize="11" Margin="2,0"/>
+                                            <Button Content="H1" Style="{StaticResource NavButton}" Click="EditorH1_Click"
+                                                    Padding="8,4" FontSize="11" Margin="2,0"/>
+                                            <Button Content="H2" Style="{StaticResource NavButton}" Click="EditorH2_Click"
+                                                    Padding="8,4" FontSize="11" Margin="2,0"/>
+                                            <Button Content="B" Style="{StaticResource NavButton}" Click="EditorBold_Click"
+                                                    Padding="8,4" FontSize="11" FontWeight="Bold" Margin="2,0"/>
+                                            <Button Content="I" Style="{StaticResource NavButton}" Click="EditorItalic_Click"
+                                                    Padding="8,4" FontSize="11" FontStyle="Italic" Margin="2,0"/>
+                                            <Button Content="[[]]" Style="{StaticResource NavButton}" Click="EditorLink_Click"
+                                                    Padding="8,4" FontSize="11" Foreground="{StaticResource NeonCyanBrush}" Margin="2,0"/>
+                                            <Button Content="`code`" Style="{StaticResource NavButton}" Click="EditorCode_Click"
+                                                    Padding="8,4" FontSize="11" Margin="2,0"/>
+                                            <Button Content="[ ]" Style="{StaticResource NavButton}" Click="EditorTask_Click"
+                                                    Padding="8,4" FontSize="11" Margin="2,0"/>
+                                        </StackPanel>
+                                    </Grid>
+                                </Border>
+
+                                <!-- Split: Editor + Preview -->
+                                <Grid Grid.Row="1">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="5"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+
+                                    <!-- Code editor -->
+                                    <ae:TextEditor x:Name="MarkdownEditorControl" Grid.Column="0"
+                                                   FontFamily="JetBrains Mono, Cascadia Code, Consolas"
+                                                   FontSize="14" ShowLineNumbers="True" WordWrap="True"
+                                                   Background="{StaticResource DeepSpaceBrush}"
+                                                   Foreground="{StaticResource TextPrimaryBrush}"
+                                                   Padding="8"/>
+
+                                    <!-- Splitter -->
+                                    <GridSplitter Grid.Column="1" Width="5" HorizontalAlignment="Stretch"
+                                                  Background="{StaticResource SurfaceLightBrush}" Cursor="SizeWE"/>
+
+                                    <!-- Preview -->
+                                    <Grid Grid.Column="2">
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="*"/>
+                                            <RowDefinition Height="Auto"/>
+                                        </Grid.RowDefinitions>
+                                        <Border Grid.Row="0" Background="{StaticResource DeepSpaceBrush}"
+                                                BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1,0,0,0">
+                                            <FlowDocumentScrollViewer x:Name="MarkdownPreview"
+                                                                       VerticalScrollBarVisibility="Auto"
+                                                                       IsToolBarVisible="False"/>
+                                        </Border>
+
+                                        <!-- Backlinks panel -->
+                                        <Border Grid.Row="1" Background="{StaticResource DarkPanelBrush}"
+                                                BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1,1,0,0"
+                                                MaxHeight="160">
+                                            <StackPanel Margin="12,8">
+                                                <TextBlock Text="BACKLINKS" FontSize="10" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,6"/>
+                                                <ScrollViewer MaxHeight="110" VerticalScrollBarVisibility="Auto">
+                                                    <StackPanel x:Name="BacklinksPanel"/>
+                                                </ScrollViewer>
+                                            </StackPanel>
+                                        </Border>
+                                    </Grid>
+                                </Grid>
+
+                                <!-- Editor status bar -->
+                                <Border Grid.Row="2" Background="{StaticResource DarkPanelBrush}"
+                                        BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="0,1,0,0"
+                                        Padding="12,4">
+                                    <StackPanel Orientation="Horizontal">
+                                        <TextBlock x:Name="EditorCursorPos" Text="Ln 1, Col 1" FontSize="10"
+                                                   Foreground="{StaticResource TextMutedBrush}" Margin="0,0,16,0"/>
+                                        <TextBlock x:Name="EditorWordCount" Text="0 words" FontSize="10"
+                                                   Foreground="{StaticResource TextMutedBrush}" Margin="0,0,16,0"/>
+                                        <TextBlock Text="Ctrl+S Save | Ctrl+B Bold | Ctrl+I Italic | Ctrl+K WikiLink | Ctrl+F Search"
+                                                   FontSize="10" Foreground="{StaticResource TextMutedBrush}" Opacity="0.5"/>
+                                    </StackPanel>
+                                </Border>
+                            </Grid>
+                        </Grid>
+
+                        <!-- ═══ SEARCH VIEW ═══ -->
+                        <Grid x:Name="SearchView" Visibility="Collapsed">
+                            <Grid Margin="24,16">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="*"/>
+                                </Grid.RowDefinitions>
+                                <StackPanel Margin="0,0,0,16">
+                                    <TextBlock Text="Search Vault" FontSize="24" FontWeight="Bold"
+                                               Foreground="{StaticResource TextPrimaryBrush}" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Full-text search across all notes"
+                                               FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"/>
+                                </StackPanel>
+                                <Grid Grid.Row="1" Margin="0,0,0,16">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBox x:Name="SearchBox" Style="{StaticResource NeonTextBox}"
+                                             FontSize="14" Padding="12,8" KeyDown="SearchBox_KeyDown"
+                                             Tag="Search notes... (Enter to search)"/>
+                                    <Button Grid.Column="1" Content="Search" Style="{StaticResource NeonButtonFilled}"
+                                            Padding="20,8" Margin="8,0,0,0" Click="SearchExecute_Click"/>
+                                </Grid>
+                                <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+                                    <StackPanel x:Name="SearchResults"/>
+                                </ScrollViewer>
+                            </Grid>
+                        </Grid>
+
                         <!-- ═══ SETTINGS VIEW ═══ -->
                         <Grid x:Name="SettingsView" Visibility="Collapsed">
                             <Grid Margin="24,16">
@@ -796,6 +958,35 @@
                             </Grid>
                         </Grid>
                     </Grid>
+                </Grid>
+
+                <!-- QUICK SWITCHER OVERLAY (Ctrl+O) -->
+                <Grid x:Name="QuickSwitcherOverlay" Grid.Row="1" Visibility="Collapsed" Panel.ZIndex="999">
+                    <Border Background="#80000000" MouseLeftButtonDown="QuickSwitcher_Close"/>
+                    <Border HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,60,0,0"
+                            Width="500" MaxHeight="400"
+                            Background="{StaticResource DarkPanelBrush}"
+                            BorderBrush="{StaticResource NeonCyanBrush}" BorderThickness="1"
+                            CornerRadius="12" Padding="0">
+                        <Border.Effect>
+                            <DropShadowEffect Color="{StaticResource NeonCyanColor}" BlurRadius="30" Opacity="0.3" ShadowDepth="0"/>
+                        </Border.Effect>
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            <TextBox x:Name="QuickSwitcherInput" Grid.Row="0"
+                                     FontSize="16" Padding="16,12" Background="Transparent"
+                                     Foreground="{StaticResource TextPrimaryBrush}"
+                                     BorderThickness="0,0,0,1" BorderBrush="{StaticResource SurfaceLightBrush}"
+                                     FontFamily="{StaticResource MonoFont}"
+                                     TextChanged="QuickSwitcher_TextChanged" KeyDown="QuickSwitcher_KeyDown"/>
+                            <ScrollViewer Grid.Row="1" MaxHeight="320" VerticalScrollBarVisibility="Auto">
+                                <StackPanel x:Name="QuickSwitcherResults"/>
+                            </ScrollViewer>
+                        </Grid>
+                    </Border>
                 </Grid>
 
                 <!-- STATUS BAR -->

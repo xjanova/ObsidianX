@@ -6,6 +6,8 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Media3D;
+using System.Text.RegularExpressions;
+using ObsidianX.Client.Editor;
 using ObsidianX.Client.Services;
 using ObsidianX.Core.Models;
 using ObsidianX.Core.Services;
@@ -20,6 +22,9 @@ public partial class MainWindow : Window
     private KnowledgeGraph _graph = new();
     private readonly KnowledgeIndexer _indexer = new();
     private ClaudeIntegration _claude = null!;
+
+    // Editor
+    private MarkdownEditor _mdEditor = null!;
 
     // Network
     private readonly NetworkClient _network = new();
@@ -60,7 +65,9 @@ public partial class MainWindow : Window
         ["Peers"] = "PeersView",
         ["Sharing"] = "SharingView",
         ["Growth"] = "GrowthView",
-        ["Settings"] = "SettingsView"
+        ["Settings"] = "SettingsView",
+        ["Editor"] = "EditorView",
+        ["Search"] = "SearchView"
     };
 
     public MainWindow()
@@ -99,6 +106,22 @@ public partial class MainWindow : Window
         _network.PeerLeft += a => Dispatcher.Invoke(() => OnPeerLeft(a));
         _network.ShareRequested += r => Dispatcher.Invoke(() => OnShareRequested(r));
         _network.ShareResponseReceived += (f, a, t) => Dispatcher.Invoke(() => OnShareResponse(f, a, t));
+
+        // Initialize markdown editor
+        _mdEditor = new MarkdownEditor(MarkdownEditorControl, MarkdownPreview, _vaultPath);
+        _mdEditor.WikiLinkClicked += OnWikiLinkClicked;
+        _mdEditor.FileSaved += f => { StatusText.Text = $"Saved: {Path.GetFileName(f)}"; IndexVault(); };
+        _mdEditor.DirtyStateChanged += dirty => EditorDirtyIndicator.Text = dirty ? " *" : "";
+        MarkdownEditorControl.TextArea.Caret.PositionChanged += (_, _) =>
+        {
+            EditorCursorPos.Text = $"Ln {MarkdownEditorControl.TextArea.Caret.Line}, Col {MarkdownEditorControl.TextArea.Caret.Column}";
+            var words = MarkdownEditorControl.Text.Split((char[])[' ', '\n', '\r', '\t'], StringSplitOptions.RemoveEmptyEntries).Length;
+            EditorWordCount.Text = $"{words} words";
+        };
+
+        // Global keyboard shortcuts
+        InputBindings.Add(new KeyBinding(new RelayCommand(OpenQuickSwitcher), Key.O, ModifierKeys.Control));
+        InputBindings.Add(new KeyBinding(new RelayCommand(CreateNewNote), Key.N, ModifierKeys.Control));
 
         // Start render loop
         CompositionTarget.Rendering += OnRenderFrame;
@@ -712,13 +735,15 @@ public partial class MainWindow : Window
             if (view != null) view.Visibility = Visibility.Visible;
         }
 
-        Button[] navButtons = [NavDashboard, NavBrainGraph, NavNetwork, NavVault, NavClaude, NavGrowth, NavPeers, NavSharing, NavSettings];
+        Button[] navButtons = [NavDashboard, NavBrainGraph, NavNetwork, NavEditor, NavVault, NavSearch, NavClaude, NavGrowth, NavPeers, NavSharing, NavSettings];
         foreach (var nb in navButtons) nb.Style = (Style)FindResource("NavButton");
         btn.Style = (Style)FindResource("NavButtonActive");
 
         // Special rendering for specific views
         if (tag == "Growth") RenderGrowthChart();
         if (tag == "Peers") RefreshPeersList();
+        if (tag == "Editor") RefreshBacklinks();
+        if (tag == "Search") SearchBox.Focus();
     }
 
     // ═══════════════════════════════════════
@@ -1405,4 +1430,536 @@ public partial class MainWindow : Window
         _serverUrl = url;
         StatusText.Text = $"Server URL updated to: {url}";
     }
+
+    // ═══════════════════════════════════════
+    // EDITOR — Toolbar Actions
+    // ═══════════════════════════════════════
+
+    private void EditorNew_Click(object s, RoutedEventArgs e) => CreateNewNote();
+    private void EditorH1_Click(object s, RoutedEventArgs e) => _mdEditor.InsertHeading(1);
+    private void EditorH2_Click(object s, RoutedEventArgs e) => _mdEditor.InsertHeading(2);
+    private void EditorBold_Click(object s, RoutedEventArgs e) => _mdEditor.ToggleBold();
+    private void EditorItalic_Click(object s, RoutedEventArgs e) => _mdEditor.ToggleItalic();
+    private void EditorLink_Click(object s, RoutedEventArgs e) => _mdEditor.InsertWikiLink();
+    private void EditorCode_Click(object s, RoutedEventArgs e) => _mdEditor.InsertCodeBlock();
+    private void EditorTask_Click(object s, RoutedEventArgs e) => _mdEditor.InsertTaskList();
+
+    private void OpenFileInEditor(string filePath)
+    {
+        _mdEditor.OpenFile(filePath);
+        EditorFileTitle.Text = Path.GetFileNameWithoutExtension(filePath);
+        StatusText.Text = $"Editing: {Path.GetFileName(filePath)}";
+        RefreshBacklinks();
+
+        // Switch to editor view
+        foreach (var kv in _viewMap)
+        {
+            var v = (UIElement?)FindName(kv.Value);
+            if (v != null) v.Visibility = Visibility.Collapsed;
+        }
+        EditorView.Visibility = Visibility.Visible;
+        Button[] navButtons = [NavDashboard, NavBrainGraph, NavNetwork, NavEditor, NavVault, NavSearch, NavClaude, NavGrowth, NavPeers, NavSharing, NavSettings];
+        foreach (var nb in navButtons) nb.Style = (Style)FindResource("NavButton");
+        NavEditor.Style = (Style)FindResource("NavButtonActive");
+    }
+
+    private void OnWikiLinkClicked(string linkName)
+    {
+        var resolved = _mdEditor.ResolveWikiLink(linkName);
+        if (resolved != null)
+            OpenFileInEditor(resolved);
+        else
+        {
+            // Create new note for broken link
+            var result = MessageBox.Show(
+                $"Note \"{linkName}\" not found.\n\nCreate it?",
+                "Create Note", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (result == MessageBoxResult.Yes)
+            {
+                var newPath = Path.Combine(_vaultPath, linkName + ".md");
+                _mdEditor.NewFile(newPath);
+                EditorFileTitle.Text = linkName;
+                RefreshVaultTree();
+            }
+        }
+    }
+
+    private void RefreshBacklinks()
+    {
+        BacklinksPanel.Children.Clear();
+        var backlinks = _mdEditor.GetBacklinks();
+        if (backlinks.Count == 0)
+        {
+            BacklinksPanel.Children.Add(new TextBlock
+            {
+                Text = "No backlinks found",
+                FontSize = 11, Foreground = (SolidColorBrush)FindResource("TextMutedBrush"),
+                FontStyle = FontStyles.Italic
+            });
+            return;
+        }
+
+        foreach (var (filePath, title, context) in backlinks)
+        {
+            var btn = new Button
+            {
+                Style = (Style)FindResource("NavButton"),
+                HorizontalContentAlignment = HorizontalAlignment.Left,
+                Padding = new Thickness(8, 4, 8, 4),
+                Margin = new Thickness(0, 0, 0, 2),
+                Tag = filePath
+            };
+            var sp = new StackPanel();
+            sp.Children.Add(new TextBlock
+            {
+                Text = $"\U0001F517 {title}",
+                FontSize = 11, FontWeight = FontWeights.SemiBold,
+                Foreground = (SolidColorBrush)FindResource("NeonCyanBrush")
+            });
+            sp.Children.Add(new TextBlock
+            {
+                Text = context,
+                FontSize = 9, Foreground = (SolidColorBrush)FindResource("TextMutedBrush"),
+                TextTrimming = TextTrimming.CharacterEllipsis
+            });
+            btn.Content = sp;
+            btn.Click += (_, _) => OpenFileInEditor(filePath);
+            BacklinksPanel.Children.Add(btn);
+        }
+    }
+
+    private void CreateNewNote()
+    {
+        var dialog = new Window
+        {
+            Title = "New Note",
+            Width = 400, Height = 180,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Owner = this,
+            WindowStyle = WindowStyle.ToolWindow,
+            Background = new SolidColorBrush(Color.FromRgb(0x0D, 0x0D, 0x1A)),
+            Foreground = new SolidColorBrush(Color.FromRgb(0xE0, 0xE0, 0xF0))
+        };
+        var sp = new StackPanel { Margin = new Thickness(16) };
+        sp.Children.Add(new TextBlock { Text = "Note Title:", FontSize = 13, Margin = new Thickness(0, 0, 0, 8) });
+        var tb = new TextBox
+        {
+            FontSize = 14, Padding = new Thickness(8, 6, 8, 6),
+            Background = new SolidColorBrush(Color.FromRgb(0x14, 0x14, 0x28)),
+            Foreground = new SolidColorBrush(Color.FromRgb(0xE0, 0xE0, 0xF0)),
+            BorderBrush = new SolidColorBrush(Color.FromRgb(0x2A, 0x2A, 0x4A))
+        };
+        sp.Children.Add(tb);
+        var okBtn = new Button
+        {
+            Content = "Create", Margin = new Thickness(0, 12, 0, 0),
+            Padding = new Thickness(20, 8, 20, 8), HorizontalAlignment = HorizontalAlignment.Right,
+            Background = new SolidColorBrush(Color.FromRgb(0, 240, 255)),
+            Foreground = new SolidColorBrush(Color.FromRgb(0x0B, 0x0B, 0x1A)),
+            FontWeight = FontWeights.Bold, Cursor = Cursors.Hand
+        };
+        okBtn.Click += (_, _) =>
+        {
+            var name = tb.Text.Trim();
+            if (string.IsNullOrEmpty(name)) return;
+            dialog.DialogResult = true;
+            dialog.Close();
+        };
+        tb.KeyDown += (_, e) => { if (e.Key == Key.Enter) { okBtn.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); } };
+        sp.Children.Add(okBtn);
+        dialog.Content = sp;
+
+        if (dialog.ShowDialog() == true)
+        {
+            var name = tb.Text.Trim();
+            var filePath = Path.Combine(_vaultPath, name + ".md");
+            _mdEditor.NewFile(filePath);
+            EditorFileTitle.Text = name;
+            RefreshVaultTree();
+            OpenFileInEditor(filePath);
+        }
+    }
+
+    // ═══════════════════════════════════════
+    // SEARCH
+    // ═══════════════════════════════════════
+
+    private void SearchBox_KeyDown(object s, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter) ExecuteSearch();
+    }
+
+    private void SearchExecute_Click(object s, RoutedEventArgs e) => ExecuteSearch();
+
+    private void ExecuteSearch()
+    {
+        var query = SearchBox.Text.Trim();
+        if (string.IsNullOrEmpty(query)) return;
+
+        SearchResults.Children.Clear();
+        var results = new List<(string FilePath, string Title, string Match, int MatchCount)>();
+
+        foreach (var file in Directory.EnumerateFiles(_vaultPath, "*.md", SearchOption.AllDirectories))
+        {
+            try
+            {
+                var content = File.ReadAllText(file);
+                var matches = Regex.Matches(content, Regex.Escape(query), RegexOptions.IgnoreCase);
+                if (matches.Count > 0)
+                {
+                    // Get first match with context
+                    var m = matches[0];
+                    int start = Math.Max(0, m.Index - 60);
+                    int end = Math.Min(content.Length, m.Index + m.Length + 60);
+                    var context = content[start..end].Replace("\n", " ").Trim();
+                    var title = Path.GetFileNameWithoutExtension(file);
+                    results.Add((file, title, context, matches.Count));
+                }
+            }
+            catch { }
+        }
+
+        if (results.Count == 0)
+        {
+            SearchResults.Children.Add(new TextBlock
+            {
+                Text = $"No results found for \"{query}\"",
+                FontSize = 13, Foreground = (SolidColorBrush)FindResource("TextMutedBrush"),
+                Margin = new Thickness(0, 20, 0, 0), FontStyle = FontStyles.Italic
+            });
+            return;
+        }
+
+        // Header
+        SearchResults.Children.Add(new TextBlock
+        {
+            Text = $"{results.Count} note{(results.Count > 1 ? "s" : "")} found",
+            FontSize = 12, Foreground = (SolidColorBrush)FindResource("NeonGreenBrush"),
+            Margin = new Thickness(0, 0, 0, 12)
+        });
+
+        foreach (var (filePath, title, match, count) in results.OrderByDescending(r => r.MatchCount))
+        {
+            var card = new Border
+            {
+                Style = (Style)FindResource("CardPanel"),
+                Margin = new Thickness(0, 0, 0, 8),
+                Cursor = Cursors.Hand
+            };
+            var sp = new StackPanel();
+            var header = new Grid();
+            header.Children.Add(new TextBlock
+            {
+                Text = $"\U0001F4C4 {title}",
+                FontSize = 13, FontWeight = FontWeights.SemiBold,
+                Foreground = (SolidColorBrush)FindResource("NeonCyanBrush")
+            });
+            header.Children.Add(new TextBlock
+            {
+                Text = $"{count} match{(count > 1 ? "es" : "")}",
+                FontSize = 10, Foreground = (SolidColorBrush)FindResource("NeonPinkBrush"),
+                HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center
+            });
+            sp.Children.Add(header);
+
+            // Highlight match in context
+            var ctx = new TextBlock
+            {
+                FontSize = 11, TextWrapping = TextWrapping.Wrap,
+                Foreground = (SolidColorBrush)FindResource("TextSecondaryBrush"),
+                Margin = new Thickness(0, 4, 0, 0)
+            };
+            var parts = Regex.Split(match, $"({Regex.Escape(query)})", RegexOptions.IgnoreCase);
+            foreach (var part in parts)
+            {
+                if (part.Equals(query, StringComparison.OrdinalIgnoreCase))
+                    ctx.Inlines.Add(new System.Windows.Documents.Run(part)
+                    {
+                        Foreground = new SolidColorBrush(Color.FromRgb(255, 214, 0)),
+                        FontWeight = FontWeights.Bold,
+                        Background = new SolidColorBrush(Color.FromArgb(40, 255, 214, 0))
+                    });
+                else
+                    ctx.Inlines.Add(new System.Windows.Documents.Run(part));
+            }
+            sp.Children.Add(ctx);
+
+            // Relative path
+            sp.Children.Add(new TextBlock
+            {
+                Text = Path.GetRelativePath(_vaultPath, filePath),
+                FontSize = 9, Foreground = (SolidColorBrush)FindResource("TextMutedBrush"),
+                Margin = new Thickness(0, 4, 0, 0), FontFamily = (FontFamily)FindResource("MonoFont")
+            });
+
+            card.Child = sp;
+            card.MouseLeftButtonDown += (_, _) => OpenFileInEditor(filePath);
+            SearchResults.Children.Add(card);
+        }
+    }
+
+    // ═══════════════════════════════════════
+    // QUICK SWITCHER (Ctrl+O)
+    // ═══════════════════════════════════════
+
+    private void OpenQuickSwitcher()
+    {
+        QuickSwitcherOverlay.Visibility = Visibility.Visible;
+        QuickSwitcherInput.Text = "";
+        QuickSwitcherInput.Focus();
+        PopulateQuickSwitcher("");
+    }
+
+    private void QuickSwitcher_Close(object s, MouseButtonEventArgs e)
+    {
+        QuickSwitcherOverlay.Visibility = Visibility.Collapsed;
+    }
+
+    private void QuickSwitcher_TextChanged(object s, TextChangedEventArgs e)
+    {
+        PopulateQuickSwitcher(QuickSwitcherInput.Text.Trim());
+    }
+
+    private void QuickSwitcher_KeyDown(object s, KeyEventArgs e)
+    {
+        if (e.Key == Key.Escape)
+        {
+            QuickSwitcherOverlay.Visibility = Visibility.Collapsed;
+            return;
+        }
+        if (e.Key == Key.Enter)
+        {
+            // Open first result
+            if (QuickSwitcherResults.Children.Count > 0 && QuickSwitcherResults.Children[0] is Button btn && btn.Tag is string path)
+            {
+                QuickSwitcherOverlay.Visibility = Visibility.Collapsed;
+                OpenFileInEditor(path);
+            }
+        }
+    }
+
+    private void PopulateQuickSwitcher(string filter)
+    {
+        QuickSwitcherResults.Children.Clear();
+        if (!Directory.Exists(_vaultPath)) return;
+
+        var files = Directory.EnumerateFiles(_vaultPath, "*.md", SearchOption.AllDirectories)
+            .Where(f => !f.Contains("\\."))
+            .Select(f => (Path: f, Name: Path.GetFileNameWithoutExtension(f)))
+            .Where(f => string.IsNullOrEmpty(filter) ||
+                        f.Name.Contains(filter, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(f => f.Name)
+            .Take(15);
+
+        foreach (var (filePath, name) in files)
+        {
+            var btn = new Button
+            {
+                HorizontalContentAlignment = HorizontalAlignment.Left,
+                Padding = new Thickness(16, 8, 16, 8),
+                Background = Brushes.Transparent,
+                Foreground = (SolidColorBrush)FindResource("TextPrimaryBrush"),
+                BorderThickness = new Thickness(0),
+                Cursor = Cursors.Hand,
+                Tag = filePath
+            };
+            var sp = new StackPanel();
+            sp.Children.Add(new TextBlock
+            {
+                Text = $"\U0001F4C4 {name}",
+                FontSize = 13, FontWeight = FontWeights.SemiBold
+            });
+            sp.Children.Add(new TextBlock
+            {
+                Text = Path.GetRelativePath(_vaultPath, filePath),
+                FontSize = 9, Foreground = (SolidColorBrush)FindResource("TextMutedBrush"),
+                FontFamily = (FontFamily)FindResource("MonoFont")
+            });
+            btn.Content = sp;
+            btn.Click += (_, _) =>
+            {
+                QuickSwitcherOverlay.Visibility = Visibility.Collapsed;
+                OpenFileInEditor(filePath);
+            };
+            // Hover effect
+            btn.MouseEnter += (_, _) => btn.Background = new SolidColorBrush(Color.FromRgb(0x1A, 0x1A, 0x3A));
+            btn.MouseLeave += (_, _) => btn.Background = Brushes.Transparent;
+            QuickSwitcherResults.Children.Add(btn);
+        }
+
+        if (!QuickSwitcherResults.Children.OfType<Button>().Any())
+        {
+            QuickSwitcherResults.Children.Add(new TextBlock
+            {
+                Text = "No notes found",
+                FontSize = 12, Foreground = (SolidColorBrush)FindResource("TextMutedBrush"),
+                Margin = new Thickness(16, 12, 16, 12), FontStyle = FontStyles.Italic
+            });
+        }
+    }
+
+    // ═══════════════════════════════════════
+    // VAULT FILE MANAGEMENT
+    // ═══════════════════════════════════════
+
+    private void VaultTree_DoubleClick(object s, MouseButtonEventArgs e)
+    {
+        if (VaultTree.SelectedItem is TreeViewItem item && item.Tag is string filePath)
+            OpenFileInEditor(filePath);
+    }
+
+    private void VaultOpenInEditor_Click(object s, RoutedEventArgs e)
+    {
+        if (VaultTree.SelectedItem is TreeViewItem item && item.Tag is string filePath)
+            OpenFileInEditor(filePath);
+    }
+
+    private void VaultNewNote_Click(object s, RoutedEventArgs e) => CreateNewNote();
+
+    private void VaultNewFolder_Click(object s, RoutedEventArgs e)
+    {
+        var dialog = new Window
+        {
+            Title = "New Folder", Width = 400, Height = 160,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Owner = this,
+            WindowStyle = WindowStyle.ToolWindow,
+            Background = new SolidColorBrush(Color.FromRgb(0x0D, 0x0D, 0x1A)),
+            Foreground = new SolidColorBrush(Color.FromRgb(0xE0, 0xE0, 0xF0))
+        };
+        var sp = new StackPanel { Margin = new Thickness(16) };
+        sp.Children.Add(new TextBlock { Text = "Folder Name:", FontSize = 13, Margin = new Thickness(0, 0, 0, 8) });
+        var tb = new TextBox
+        {
+            FontSize = 14, Padding = new Thickness(8, 6, 8, 6),
+            Background = new SolidColorBrush(Color.FromRgb(0x14, 0x14, 0x28)),
+            Foreground = new SolidColorBrush(Color.FromRgb(0xE0, 0xE0, 0xF0)),
+            BorderBrush = new SolidColorBrush(Color.FromRgb(0x2A, 0x2A, 0x4A))
+        };
+        sp.Children.Add(tb);
+        var okBtn = new Button
+        {
+            Content = "Create", Margin = new Thickness(0, 12, 0, 0), Padding = new Thickness(20, 8, 20, 8),
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Background = new SolidColorBrush(Color.FromRgb(0, 240, 255)),
+            Foreground = new SolidColorBrush(Color.FromRgb(0x0B, 0x0B, 0x1A)), FontWeight = FontWeights.Bold
+        };
+        okBtn.Click += (_, _) => { dialog.DialogResult = true; dialog.Close(); };
+        tb.KeyDown += (_, ev) => { if (ev.Key == Key.Enter) { okBtn.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); } };
+        sp.Children.Add(okBtn);
+        dialog.Content = sp;
+
+        if (dialog.ShowDialog() == true)
+        {
+            var name = tb.Text.Trim();
+            if (string.IsNullOrEmpty(name)) return;
+            var dirPath = Path.Combine(_vaultPath, name);
+            if (!Directory.Exists(dirPath)) Directory.CreateDirectory(dirPath);
+            RefreshVaultTree();
+            StatusText.Text = $"Folder created: {name}";
+        }
+    }
+
+    private void VaultRename_Click(object s, RoutedEventArgs e)
+    {
+        if (VaultTree.SelectedItem is not TreeViewItem item || item.Tag is not string filePath) return;
+
+        var oldName = Path.GetFileNameWithoutExtension(filePath);
+        var dialog = new Window
+        {
+            Title = "Rename", Width = 400, Height = 160,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Owner = this,
+            WindowStyle = WindowStyle.ToolWindow,
+            Background = new SolidColorBrush(Color.FromRgb(0x0D, 0x0D, 0x1A)),
+            Foreground = new SolidColorBrush(Color.FromRgb(0xE0, 0xE0, 0xF0))
+        };
+        var sp = new StackPanel { Margin = new Thickness(16) };
+        sp.Children.Add(new TextBlock { Text = "New Name:", FontSize = 13, Margin = new Thickness(0, 0, 0, 8) });
+        var tb = new TextBox
+        {
+            Text = oldName, FontSize = 14, Padding = new Thickness(8, 6, 8, 6),
+            Background = new SolidColorBrush(Color.FromRgb(0x14, 0x14, 0x28)),
+            Foreground = new SolidColorBrush(Color.FromRgb(0xE0, 0xE0, 0xF0)),
+            BorderBrush = new SolidColorBrush(Color.FromRgb(0x2A, 0x2A, 0x4A))
+        };
+        tb.SelectAll();
+        sp.Children.Add(tb);
+        var okBtn = new Button
+        {
+            Content = "Rename", Margin = new Thickness(0, 12, 0, 0), Padding = new Thickness(20, 8, 20, 8),
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Background = new SolidColorBrush(Color.FromRgb(0, 240, 255)),
+            Foreground = new SolidColorBrush(Color.FromRgb(0x0B, 0x0B, 0x1A)), FontWeight = FontWeights.Bold
+        };
+        okBtn.Click += (_, _) => { dialog.DialogResult = true; dialog.Close(); };
+        tb.KeyDown += (_, ev) => { if (ev.Key == Key.Enter) { okBtn.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); } };
+        sp.Children.Add(okBtn);
+        dialog.Content = sp;
+
+        if (dialog.ShowDialog() == true)
+        {
+            var newName = tb.Text.Trim();
+            if (string.IsNullOrEmpty(newName) || newName == oldName) return;
+            var dir = Path.GetDirectoryName(filePath)!;
+            var newPath = Path.Combine(dir, newName + ".md");
+            if (File.Exists(newPath))
+            {
+                MessageBox.Show("A file with that name already exists.", "Rename", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+            File.Move(filePath, newPath);
+
+            // Update wiki-links across vault
+            UpdateWikiLinks(oldName, newName);
+
+            if (_mdEditor.CurrentFilePath == filePath)
+            {
+                _mdEditor.OpenFile(newPath);
+                EditorFileTitle.Text = newName;
+            }
+            RefreshVaultTree();
+            StatusText.Text = $"Renamed: {oldName} -> {newName}";
+        }
+    }
+
+    private void VaultDelete_Click(object s, RoutedEventArgs e)
+    {
+        if (VaultTree.SelectedItem is not TreeViewItem item || item.Tag is not string filePath) return;
+        var name = Path.GetFileName(filePath);
+        var result = MessageBox.Show($"Delete \"{name}\"?\n\nThis cannot be undone.",
+            "Delete Note", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+        if (result != MessageBoxResult.Yes) return;
+
+        File.Delete(filePath);
+        RefreshVaultTree();
+        StatusText.Text = $"Deleted: {name}";
+    }
+
+    private void VaultRefresh_Click(object s, RoutedEventArgs e)
+    {
+        RefreshVaultTree();
+        IndexVault();
+        _dashPhysics.LoadFromGraph(_graph);
+        _graphPhysics.LoadFromGraph(_graph);
+        UpdateUI();
+        StatusText.Text = "Vault refreshed";
+    }
+
+    /// <summary>Update all [[wiki-links]] in the vault when a note is renamed.</summary>
+    private void UpdateWikiLinks(string oldName, string newName)
+    {
+        foreach (var file in Directory.EnumerateFiles(_vaultPath, "*.md", SearchOption.AllDirectories))
+        {
+            try
+            {
+                var content = File.ReadAllText(file);
+                var updated = Regex.Replace(content, $@"\[\[{Regex.Escape(oldName)}(\|[^\]]+)?\]\]",
+                    m => $"[[{newName}{m.Groups[1].Value}]]", RegexOptions.IgnoreCase);
+                if (updated != content)
+                    File.WriteAllText(file, updated);
+            }
+            catch { }
+        }
+    }
+
+    private void RefreshVaultTree() => PopulateVaultTree();
 }

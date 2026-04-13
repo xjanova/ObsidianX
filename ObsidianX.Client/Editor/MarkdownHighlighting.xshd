@@ -1,0 +1,83 @@
+<?xml version="1.0"?>
+<SyntaxDefinition name="Markdown" xmlns="http://icsharpcode.net/sharpdevelop/syntaxdefinition/2008">
+  <Color name="Heading1" foreground="#00F0FF" fontWeight="bold" fontSize="20"/>
+  <Color name="Heading2" foreground="#8B5CF6" fontWeight="bold" fontSize="17"/>
+  <Color name="Heading3" foreground="#FF006E" fontWeight="bold" fontSize="15"/>
+  <Color name="Heading4" foreground="#00FF88" fontWeight="bold"/>
+  <Color name="Bold" fontWeight="bold" foreground="#E0E0F0"/>
+  <Color name="Italic" fontStyle="italic" foreground="#B0B0D0"/>
+  <Color name="Code" foreground="#FFC107" background="#1A1A2E"/>
+  <Color name="WikiLink" foreground="#00F0FF" fontWeight="bold"/>
+  <Color name="Tag" foreground="#8B5CF6"/>
+  <Color name="Link" foreground="#4FC3F7"/>
+  <Color name="Image" foreground="#FF8C00"/>
+  <Color name="BlockQuote" foreground="#6A6A8A" fontStyle="italic"/>
+  <Color name="ListMarker" foreground="#00FF88" fontWeight="bold"/>
+  <Color name="HorizontalRule" foreground="#3A3A5A"/>
+  <Color name="YamlFrontmatter" foreground="#FFC107" background="#0D0D1A"/>
+  <Color name="Strikethrough" foreground="#6A6A8A"/>
+  <Color name="TaskDone" foreground="#00FF88"/>
+  <Color name="TaskPending" foreground="#FF006E"/>
+
+  <RuleSet>
+    <!-- YAML frontmatter -->
+    <Span color="YamlFrontmatter" multiline="true">
+      <Begin>^---$</Begin>
+      <End>^---$</End>
+    </Span>
+
+    <!-- Code blocks -->
+    <Span color="Code" multiline="true">
+      <Begin>^```</Begin>
+      <End>^```</End>
+    </Span>
+
+    <!-- Inline code -->
+    <Span color="Code">
+      <Begin>`</Begin>
+      <End>`</End>
+    </Span>
+
+    <!-- Block quotes -->
+    <Span color="BlockQuote">
+      <Begin>^&gt;\s</Begin>
+    </Span>
+
+    <Rule color="Heading1">^\#\s.*$</Rule>
+    <Rule color="Heading2">^\#\#\s.*$</Rule>
+    <Rule color="Heading3">^\#\#\#\s.*$</Rule>
+    <Rule color="Heading4">^\#\#\#\#+\s.*$</Rule>
+
+    <!-- Wiki links [[...]] -->
+    <Rule color="WikiLink">\[\[[^\]]+\]\]</Rule>
+
+    <!-- Tags #tag -->
+    <Rule color="Tag">\#[a-zA-Z0-9_/\-]+</Rule>
+
+    <!-- Images ![alt](url) -->
+    <Rule color="Image">!\[[^\]]*\]\([^\)]+\)</Rule>
+
+    <!-- Links [text](url) -->
+    <Rule color="Link">\[[^\]]+\]\([^\)]+\)</Rule>
+
+    <!-- Bold **text** -->
+    <Rule color="Bold">\*\*[^*]+\*\*</Rule>
+
+    <!-- Italic *text* -->
+    <Rule color="Italic">\*[^*]+\*</Rule>
+
+    <!-- Strikethrough ~~text~~ -->
+    <Rule color="Strikethrough">~~[^~]+~~</Rule>
+
+    <!-- Task lists -->
+    <Rule color="TaskDone">^\s*-\s\[x\]</Rule>
+    <Rule color="TaskPending">^\s*-\s\[\s\]</Rule>
+
+    <!-- List markers -->
+    <Rule color="ListMarker">^\s*[-*+]\s</Rule>
+    <Rule color="ListMarker">^\s*\d+\.\s</Rule>
+
+    <!-- Horizontal rules -->
+    <Rule color="HorizontalRule">^(\*\*\*|---|___)$</Rule>
+  </RuleSet>
+</SyntaxDefinition>
