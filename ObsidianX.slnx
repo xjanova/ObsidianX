@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="ObsidianX.Client/ObsidianX.Client.csproj" />
+  <Project Path="ObsidianX.Server/ObsidianX.Server.csproj" />
+</Solution>

@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ObsidianX Server — Neural Network Hub</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;700&family=Orbitron:wght@400;700;900&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --bg-deep: #06060f;
+    --bg-card: #0d0d1a;
+    --bg-card-hover: #12122a;
+    --border: #1a1a3a;
+    --cyan: #00f0ff;
+    --purple: #8b5cf6;
+    --pink: #ff006e;
+    --green: #00ff88;
+    --yellow: #ffd600;
+    --orange: #ff8c00;
+    --text: #e0e0f0;
+    --text-dim: #6a6a8a;
+    --glow-cyan: 0 0 20px rgba(0,240,255,0.3);
+    --glow-purple: 0 0 20px rgba(139,92,246,0.3);
+    --glow-green: 0 0 20px rgba(0,255,136,0.3);
+  }
+
+  body {
+    background: var(--bg-deep);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Animated background grid */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background:
+      linear-gradient(rgba(0,240,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,240,255,0.03) 1px, transparent 1px);
+    background-size: 50px 50px;
+    animation: gridMove 20s linear infinite;
+    pointer-events: none;
+    z-index: 0;
+  }
+  @keyframes gridMove {
+    0% { transform: translate(0, 0); }
+    100% { transform: translate(50px, 50px); }
+  }
+
+  /* Scan line effect */
+  body::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg, transparent, transparent 2px, rgba(0,240,255,0.015) 2px, rgba(0,240,255,0.015) 4px
+    );
+    pointer-events: none;
+    z-index: 1000;
+  }
+
+  .container { max-width: 1400px; margin: 0 auto; padding: 20px; position: relative; z-index: 1; }
+
+  /* Header */
+  .header {
+    text-align: center;
+    padding: 30px 0 40px;
+    position: relative;
+  }
+  .header h1 {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 2.4em;
+    font-weight: 900;
+    background: linear-gradient(135deg, var(--cyan), var(--purple), var(--pink));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    text-shadow: none;
+    letter-spacing: 4px;
+    text-transform: uppercase;
+  }
+  .header .subtitle {
+    color: var(--text-dim);
+    font-size: 0.85em;
+    margin-top: 8px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+  }
+  .header .version {
+    display: inline-block;
+    margin-top: 12px;
+    padding: 4px 16px;
+    border: 1px solid var(--cyan);
+    border-radius: 20px;
+    color: var(--cyan);
+    font-size: 0.7em;
+    letter-spacing: 2px;
+    box-shadow: var(--glow-cyan);
+  }
+
+  /* Status indicator */
+  .status-bar {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 12px;
+    margin: -15px 0 25px;
+    font-size: 0.8em;
+  }
+  .status-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 10px var(--green), 0 0 20px var(--green);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.6; transform: scale(0.85); }
+  }
+  .status-text { color: var(--green); text-transform: uppercase; letter-spacing: 2px; }
+  #uptime { color: var(--text-dim); }
+
+  /* Stats Grid */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+    transition: all 0.3s ease;
+    position: relative;
+    overflow: hidden;
+  }
+  .stat-card:hover {
+    border-color: var(--cyan);
+    box-shadow: var(--glow-cyan);
+    transform: translateY(-2px);
+  }
+  .stat-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--cyan), transparent);
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+  .stat-card:hover::before { opacity: 1; }
+  .stat-card .icon { font-size: 1.6em; margin-bottom: 8px; }
+  .stat-card .value {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 2em;
+    font-weight: 700;
+    color: var(--cyan);
+    text-shadow: var(--glow-cyan);
+  }
+  .stat-card .label {
+    font-size: 0.7em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    margin-top: 4px;
+  }
+  .stat-card:nth-child(2) .value { color: var(--purple); text-shadow: var(--glow-purple); }
+  .stat-card:nth-child(3) .value { color: var(--green); text-shadow: var(--glow-green); }
+  .stat-card:nth-child(4) .value { color: var(--pink); }
+
+  /* Main layout */
+  .main-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+
+  /* Cards */
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(135deg, rgba(0,240,255,0.05), rgba(139,92,246,0.05));
+  }
+  .card-header h2 {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 0.9em;
+    font-weight: 700;
+    color: var(--cyan);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+  }
+  .card-header .badge {
+    background: rgba(0,240,255,0.1);
+    border: 1px solid rgba(0,240,255,0.3);
+    color: var(--cyan);
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 0.75em;
+  }
+  .card-body { padding: 16px 20px; max-height: 420px; overflow-y: auto; }
+  .card-body::-webkit-scrollbar { width: 4px; }
+  .card-body::-webkit-scrollbar-track { background: transparent; }
+  .card-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  /* Peer items */
+  .peer-item {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 14px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 10px;
+    transition: all 0.3s;
+  }
+  .peer-item:hover {
+    border-color: var(--purple);
+    background: var(--bg-card-hover);
+  }
+  .peer-avatar {
+    width: 42px; height: 42px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--cyan), var(--purple));
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700;
+    font-size: 1em;
+    flex-shrink: 0;
+    box-shadow: var(--glow-cyan);
+  }
+  .peer-info { flex: 1; min-width: 0; }
+  .peer-name { font-weight: 600; font-size: 0.9em; color: var(--text); }
+  .peer-address {
+    font-size: 0.65em;
+    color: var(--cyan);
+    opacity: 0.7;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .peer-tags { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+  .peer-tag {
+    font-size: 0.6em;
+    padding: 2px 8px;
+    border-radius: 8px;
+    border: 1px solid;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  .peer-tag.expertise { border-color: var(--purple); color: var(--purple); background: rgba(139,92,246,0.1); }
+  .peer-stats {
+    text-align: right;
+    flex-shrink: 0;
+  }
+  .peer-stats .nodes { font-family: 'Orbitron', sans-serif; font-size: 1.1em; color: var(--green); }
+  .peer-stats .words { font-size: 0.65em; color: var(--text-dim); }
+
+  /* Activity log */
+  .activity-item {
+    padding: 10px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    font-size: 0.8em;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+  }
+  .activity-item:last-child { border-bottom: none; }
+  .activity-time {
+    color: var(--text-dim);
+    font-size: 0.85em;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .activity-msg { color: var(--text); line-height: 1.4; }
+  .activity-msg .highlight-join { color: var(--green); }
+  .activity-msg .highlight-leave { color: var(--pink); }
+  .activity-msg .highlight-share { color: var(--yellow); }
+  .activity-msg .highlight-match { color: var(--purple); }
+
+  /* Empty state */
+  .empty-state {
+    text-align: center;
+    padding: 50px 20px;
+    color: var(--text-dim);
+  }
+  .empty-state .icon { font-size: 2.5em; margin-bottom: 12px; opacity: 0.5; }
+  .empty-state .msg { font-size: 0.85em; }
+  .empty-state .hint {
+    font-size: 0.7em;
+    margin-top: 8px;
+    color: var(--cyan);
+    opacity: 0.5;
+  }
+
+  /* Network visualization */
+  .network-viz {
+    margin-top: 20px;
+  }
+  .network-viz .card-body {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 20px;
+  }
+  .category-bubble {
+    padding: 8px 16px;
+    border-radius: 20px;
+    font-size: 0.75em;
+    border: 1px solid;
+    transition: all 0.3s;
+    cursor: default;
+  }
+  .category-bubble:hover {
+    transform: scale(1.05);
+  }
+
+  /* Footer */
+  .footer {
+    text-align: center;
+    padding: 30px 0 20px;
+    color: var(--text-dim);
+    font-size: 0.7em;
+    letter-spacing: 2px;
+  }
+  .footer a { color: var(--cyan); text-decoration: none; }
+  .footer a:hover { text-decoration: underline; }
+
+  /* Responsive */
+  @media (max-width: 900px) {
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+    .main-grid { grid-template-columns: 1fr; }
+    .header h1 { font-size: 1.6em; }
+  }
+
+  /* Connection animation */
+  @keyframes connectPulse {
+    0% { box-shadow: 0 0 0 0 rgba(0,255,136,0.4); }
+    70% { box-shadow: 0 0 0 15px rgba(0,255,136,0); }
+    100% { box-shadow: 0 0 0 0 rgba(0,255,136,0); }
+  }
+  .peer-item.new { animation: connectPulse 1s ease-out; }
+
+  /* Glitch text */
+  @keyframes glitch {
+    0%, 100% { text-shadow: none; }
+    20% { text-shadow: -2px 0 var(--pink), 2px 0 var(--cyan); }
+    40% { text-shadow: 2px 0 var(--pink), -2px 0 var(--cyan); }
+    60% { text-shadow: -1px 0 var(--green), 1px 0 var(--purple); }
+  }
+  .header h1:hover { animation: glitch 0.3s ease-in-out; }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <!-- Header -->
+  <div class="header">
+    <h1>ObsidianX</h1>
+    <div class="subtitle">Neural Knowledge Network Hub</div>
+    <div class="version">v1.0.0 &mdash; Brain Matchmaking Server</div>
+  </div>
+
+  <!-- Status bar -->
+  <div class="status-bar">
+    <div class="status-dot"></div>
+    <span class="status-text">Server Online</span>
+    <span id="uptime">00:00:00</span>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="icon">&#x1F9E0;</div>
+      <div class="value" id="peerCount">0</div>
+      <div class="label">Connected Brains</div>
+    </div>
+    <div class="stat-card">
+      <div class="icon">&#x1F4E6;</div>
+      <div class="value" id="knowledgeCount">0</div>
+      <div class="label">Knowledge Nodes</div>
+    </div>
+    <div class="stat-card">
+      <div class="icon">&#x1F4DD;</div>
+      <div class="value" id="wordCount">0</div>
+      <div class="label">Total Words</div>
+    </div>
+    <div class="stat-card">
+      <div class="icon">&#x1F91D;</div>
+      <div class="value" id="shareCount">0</div>
+      <div class="label">Share Requests</div>
+    </div>
+  </div>
+
+  <!-- Main content -->
+  <div class="main-grid">
+    <!-- Connected Peers -->
+    <div class="card">
+      <div class="card-header">
+        <h2>Connected Brains</h2>
+        <span class="badge" id="peerBadge">0 online</span>
+      </div>
+      <div class="card-body" id="peerList">
+        <div class="empty-state">
+          <div class="icon">&#x1F9E0;</div>
+          <div class="msg">No brains connected yet</div>
+          <div class="hint">Launch ObsidianX Client to connect</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Activity Feed -->
+    <div class="card">
+      <div class="card-header">
+        <h2>Activity Feed</h2>
+        <span class="badge" id="activityBadge">live</span>
+      </div>
+      <div class="card-body" id="activityList">
+        <div class="empty-state">
+          <div class="icon">&#x1F4E1;</div>
+          <div class="msg">Waiting for activity...</div>
+          <div class="hint">Events will appear here in real-time</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Network Categories -->
+  <div class="network-viz card" style="margin-top: 20px;">
+    <div class="card-header">
+      <h2>Network Expertise Map</h2>
+      <span class="badge" id="catBadge">categories</span>
+    </div>
+    <div class="card-body" id="categoryMap">
+      <div class="empty-state" style="width:100%">
+        <div class="icon">&#x1F310;</div>
+        <div class="msg">Expertise map populates when brains connect</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    ObsidianX Server &mdash; Neural Knowledge Network &mdash; SignalR Hub at <a href="/brain-hub">/brain-hub</a>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.7/signalr.min.js"></script>
+<script>
+const CATEGORY_COLORS = {
+  Programming: '#00f0ff', AI_MachineLearning: '#8b5cf6', Blockchain_Web3: '#ff006e',
+  Security_Crypto: '#ff4444', Web_Development: '#00ff88', Data_Science: '#ffd600',
+  DevOps_Cloud: '#ff8c00', Mathematics: '#4fc3f7', Engineering: '#ba68c8',
+  Design_Art: '#f06292', Business_Finance: '#66bb6a', Science_Research: '#26c6da',
+  Philosophy_Logic: '#ab47bc', Writing_Communication: '#ef5350', Music_Audio: '#7e57c2',
+  Health_Medicine: '#66bb6a', Law_Ethics: '#8d6e63', Education: '#42a5f5',
+  Gaming_Entertainment: '#ff7043', Social_Psychology: '#ec407a', Networking_Protocols: '#29b6f6',
+  Hardware_IoT: '#78909c', Languages_Linguistics: '#ffca28', History_Culture: '#a1887f',
+  General: '#78909c'
+};
+
+let peers = [];
+let activities = [];
+let startTime = Date.now();
+
+// Format numbers nicely
+function fmt(n) {
+  if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n/1000).toFixed(1) + 'K';
+  return n.toString();
+}
+
+// Format uptime
+function fmtTime(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+
+// Render peers list
+function renderPeers() {
+  const el = document.getElementById('peerList');
+  document.getElementById('peerBadge').textContent = peers.length + ' online';
+  document.getElementById('peerCount').textContent = peers.length;
+
+  if (peers.length === 0) {
+    el.innerHTML = `<div class="empty-state">
+      <div class="icon">&#x1F9E0;</div>
+      <div class="msg">No brains connected yet</div>
+      <div class="hint">Launch ObsidianX Client to connect</div>
+    </div>`;
+    return;
+  }
+
+  let totalNodes = 0, totalWords = 0;
+  el.innerHTML = peers.map(p => {
+    totalNodes += p.totalKnowledgeNodes || 0;
+    totalWords += p.totalWords || 0;
+    const initials = (p.displayName || '?').split(' ').map(w => w[0]).join('').slice(0,2).toUpperCase();
+    const tags = (p.topExpertise || []).map(e =>
+      `<span class="peer-tag expertise" style="border-color:${CATEGORY_COLORS[e.category]||'#888'};color:${CATEGORY_COLORS[e.category]||'#888'}">${e.category.replace('_','/')}</span>`
+    ).join('');
+    return `<div class="peer-item">
+      <div class="peer-avatar">${initials}</div>
+      <div class="peer-info">
+        <div class="peer-name">${p.displayName || 'Unknown'}</div>
+        <div class="peer-address">${p.brainAddress || ''}</div>
+        <div class="peer-tags">${tags}</div>
+      </div>
+      <div class="peer-stats">
+        <div class="nodes">${p.totalKnowledgeNodes || 0}</div>
+        <div class="words">${fmt(p.totalWords||0)} words</div>
+      </div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('knowledgeCount').textContent = fmt(totalNodes);
+  document.getElementById('wordCount').textContent = fmt(totalWords);
+}
+
+// Render activity feed
+function renderActivity() {
+  const el = document.getElementById('activityList');
+  if (activities.length === 0) {
+    el.innerHTML = `<div class="empty-state">
+      <div class="icon">&#x1F4E1;</div>
+      <div class="msg">Waiting for activity...</div>
+      <div class="hint">Events will appear here in real-time</div>
+    </div>`;
+    return;
+  }
+
+  el.innerHTML = activities.map(a => {
+    let msg = a.replace(/\[.*?\]\s*/, '');
+    const time = a.match(/\[(.*?)\]/)?.[1] || '';
+    // Colorize
+    if (msg.includes('joined') || msg.includes('Brain joined'))
+      msg = `<span class="highlight-join">${msg}</span>`;
+    else if (msg.includes('left') || msg.includes('Brain left'))
+      msg = `<span class="highlight-leave">${msg}</span>`;
+    else if (msg.includes('Share'))
+      msg = `<span class="highlight-share">${msg}</span>`;
+    else if (msg.includes('Match'))
+      msg = `<span class="highlight-match">${msg}</span>`;
+    return `<div class="activity-item">
+      <span class="activity-time">${time}</span>
+      <span class="activity-msg">${msg}</span>
+    </div>`;
+  }).join('');
+}
+
+// Render category map
+function renderCategories() {
+  const catMap = {};
+  peers.forEach(p => {
+    (p.topExpertise || []).forEach(e => {
+      catMap[e.category] = (catMap[e.category] || 0) + 1;
+    });
+  });
+
+  const el = document.getElementById('categoryMap');
+  const cats = Object.entries(catMap).sort((a,b) => b[1] - a[1]);
+  document.getElementById('catBadge').textContent = cats.length + ' active';
+
+  if (cats.length === 0) {
+    el.innerHTML = `<div class="empty-state" style="width:100%">
+      <div class="icon">&#x1F310;</div>
+      <div class="msg">Expertise map populates when brains connect</div>
+    </div>`;
+    return;
+  }
+
+  el.innerHTML = cats.map(([cat, count]) => {
+    const color = CATEGORY_COLORS[cat] || '#888';
+    return `<div class="category-bubble" style="border-color:${color};color:${color};background:${color}15">
+      ${cat.replace('_','/')} <strong>&times;${count}</strong>
+    </div>`;
+  }).join('');
+}
+
+// Fetch current state
+async function refresh() {
+  try {
+    const [pRes, sRes] = await Promise.all([
+      fetch('/api/peers').then(r => r.json()),
+      fetch('/api/stats').then(r => r.json())
+    ]);
+    peers = pRes;
+    activities = sRes.recentActivity || [];
+    document.getElementById('shareCount').textContent = sRes.totalShareRequests || 0;
+    startTime = Date.now() - (sRes.uptime || 0) * 1000;
+    renderPeers();
+    renderActivity();
+    renderCategories();
+  } catch(e) { console.warn('Refresh failed:', e); }
+}
+
+// Uptime ticker
+setInterval(() => {
+  const sec = (Date.now() - startTime) / 1000;
+  document.getElementById('uptime').textContent = fmtTime(sec);
+}, 1000);
+
+// Poll for updates (simple & reliable)
+setInterval(refresh, 3000);
+
+// Initial load
+refresh();
+
+// Also connect via SignalR for instant updates
+(async () => {
+  try {
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl('/brain-hub')
+      .withAutomaticReconnect()
+      .build();
+
+    connection.on('PeerJoined', () => refresh());
+    connection.on('PeerLeft', () => refresh());
+    connection.on('ShareRequested', () => refresh());
+    connection.on('ShareResponse', () => refresh());
+
+    await connection.start();
+    console.log('Dashboard connected to SignalR hub');
+  } catch(e) {
+    console.warn('SignalR connection failed, using polling only:', e);
+  }
+})();
+</script>
+</body>
+</html>

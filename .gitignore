@@ -1,0 +1,41 @@
+# Build results
+bin/
+obj/
+out/
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.idea/
+
+# NuGet
+*.nupkg
+packages/
+project.lock.json
+project.fragment.lock.json
+
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
+nlog-*.log
+
+# User-specific
+launchSettings.json
+
+# Identity files (sensitive)
+.obsidianx/identity.json
+
+# Temp
+*.tmp
+*.bak
+*.swp
+~$*
