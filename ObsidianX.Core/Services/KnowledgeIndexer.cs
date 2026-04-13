@@ -104,13 +104,15 @@ public partial class KnowledgeIndexer
 
         // Categorize
         var scores = CalculateCategoryScores(content, tags);
+        if (scores.Count == 0)
+            scores[KnowledgeCategory.Other] = 0.1;
         var sorted = scores.OrderByDescending(kv => kv.Value).ToList();
 
         var node = new KnowledgeNode
         {
             Title = title,
             FilePath = filePath,
-            PrimaryCategory = sorted.FirstOrDefault().Key,
+            PrimaryCategory = sorted[0].Key,
             SecondaryCategories = sorted.Skip(1).Take(3).Where(kv => kv.Value > 0.1).Select(kv => kv.Key).ToList(),
             Tags = tags.Distinct().ToList(),
             WordCount = words.Length,

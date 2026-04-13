@@ -478,6 +478,12 @@ let peers = [];
 let activities = [];
 let startTime = Date.now();
 
+// XSS protection
+function esc(text) {
+  const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
+  return String(text || '').replace(/[&<>"']/g, m => map[m]);
+}
+
 // Format numbers nicely
 function fmt(n) {
   if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
@@ -512,15 +518,15 @@ function renderPeers() {
   el.innerHTML = peers.map(p => {
     totalNodes += p.totalKnowledgeNodes || 0;
     totalWords += p.totalWords || 0;
-    const initials = (p.displayName || '?').split(' ').map(w => w[0]).join('').slice(0,2).toUpperCase();
+    const initials = esc((p.displayName || '?').split(' ').map(w => w[0]).join('').slice(0,2).toUpperCase());
     const tags = (p.topExpertise || []).map(e =>
-      `<span class="peer-tag expertise" style="border-color:${CATEGORY_COLORS[e.category]||'#888'};color:${CATEGORY_COLORS[e.category]||'#888'}">${e.category.replace('_','/')}</span>`
+      `<span class="peer-tag expertise" style="border-color:${CATEGORY_COLORS[e.category]||'#888'};color:${CATEGORY_COLORS[e.category]||'#888'}">${esc(e.category.replace('_','/'))}</span>`
     ).join('');
     return `<div class="peer-item">
       <div class="peer-avatar">${initials}</div>
       <div class="peer-info">
-        <div class="peer-name">${p.displayName || 'Unknown'}</div>
-        <div class="peer-address">${p.brainAddress || ''}</div>
+        <div class="peer-name">${esc(p.displayName || 'Unknown')}</div>
+        <div class="peer-address">${esc(p.brainAddress || '')}</div>
         <div class="peer-tags">${tags}</div>
       </div>
       <div class="peer-stats">
@@ -547,8 +553,8 @@ function renderActivity() {
   }
 
   el.innerHTML = activities.map(a => {
-    let msg = a.replace(/\[.*?\]\s*/, '');
-    const time = a.match(/\[(.*?)\]/)?.[1] || '';
+    let msg = esc(a.replace(/\[.*?\]\s*/, ''));
+    const time = esc(a.match(/\[(.*?)\]/)?.[1] || '');
     // Colorize
     if (msg.includes('joined') || msg.includes('Brain joined'))
       msg = `<span class="highlight-join">${msg}</span>`;
@@ -589,7 +595,7 @@ function renderCategories() {
   el.innerHTML = cats.map(([cat, count]) => {
     const color = CATEGORY_COLORS[cat] || '#888';
     return `<div class="category-bubble" style="border-color:${color};color:${color};background:${color}15">
-      ${cat.replace('_','/')} <strong>&times;${count}</strong>
+      ${esc(cat.replace('_','/'))} <strong>&times;${count}</strong>
     </div>`;
   }).join('');
 }

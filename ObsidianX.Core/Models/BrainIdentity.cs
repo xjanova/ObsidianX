@@ -16,7 +16,7 @@ public class BrainIdentity
     [JsonIgnore] public string PrivateKey { get; set; } = string.Empty;
     public string DisplayName { get; set; } = string.Empty;
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
-    public string AvatarSeed => Address[..16];
+    public string AvatarSeed => Address.Length >= 16 ? Address[..16] : Address;
 
     public static BrainIdentity Generate(string displayName = "Anonymous Brain")
     {
@@ -40,6 +40,8 @@ public class BrainIdentity
 
     public string Sign(string data)
     {
+        if (string.IsNullOrEmpty(PrivateKey))
+            throw new InvalidOperationException("Private key not set");
         using var ecdsa = ECDsa.Create();
         ecdsa.ImportECPrivateKey(Convert.FromBase64String(PrivateKey), out _);
         var dataBytes = Encoding.UTF8.GetBytes(data);
@@ -49,11 +51,18 @@ public class BrainIdentity
 
     public static bool Verify(string data, string signature, string publicKey)
     {
-        using var ecdsa = ECDsa.Create();
-        ecdsa.ImportSubjectPublicKeyInfo(Convert.FromBase64String(publicKey), out _);
-        var dataBytes = Encoding.UTF8.GetBytes(data);
-        var sigBytes = Convert.FromBase64String(signature);
-        return ecdsa.VerifyData(dataBytes, sigBytes, HashAlgorithmName.SHA256);
+        if (string.IsNullOrEmpty(publicKey) || string.IsNullOrEmpty(signature))
+            return false;
+        try
+        {
+            using var ecdsa = ECDsa.Create();
+            ecdsa.ImportSubjectPublicKeyInfo(Convert.FromBase64String(publicKey), out _);
+            var dataBytes = Encoding.UTF8.GetBytes(data);
+            var sigBytes = Convert.FromBase64String(signature);
+            return ecdsa.VerifyData(dataBytes, sigBytes, HashAlgorithmName.SHA256);
+        }
+        catch (FormatException) { return false; }
+        catch (CryptographicException) { return false; }
     }
 
     public void SaveToFile(string path)

@@ -6,10 +6,16 @@ namespace ObsidianX.Server.Hubs;
 public class BrainHub : Hub
 {
     private static readonly Dictionary<string, PeerInfo> ConnectedPeers = new();
+    private static readonly Dictionary<string, string> EndpointToAddress = new();
     private static readonly List<ShareRequest> PendingRequests = [];
     private static readonly List<string> ActivityLog = [];
-    private static DateTime _startTime = DateTime.UtcNow;
+    private static readonly DateTime StartTime = DateTime.UtcNow;
     private static int _totalShareRequests;
+
+    private const int MaxPendingRequests = 10_000;
+    private const int MaxKeywords = 50;
+    private const int MaxResults = 100;
+    private const int MaxDisplayNameLength = 100;
 
     public static object GetPeersSnapshot()
     {
@@ -32,6 +38,12 @@ public class BrainHub : Hub
 
     public static object GetStatsSnapshot()
     {
+        List<string> recentActivity;
+        lock (ActivityLog)
+        {
+            recentActivity = ActivityLog.TakeLast(20).Reverse().ToList();
+        }
+
         lock (ConnectedPeers)
         {
             return new
@@ -41,8 +53,8 @@ public class BrainHub : Hub
                 TotalKnowledge = ConnectedPeers.Values.Sum(p => p.TotalKnowledgeNodes),
                 TotalWords = ConnectedPeers.Values.Sum(p => p.TotalWords),
                 TotalShareRequests = _totalShareRequests,
-                Uptime = (DateTime.UtcNow - _startTime).TotalSeconds,
-                RecentActivity = ActivityLog.TakeLast(20).Reverse().ToList()
+                Uptime = (DateTime.UtcNow - StartTime).TotalSeconds,
+                RecentActivity = recentActivity
             };
         }
     }
@@ -56,15 +68,33 @@ public class BrainHub : Hub
         }
     }
 
-    public async Task RegisterBrain(PeerInfo peerInfo)
+    private static string Sanitize(string? input, int maxLen = 200)
     {
+        if (string.IsNullOrWhiteSpace(input)) return "";
+        return input.Length > maxLen ? input[..maxLen] : input;
+    }
+
+    public async Task RegisterBrain(PeerInfo? peerInfo)
+    {
+        if (peerInfo == null
+            || string.IsNullOrWhiteSpace(peerInfo.BrainAddress)
+            || string.IsNullOrWhiteSpace(peerInfo.DisplayName))
+        {
+            await Clients.Caller.SendAsync("Error", "Invalid peer info: address and name required");
+            return;
+        }
+
+        peerInfo.DisplayName = Sanitize(peerInfo.DisplayName, MaxDisplayNameLength);
         peerInfo.Status = PeerStatus.Online;
         peerInfo.LastSeen = DateTime.UtcNow;
         peerInfo.Endpoint = Context.ConnectionId;
 
+        int totalPeers;
         lock (ConnectedPeers)
         {
             ConnectedPeers[peerInfo.BrainAddress] = peerInfo;
+            EndpointToAddress[Context.ConnectionId] = peerInfo.BrainAddress;
+            totalPeers = ConnectedPeers.Count;
         }
 
         await Clients.All.SendAsync("PeerJoined", peerInfo);
@@ -72,16 +102,26 @@ public class BrainHub : Hub
         {
             Success = true,
             YourAddress = peerInfo.BrainAddress,
-            TotalPeers = ConnectedPeers.Count,
-            Message = $"Welcome to ObsidianX Network! {ConnectedPeers.Count} brains connected."
+            TotalPeers = totalPeers,
+            Message = $"Welcome to ObsidianX Network! {totalPeers} brains connected."
         });
 
-        LogActivity($"Brain joined: {peerInfo.DisplayName} ({peerInfo.BrainAddress[..18]}...)");
+        var shortAddr = peerInfo.BrainAddress.Length > 18 ? peerInfo.BrainAddress[..18] + "..." : peerInfo.BrainAddress;
+        LogActivity($"Brain joined: {peerInfo.DisplayName} ({shortAddr})");
         Console.WriteLine($"[+] Brain registered: {peerInfo.BrainAddress} ({peerInfo.DisplayName})");
     }
 
-    public async Task<List<MatchResult>> FindExperts(MatchRequest request)
+    public async Task<List<MatchResult>> FindExperts(MatchRequest? request)
     {
+        if (request == null || string.IsNullOrWhiteSpace(request.RequesterAddress))
+            throw new HubException("Invalid match request");
+
+        request.Keywords ??= [];
+        if (request.Keywords.Count > MaxKeywords)
+            request.Keywords = request.Keywords.Take(MaxKeywords).ToList();
+        if (request.MaxResults is < 1 or > MaxResults)
+            request.MaxResults = 20;
+
         List<PeerInfo> peers;
         lock (ConnectedPeers)
         {
@@ -97,10 +137,10 @@ public class BrainHub : Hub
                 if (peer.ExpertiseScores.TryGetValue(request.DesiredCategory, out var expertise))
                     score = expertise;
 
-                // Keyword bonus
                 foreach (var keyword in request.Keywords)
                 {
-                    if (peer.DisplayName.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                    if (!string.IsNullOrEmpty(keyword) &&
+                        peer.DisplayName.Contains(keyword, StringComparison.OrdinalIgnoreCase))
                         score += 0.1;
                 }
 
@@ -124,12 +164,24 @@ public class BrainHub : Hub
         return results;
     }
 
-    public async Task RequestShare(ShareRequest request)
+    public async Task RequestShare(ShareRequest? request)
     {
+        if (request == null
+            || string.IsNullOrWhiteSpace(request.FromAddress)
+            || string.IsNullOrWhiteSpace(request.ToAddress))
+        {
+            throw new HubException("Invalid share request");
+        }
+
         lock (PendingRequests)
         {
+            // Cap pending requests to prevent memory exhaustion
+            if (PendingRequests.Count >= MaxPendingRequests)
+                PendingRequests.RemoveAll(r => r.Status != ShareStatus.Pending);
             PendingRequests.Add(request);
         }
+
+        Interlocked.Increment(ref _totalShareRequests);
 
         PeerInfo? target;
         lock (ConnectedPeers)
@@ -137,17 +189,19 @@ public class BrainHub : Hub
             ConnectedPeers.TryGetValue(request.ToAddress, out target);
         }
 
-        _totalShareRequests++;
         if (target != null)
         {
             await Clients.Client(target.Endpoint).SendAsync("ShareRequested", request);
-            LogActivity($"Share request: {request.NodeTitle} → {request.ToAddress[..18]}...");
+            var shortAddr = request.ToAddress.Length > 18 ? request.ToAddress[..18] + "..." : request.ToAddress;
+            LogActivity($"Share request: {Sanitize(request.NodeTitle, 60)} → {shortAddr}");
             Console.WriteLine($"[>] Share request: {request.FromAddress} -> {request.ToAddress} ({request.NodeTitle})");
         }
     }
 
-    public async Task RespondToShare(string fromAddress, bool accepted)
+    public async Task RespondToShare(string? fromAddress, bool accepted)
     {
+        if (string.IsNullOrWhiteSpace(fromAddress)) return;
+
         ShareRequest? request;
         lock (PendingRequests)
         {
@@ -207,19 +261,23 @@ public class BrainHub : Hub
         var disconnected = string.Empty;
         lock (ConnectedPeers)
         {
-            var peer = ConnectedPeers.Values.FirstOrDefault(p => p.Endpoint == Context.ConnectionId);
-            if (peer != null)
+            if (EndpointToAddress.TryGetValue(Context.ConnectionId, out var address))
             {
-                peer.Status = PeerStatus.Offline;
-                disconnected = peer.BrainAddress;
-                ConnectedPeers.Remove(peer.BrainAddress);
+                EndpointToAddress.Remove(Context.ConnectionId);
+                if (ConnectedPeers.TryGetValue(address, out var peer))
+                {
+                    peer.Status = PeerStatus.Offline;
+                    disconnected = address;
+                    ConnectedPeers.Remove(address);
+                }
             }
         }
 
         if (!string.IsNullOrEmpty(disconnected))
         {
             await Clients.All.SendAsync("PeerLeft", disconnected);
-            LogActivity($"Brain left: {disconnected[..18]}...");
+            var shortAddr = disconnected.Length > 18 ? disconnected[..18] + "..." : disconnected;
+            LogActivity($"Brain left: {shortAddr}");
             Console.WriteLine($"[-] Brain disconnected: {disconnected}");
         }
 

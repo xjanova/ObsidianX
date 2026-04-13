@@ -762,6 +762,18 @@ public partial class MainWindow : Window
         WindowState = WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized;
     private void Close_Click(object s, RoutedEventArgs e) => Close();
 
+    private async void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        // Save any unsaved editor work
+        _mdEditor?.Save();
+
+        // Unsubscribe render loop
+        CompositionTarget.Rendering -= OnRenderFrame;
+
+        // Disconnect from network
+        try { await _network.DisconnectAsync(); } catch { }
+    }
+
     private void CopyAddress_Click(object s, MouseButtonEventArgs e)
     {
         Clipboard.SetText(_identity.Address);
@@ -848,7 +860,11 @@ public partial class MainWindow : Window
 
     private async void LeaveNetwork_Click(object s, RoutedEventArgs e)
     {
-        await _network.DisconnectAsync();
+        try
+        {
+            await _network.DisconnectAsync();
+        }
+        catch { }
         JoinNetworkBtn.Content = "\U0001F310 Join ObsidianX Network";
         JoinNetworkBtn.IsEnabled = true;
         LeaveNetworkBtn.Visibility = Visibility.Collapsed;
@@ -867,13 +883,22 @@ public partial class MainWindow : Window
             ? Enum.Parse<KnowledgeCategory>(item.Tag.ToString()!)
             : KnowledgeCategory.Programming;
 
-        var results = await _network.FindExpertsAsync(new MatchRequest
+        List<MatchResult> results;
+        try
         {
-            RequesterAddress = _identity.Address,
-            DesiredCategory = category,
-            MinExpertiseScore = 0.1,
-            MaxResults = 10
-        });
+            results = await _network.FindExpertsAsync(new MatchRequest
+            {
+                RequesterAddress = _identity.Address,
+                DesiredCategory = category,
+                MinExpertiseScore = 0.1,
+                MaxResults = 10
+            });
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = $"Search failed: {ex.Message}";
+            return;
+        }
 
         MatchResultsList.Children.Clear();
         if (results.Count == 0)
@@ -930,17 +955,25 @@ public partial class MainWindow : Window
     private async void RequestShare_Click(object sender, RoutedEventArgs e)
     {
         if (sender is not Button btn || btn.Tag is not string targetAddress) return;
-        await _network.RequestShareAsync(new ShareRequest
+        try
         {
-            FromAddress = _identity.Address,
-            ToAddress = targetAddress,
-            NodeTitle = "Knowledge Exchange",
-            Category = KnowledgeCategory.Other,
-            WordCount = (int)_graph.TotalWords,
-            Signature = _identity.Sign(targetAddress)
-        });
-        _shareHistory.Add($"[SENT] Request to {targetAddress[..20]}...");
-        StatusText.Text = "Share request sent!";
+            await _network.RequestShareAsync(new ShareRequest
+            {
+                FromAddress = _identity.Address,
+                ToAddress = targetAddress,
+                NodeTitle = "Knowledge Exchange",
+                Category = KnowledgeCategory.Other,
+                WordCount = (int)_graph.TotalWords,
+                Signature = _identity.Sign(targetAddress)
+            });
+            var shortAddr = targetAddress.Length > 20 ? targetAddress[..20] + "..." : targetAddress;
+            _shareHistory.Add($"[SENT] Request to {shortAddr}");
+            StatusText.Text = "Share request sent!";
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = $"Share request failed: {ex.Message}";
+        }
     }
 
     private void ExportStats_Click(object s, RoutedEventArgs e)

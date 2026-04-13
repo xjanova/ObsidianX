@@ -80,7 +80,7 @@ public class ClaudeIntegration
             ? prompt
             : $"Context from my ObsidianX vault:\n{context}\n\nQuestion: {prompt}";
 
-        var psi = new ProcessStartInfo("claude", $"--print \"{fullPrompt.Replace("\"", "\\\"")}\"")
+        var psi = new ProcessStartInfo("claude")
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -88,12 +88,21 @@ public class ClaudeIntegration
             CreateNoWindow = true,
             WorkingDirectory = _vaultPath
         };
+        psi.ArgumentList.Add("--print");
+        psi.ArgumentList.Add(fullPrompt);
 
         using var proc = Process.Start(psi);
         if (proc == null) return "Error: Could not start Claude Code";
 
-        var output = await proc.StandardOutput.ReadToEndAsync();
+        var outputTask = proc.StandardOutput.ReadToEndAsync();
+        var errorTask = proc.StandardError.ReadToEndAsync();
         await proc.WaitForExitAsync();
+
+        var error = await errorTask;
+        if (proc.ExitCode != 0 && !string.IsNullOrEmpty(error))
+            return $"Error: {error.Trim()}";
+
+        var output = await outputTask;
         return output.Trim();
     }
 
