@@ -973,6 +973,160 @@
                                             </StackPanel>
                                         </Border>
 
+                                        <!-- Auto-Import Scanner -->
+                                        <Border Style="{StaticResource CardPanel}" Margin="0,0,0,12">
+                                            <StackPanel>
+                                                <TextBlock Text="AUTO-IMPORT SCANNER (Resonance Scan)" FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,8"/>
+                                                <TextBlock FontSize="11" Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,12"
+                                                           TextWrapping="Wrap">
+                                                    Scans paths for CLAUDE.md, README.md, *.md using a priority-queue filesystem walk with
+                                                    archetype-aware descent and 64-bit SimHash near-duplicate detection. Pruned subtrees are never touched.
+                                                </TextBlock>
+
+                                                <TextBlock Text="Scan paths" FontSize="11"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                <ListBox x:Name="ScanPathsList" Height="80"
+                                                         Background="{StaticResource SurfaceBrush}"
+                                                         Foreground="{StaticResource TextPrimaryBrush}"
+                                                         BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1"
+                                                         Margin="0,0,0,8"/>
+                                                <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+                                                    <Button Content="+ Add folder" Style="{StaticResource NeonButton}"
+                                                            Click="AddScanPath_Click" Padding="12,6" Margin="0,0,8,0"/>
+                                                    <Button Content="− Remove" Style="{StaticResource NeonButton}"
+                                                            Click="RemoveScanPath_Click" Padding="12,6"/>
+                                                </StackPanel>
+
+                                                <CheckBox x:Name="ScanWholeMachineCheck" Content="Scan whole machine (all fixed drives — slower)"
+                                                          Foreground="{StaticResource TextPrimaryBrush}" Margin="0,0,0,8"
+                                                          Checked="ScanWholeMachineCheck_Changed" Unchecked="ScanWholeMachineCheck_Changed"/>
+                                                <CheckBox x:Name="AutoScanOnStartupCheck" Content="Auto-scan + import on startup"
+                                                          Foreground="{StaticResource TextPrimaryBrush}" Margin="0,0,0,12"
+                                                          Checked="AutoScanOnStartup_Changed" Unchecked="AutoScanOnStartup_Changed"/>
+
+                                                <TextBlock Text="File patterns (semicolon-separated, supports *, ?)" FontSize="11"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                <TextBox x:Name="ScanPatternsBox" Style="{StaticResource NeonTextBox}"
+                                                         Text="CLAUDE.md;README.md;*.md" Margin="0,0,0,8"/>
+
+                                                <TextBlock Text="Import mode" FontSize="11"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                <ComboBox x:Name="ImportModeCombo" Margin="0,0,0,12"
+                                                          Background="{StaticResource SurfaceBrush}"
+                                                          Foreground="{StaticResource TextPrimaryBrush}"
+                                                          SelectionChanged="ImportMode_Changed">
+                                                    <ComboBoxItem Content="Reference — stub + wiki-link to original (safer)" IsSelected="True"/>
+                                                    <ComboBoxItem Content="Copy — full content copied into vault"/>
+                                                </ComboBox>
+
+                                                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                                    <Button x:Name="PreviewScanButton" Content="Preview Scan"
+                                                            Style="{StaticResource NeonButton}"
+                                                            Click="PreviewScan_Click" Padding="16,8" Margin="0,0,8,0"/>
+                                                    <Button x:Name="ImportScanButton" Content="Import Now"
+                                                            Style="{StaticResource NeonButtonFilled}"
+                                                            Click="ImportScan_Click" Padding="16,8"
+                                                            Margin="0,0,8,0" IsEnabled="False"/>
+                                                    <Button Content="Save Patterns" Style="{StaticResource NeonButton}"
+                                                            Click="SaveScanPatterns_Click" Padding="16,8"/>
+                                                </StackPanel>
+                                                <TextBlock x:Name="ScanStatusText" FontSize="11"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"
+                                                           Margin="0,0,0,8"/>
+                                                <ListBox x:Name="ScanResultsList" Height="140"
+                                                         FontFamily="{StaticResource MonoFont}" FontSize="11"
+                                                         Background="{StaticResource SurfaceBrush}"
+                                                         Foreground="{StaticResource TextPrimaryBrush}"
+                                                         BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1"/>
+                                            </StackPanel>
+                                        </Border>
+
+                                        <!-- Brain Export -->
+                                        <Border Style="{StaticResource CardPanel}" Margin="0,0,0,12">
+                                            <StackPanel>
+                                                <TextBlock Text="BRAIN EXPORT (for Claude &amp; external tools)" FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,8"/>
+                                                <TextBlock FontSize="11" Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap" Margin="0,0,0,12">
+                                                    Writes a machine-readable fingerprint of this brain so Claude and any external tool can
+                                                    pull your expertise without understanding ObsidianX internals. Updates a managed section
+                                                    in CLAUDE.md automatically.
+                                                </TextBlock>
+                                                <StackPanel Margin="0,0,0,12">
+                                                    <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11">
+                                                        • <Run FontFamily="{StaticResource MonoFont}">.obsidianx/brain-export.json</Run> — full index (schema brain-export/v1)
+                                                    </TextBlock>
+                                                    <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11">
+                                                        • <Run FontFamily="{StaticResource MonoFont}">.obsidianx/brain-export.md</Run> — human-readable card
+                                                    </TextBlock>
+                                                    <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11">
+                                                        • <Run FontFamily="{StaticResource MonoFont}">.obsidianx/brain-manifest.json</Run> — tiny fingerprint
+                                                    </TextBlock>
+                                                    <TextBlock Foreground="{StaticResource TextSecondaryBrush}" FontSize="11">
+                                                        • REST endpoints on server: <Run FontFamily="{StaticResource MonoFont}">/api/brain/export</Run>, <Run FontFamily="{StaticResource MonoFont}">/api/brain/search?q=</Run>, <Run FontFamily="{StaticResource MonoFont}">/api/brain/expertise</Run>
+                                                    </TextBlock>
+                                                </StackPanel>
+                                                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                                    <Button Content="Export Brain Now" Style="{StaticResource NeonButtonFilled}"
+                                                            Click="ExportBrain_Click" Padding="16,8" Margin="0,0,8,0"/>
+                                                    <Button Content="Open .obsidianx folder" Style="{StaticResource NeonButton}"
+                                                            Click="OpenExportFolder_Click" Padding="16,8"/>
+                                                </StackPanel>
+                                                <TextBlock x:Name="ExportStatusText" FontSize="11"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                        </Border>
+
+                                        <!-- Claude Code CLI Integration -->
+                                        <Border Style="{StaticResource CardPanel}" Margin="0,0,0,12">
+                                            <StackPanel>
+                                                <TextBlock Text="CLAUDE CODE CLI INTEGRATION (MCP)" FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,8"/>
+                                                <TextBlock FontSize="11" Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap" Margin="0,0,0,12">
+                                                    Exposes your brain as MCP tools (brain_search, brain_get_note, brain_expertise, brain_list,
+                                                    brain_stats, brain_import_path) so any Claude Code CLI session — anywhere on your machine —
+                                                    can query this brain directly. No manual JSON editing.
+                                                </TextBlock>
+
+                                                <TextBlock Text="Install command" FontSize="11"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                <TextBox x:Name="McpInstallCommand" Style="{StaticResource NeonTextBox}"
+                                                         IsReadOnly="True" FontFamily="{StaticResource MonoFont}" FontSize="11"
+                                                         TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+                                                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                                    <Button Content="Install in Claude Code CLI" Style="{StaticResource NeonButtonFilled}"
+                                                            Click="InstallMcp_Click" Padding="16,8" Margin="0,0,8,0"/>
+                                                    <Button Content="Copy Command" Style="{StaticResource NeonButton}"
+                                                            Click="CopyMcpCommand_Click" Padding="16,8" Margin="0,0,8,0"/>
+                                                    <Button Content="Build MCP Server" Style="{StaticResource NeonButton}"
+                                                            Click="BuildMcpServer_Click" Padding="16,8" Margin="0,0,8,0"/>
+                                                    <Button Content="Uninstall" Style="{StaticResource NeonButton}"
+                                                            Click="UninstallMcp_Click" Padding="16,8"/>
+                                                </StackPanel>
+                                                <TextBlock x:Name="McpStatusText" FontSize="11"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap" Margin="0,0,0,12"/>
+
+                                                <Expander Header="Manual config (for Claude Desktop / Cursor / other MCP clients)"
+                                                          Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,0">
+                                                    <StackPanel Margin="0,8,0,0">
+                                                        <TextBlock FontSize="11" Foreground="{StaticResource TextSecondaryBrush}"
+                                                                   TextWrapping="Wrap" Margin="0,0,0,8">
+                                                            Paste into your MCP client's config (e.g. claude_desktop_config.json → mcpServers):
+                                                        </TextBlock>
+                                                        <TextBox x:Name="McpManualConfig" Style="{StaticResource NeonTextBox}"
+                                                                 IsReadOnly="True" FontFamily="{StaticResource MonoFont}" FontSize="10"
+                                                                 TextWrapping="NoWrap" AcceptsReturn="True" Height="140"
+                                                                 HorizontalScrollBarVisibility="Auto"
+                                                                 VerticalScrollBarVisibility="Auto"/>
+                                                        <Button Content="Copy JSON" Style="{StaticResource NeonButton}"
+                                                                Click="CopyMcpConfig_Click" Padding="12,6" Margin="0,8,0,0"
+                                                                HorizontalAlignment="Left"/>
+                                                    </StackPanel>
+                                                </Expander>
+                                            </StackPanel>
+                                        </Border>
+
                                         <!-- About -->
                                         <Border Style="{StaticResource CardPanel}">
                                             <StackPanel>

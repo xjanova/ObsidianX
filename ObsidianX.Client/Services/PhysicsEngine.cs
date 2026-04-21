@@ -17,6 +17,12 @@ public class PhysicsNode
     public double PulsePhase { get; set; }
     public int WordCount { get; set; }
     public List<string> LinkedIds { get; set; } = [];
+
+    // Knowledge-pulse state: 0..1, decays over time, bumps to 1 when the node
+    // is accessed via MCP (brain_search / brain_get_note) or a peer share.
+    public double AccessIntensity { get; set; }
+    public int AccessCount { get; set; }
+    public DateTime LastAccessedAt { get; set; } = DateTime.MinValue;
 }
 
 public class PhysicsEdge
@@ -51,15 +57,19 @@ public class PhysicsEngine
         Nodes.Clear();
         Edges.Clear();
 
-        // Place nodes on a sphere with some randomness
-        int i = 0;
         int total = Math.Max(1, graph.Nodes.Count);
+        // For big graphs, near-zero initial velocity so it doesn't explode.
+        // Starting energy scales inversely with node count squared.
+        double velJitter = total > 40 ? 0.02 : total > 15 ? 0.1 : 0.3;
+
+        int i = 0;
         foreach (var node in graph.Nodes)
         {
-            // Fibonacci sphere distribution + jitter
+            // Fibonacci sphere — denser graph spreads wider
+            double radius = 3.0 + Math.Sqrt(total) * 0.15;
             double phi = Math.Acos(1 - 2.0 * (i + 0.5) / total);
             double theta = Math.PI * (1 + Math.Sqrt(5)) * i;
-            double r = 3.0 + (_rng.NextDouble() - 0.5) * 1.5;
+            double r = radius + (_rng.NextDouble() - 0.5) * 0.3;
 
             var pNode = new PhysicsNode
             {
@@ -72,9 +82,9 @@ public class PhysicsEngine
                     r * Math.Cos(phi),
                     r * Math.Sin(phi) * Math.Sin(theta)),
                 Velocity = new Vector3D(
-                    (_rng.NextDouble() - 0.5) * 0.5,
-                    (_rng.NextDouble() - 0.5) * 0.5,
-                    (_rng.NextDouble() - 0.5) * 0.5),
+                    (_rng.NextDouble() - 0.5) * velJitter,
+                    (_rng.NextDouble() - 0.5) * velJitter,
+                    (_rng.NextDouble() - 0.5) * velJitter),
                 Mass = Math.Max(0.5, Math.Log(1 + node.WordCount) * 0.3),
                 Radius = Math.Max(0.08, Math.Min(0.35, Math.Log(1 + node.WordCount) * 0.035)),
                 PulsePhase = _rng.NextDouble() * Math.PI * 2,
@@ -94,6 +104,36 @@ public class PhysicsEngine
                 Strength = edge.Strength
             });
         }
+
+        AutoTune();
+        Warmup(60);  // pre-settle so the user sees a calm graph
+    }
+
+    /// <summary>
+    /// Adapts physics constants to the current node count. Pairwise
+    /// repulsion grows O(N) per node, so we scale forces down as N rises;
+    /// we also raise damping and center gravity so large graphs stay coherent.
+    /// </summary>
+    public void AutoTune()
+    {
+        var n = Math.Max(1, Nodes.Count);
+        var inv = 1.0 / Math.Sqrt(n);
+
+        Repulsion       = Math.Max(0.8, 8.0 * inv * 2.5);         // 8 @ N=1  → ~2.5 @ N=10 → ~1.1 @ N=50
+        MaxVelocity     = Math.Max(0.35, 2.0 * inv * 1.8);        // 2.0 → ~1.1 @ N=10 → ~0.5 @ N=50
+        Damping         = n > 30 ? 0.80 : n > 10 ? 0.86 : 0.88;   // heavier damping for busy graphs
+        CenterGravity   = Math.Min(0.08, 0.02 + n * 0.0008);      // stronger pull for many nodes
+        BounceEnergy    = n > 30 ? 0.25 : 0.5;                    // less bouncy when crowded
+        SpringLength    = Math.Max(1.2, 2.5 - Math.Log(n) * 0.2); // tighter springs at high N
+    }
+
+    /// <summary>
+    /// Run physics for N steps without rendering. Used after LoadFromGraph
+    /// so the graph lands near equilibrium before the user sees it.
+    /// </summary>
+    public void Warmup(int steps)
+    {
+        for (int i = 0; i < steps; i++) Step(0.016);
     }
 
     /// <summary>

@@ -6,6 +6,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Media3D;
+using System.Windows.Threading;
 using System.Text.RegularExpressions;
 using ObsidianX.Client.Editor;
 using ObsidianX.Client.Services;
@@ -31,6 +32,21 @@ public partial class MainWindow : Window
     private string _serverUrl = "http://localhost:5142/brain-hub";
     private readonly List<ShareRequest> _incomingShares = [];
     private readonly List<string> _shareHistory = [];
+
+    // Auto-import + brain export
+    private readonly VaultImporter _importer = new();
+    private readonly BrainExporter _exporter = new();
+    private readonly List<string> _scanPaths = [];
+    private bool _scanWholeMachine;
+    private string _scanPatterns = "CLAUDE.md;README.md;*.md";
+    private bool _autoScanOnStartup;
+    private VaultImporter.ImportMode _importMode = VaultImporter.ImportMode.Reference;
+    private List<ScanHit> _lastScanHits = [];
+
+    // Access-log tail — MCP writes here when Claude pulls knowledge
+    private long _accessLogOffset;
+    private DispatcherTimer? _accessLogTimer;
+    private int _recentAccessCount;   // for status bar counter
 
     // Physics
     private readonly PhysicsEngine _dashPhysics = new();
@@ -91,14 +107,46 @@ public partial class MainWindow : Window
 
         // Load physics
         _dashPhysics.LoadFromGraph(_graph);
-        _dashPhysics.Disturb(0.5);
+        _dashPhysics.Disturb(_graph.TotalNodes > 20 ? 0.05 : 0.3);
         _graphPhysics.LoadFromGraph(_graph);
-        _graphPhysics.Disturb(0.8);
+        _graphPhysics.Disturb(_graph.TotalNodes > 20 ? 0.08 : 0.4);
 
         // Populate UI
         UpdateUI();
         PopulateMatchCategories();
         PopulateSettings();
+        PopulateImportSettings();
+        PopulateMcpCommands();
+        StartAccessLogWatcher();
+
+        // Auto-scan + export on startup, if enabled
+        if (_autoScanOnStartup && (_scanPaths.Count > 0 || _scanWholeMachine))
+        {
+            _ = Task.Run(() =>
+            {
+                var report = _importer.Scan(BuildImportOptions());
+                if (report.Hits.Count > 0)
+                {
+                    _importer.Import(report.Hits, BuildImportOptions());
+                    Dispatcher.Invoke(() =>
+                    {
+                        IndexVault();
+                        _dashPhysics.LoadFromGraph(_graph);
+                        _graphPhysics.LoadFromGraph(_graph);
+                        UpdateUI();
+                        RefreshVaultTree();
+                        _exporter.Export(_vaultPath, _identity, _graph);
+                        StatusText.Text = $"Auto-scan imported {report.Hits.Count} notes · brain exported";
+                    });
+                }
+            });
+        }
+        else
+        {
+            // Still do an export so brain-export.json is fresh on launch
+            try { _exporter.Export(_vaultPath, _identity, _graph); }
+            catch (Exception ex) { Debug.WriteLine($"Auto-export failed: {ex.Message}"); }
+        }
 
         // Wire network events (dispatch to UI thread)
         _network.StatusChanged += s => Dispatcher.Invoke(() => OnNetworkStatus(s));
@@ -156,6 +204,10 @@ public partial class MainWindow : Window
         _dashPhysics.Step();
         _graphPhysics.Step();
 
+        // Decay knowledge-pulse intensity each frame (~16ms)
+        DecayPulses(_dashPhysics, 0.016);
+        DecayPulses(_graphPhysics, 0.016);
+
         // Rebuild 3D meshes (optimized: single batched geometry)
         if (DashboardView.Visibility == Visibility.Visible)
         {
@@ -187,7 +239,9 @@ public partial class MainWindow : Window
         // --- BATCH ALL NODES INTO ONE MESH PER MATERIAL ---
         // Group nodes by category color for minimal draw calls
         var colorGroups = new Dictionary<Color, (MeshGeometry3D mesh, bool emissive)>();
-        var glowGroup = new MeshGeometry3D(); // selected/hovered glow
+        var glowGroup = new MeshGeometry3D();      // selected/hovered glow
+        var pulseGroups = new Dictionary<Color, MeshGeometry3D>(); // knowledge-pulse (MCP access)
+        var pulseAuraGroup = new MeshGeometry3D(); // outer aura around pulsed nodes
 
         for (int i = 0; i < physics.Nodes.Count; i++)
         {
@@ -200,6 +254,15 @@ public partial class MainWindow : Window
             if (isSelected || node.IsHovered)
                 radius *= 1.4; // bigger when selected
 
+            // Knowledge-pulse bump: 0.0 = normal, 1.0 = freshly accessed
+            var intensity = node.AccessIntensity;
+            if (intensity > 0.05)
+            {
+                // Fast oscillation on top of the decay so it "breathes"
+                var beat = 1.0 + Math.Sin(_time * 10 + node.PulsePhase) * 0.15 * intensity;
+                radius *= (1.0 + 0.8 * intensity) * beat;
+            }
+
             // Pick LOD based on node count
             var sphereMesh = physics.Nodes.Count > 100 ? SharedSphereLOD : SharedSphere;
 
@@ -207,6 +270,17 @@ public partial class MainWindow : Window
                 colorGroups[color] = (new MeshGeometry3D(), false);
 
             AppendSphereToMesh(colorGroups[color].mesh, node.Position, radius, sphereMesh);
+
+            // Extra hot-layer: bright overlay mesh for pulsed nodes
+            if (intensity > 0.05)
+            {
+                if (!pulseGroups.TryGetValue(color, out var pm))
+                    pulseGroups[color] = pm = new MeshGeometry3D();
+                AppendSphereToMesh(pm, node.Position, radius * 1.05, sphereMesh);
+                // Outer aura scales with intensity
+                AppendSphereToMesh(pulseAuraGroup, node.Position,
+                    radius * (1.6 + intensity * 0.8), SharedSphereLOD);
+            }
 
             // Glow ring for selected
             if (isSelected)
@@ -221,6 +295,28 @@ public partial class MainWindow : Window
             mat.Children.Add(new EmissiveMaterial(new SolidColorBrush(
                 Color.FromArgb(100, color.R, color.G, color.B))));
             group.Children.Add(new GeometryModel3D(mesh, mat) { BackMaterial = mat });
+        }
+
+        // Knowledge-pulse overlay: bright white-tinted emissive on top
+        foreach (var (color, mesh) in pulseGroups)
+        {
+            // White-hot core tinted toward category color
+            var hot = Color.FromArgb(230,
+                (byte)Math.Min(255, color.R + 140),
+                (byte)Math.Min(255, color.G + 140),
+                (byte)Math.Min(255, color.B + 140));
+            var pulseMat = new MaterialGroup();
+            pulseMat.Children.Add(new EmissiveMaterial(new SolidColorBrush(hot)));
+            group.Children.Add(new GeometryModel3D(mesh, pulseMat));
+        }
+
+        // Outer translucent aura — cyan regardless of category so "MCP pull" reads
+        // as a distinct signal on the graph
+        if (pulseAuraGroup.Positions.Count > 0)
+        {
+            var auraMat = new EmissiveMaterial(new SolidColorBrush(
+                Color.FromArgb(70, 0, 240, 255)));
+            group.Children.Add(new GeometryModel3D(pulseAuraGroup, auraMat));
         }
 
         // Glow for selected
@@ -849,9 +945,11 @@ public partial class MainWindow : Window
     {
         IndexVault();
         _dashPhysics.LoadFromGraph(_graph);
-        _dashPhysics.Disturb(1.0);
         _graphPhysics.LoadFromGraph(_graph);
-        _graphPhysics.Disturb(1.0);
+        // LoadFromGraph already auto-tunes + warmups — just a tiny kick
+        var kick = _graph.TotalNodes > 20 ? 0.05 : 0.3;
+        _dashPhysics.Disturb(kick);
+        _graphPhysics.Disturb(kick);
         UpdateUI();
         StatusText.Text = $"Re-indexed: {_graph.TotalNodes} nodes, {_graph.TotalEdges} edges";
     }
@@ -1528,10 +1626,15 @@ public partial class MainWindow : Window
         {
             var dir = Path.GetDirectoryName(SettingsFilePath)!;
             if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
-            var settings = new Dictionary<string, string>
+            var settings = new Dictionary<string, object>
             {
                 ["ServerUrl"] = _serverUrl,
-                ["BrainName"] = _identity.DisplayName
+                ["BrainName"] = _identity.DisplayName,
+                ["ScanPaths"] = _scanPaths,
+                ["ScanWholeMachine"] = _scanWholeMachine,
+                ["ScanPatterns"] = _scanPatterns,
+                ["AutoScanOnStartup"] = _autoScanOnStartup,
+                ["ImportMode"] = _importMode.ToString()
             };
             File.WriteAllText(SettingsFilePath,
                 Newtonsoft.Json.JsonConvert.SerializeObject(settings, Newtonsoft.Json.Formatting.Indented));
@@ -1545,12 +1648,474 @@ public partial class MainWindow : Window
         {
             if (!File.Exists(SettingsFilePath)) return;
             var json = File.ReadAllText(SettingsFilePath);
-            var settings = Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, string>>(json);
+            var settings = Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, object>>(json);
             if (settings == null) return;
-            if (settings.TryGetValue("ServerUrl", out var url) && !string.IsNullOrEmpty(url))
-                _serverUrl = url;
+            if (settings.TryGetValue("ServerUrl", out var url) && url != null)
+                _serverUrl = url.ToString() ?? _serverUrl;
+            if (settings.TryGetValue("ScanWholeMachine", out var swm) && swm != null)
+                bool.TryParse(swm.ToString(), out _scanWholeMachine);
+            if (settings.TryGetValue("ScanPatterns", out var sp) && sp != null)
+                _scanPatterns = sp.ToString() ?? _scanPatterns;
+            if (settings.TryGetValue("AutoScanOnStartup", out var asos) && asos != null)
+                bool.TryParse(asos.ToString(), out _autoScanOnStartup);
+            if (settings.TryGetValue("ImportMode", out var im) && im != null)
+                Enum.TryParse<VaultImporter.ImportMode>(im.ToString(), out _importMode);
+            if (settings.TryGetValue("ScanPaths", out var paths) && paths is Newtonsoft.Json.Linq.JArray arr)
+            {
+                _scanPaths.Clear();
+                foreach (var p in arr) if (p != null) _scanPaths.Add(p.ToString());
+            }
         }
         catch (Exception ex) { Debug.WriteLine($"Settings load error: {ex.Message}"); }
+    }
+
+    // ═══════════════════════════════════════
+    // AUTO-IMPORT SCANNER + BRAIN EXPORT
+    // ═══════════════════════════════════════
+
+    private ImportOptions BuildImportOptions() => new()
+    {
+        VaultPath = _vaultPath,
+        ScanPaths = [.._scanPaths],
+        ScanWholeMachine = _scanWholeMachine,
+        Patterns = _scanPatterns,
+        Mode = _importMode
+    };
+
+    private void PopulateImportSettings()
+    {
+        if (ScanPathsList == null) return;
+        ScanPathsList.Items.Clear();
+        foreach (var p in _scanPaths) ScanPathsList.Items.Add(p);
+        ScanPatternsBox.Text = _scanPatterns;
+        ScanWholeMachineCheck.IsChecked = _scanWholeMachine;
+        AutoScanOnStartupCheck.IsChecked = _autoScanOnStartup;
+        ImportModeCombo.SelectedIndex = _importMode == VaultImporter.ImportMode.Copy ? 1 : 0;
+    }
+
+    private void AddScanPath_Click(object s, RoutedEventArgs e)
+    {
+        var dialog = new Microsoft.Win32.OpenFolderDialog
+        {
+            Title = "Choose a folder to scan for CLAUDE.md / README.md / *.md"
+        };
+        if (dialog.ShowDialog() != true) return;
+        var path = dialog.FolderName;
+        if (string.IsNullOrWhiteSpace(path) || _scanPaths.Contains(path)) return;
+        _scanPaths.Add(path);
+        ScanPathsList.Items.Add(path);
+        SaveSettingsToFile();
+        StatusText.Text = $"Added scan path: {path}";
+    }
+
+    private void RemoveScanPath_Click(object s, RoutedEventArgs e)
+    {
+        if (ScanPathsList.SelectedItem is not string path) return;
+        _scanPaths.Remove(path);
+        ScanPathsList.Items.Remove(path);
+        SaveSettingsToFile();
+        StatusText.Text = $"Removed scan path: {path}";
+    }
+
+    private void ScanWholeMachineCheck_Changed(object s, RoutedEventArgs e)
+    {
+        _scanWholeMachine = ScanWholeMachineCheck.IsChecked == true;
+        SaveSettingsToFile();
+    }
+
+    private void AutoScanOnStartup_Changed(object s, RoutedEventArgs e)
+    {
+        _autoScanOnStartup = AutoScanOnStartupCheck.IsChecked == true;
+        SaveSettingsToFile();
+    }
+
+    private void SaveScanPatterns_Click(object s, RoutedEventArgs e)
+    {
+        _scanPatterns = string.IsNullOrWhiteSpace(ScanPatternsBox.Text)
+            ? "CLAUDE.md;README.md;*.md" : ScanPatternsBox.Text.Trim();
+        SaveSettingsToFile();
+        StatusText.Text = $"Patterns saved: {_scanPatterns}";
+    }
+
+    private void ImportMode_Changed(object s, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        _importMode = ImportModeCombo.SelectedIndex == 1
+            ? VaultImporter.ImportMode.Copy : VaultImporter.ImportMode.Reference;
+        SaveSettingsToFile();
+    }
+
+    private async void PreviewScan_Click(object s, RoutedEventArgs e)
+    {
+        if (_scanPaths.Count == 0 && !_scanWholeMachine)
+        {
+            MessageBox.Show("Add at least one scan path, or enable \"Scan Whole Machine\".",
+                "Resonance Scan", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        ScanStatusText.Text = "Scanning (Resonance Scan running)…";
+        PreviewScanButton.IsEnabled = false;
+        ImportScanButton.IsEnabled = false;
+
+        var opts = BuildImportOptions();
+        var report = await Task.Run(() => _importer.Scan(opts));
+        _lastScanHits = report.Hits;
+
+        ScanResultsList.Items.Clear();
+        foreach (var hit in report.Hits.Take(500))
+        {
+            ScanResultsList.Items.Add(
+                $"[{hit.ResonanceScore,5:F2}]  {hit.FileName,-18}  {hit.SizeBytes,8:N0} B  {hit.SourcePath}");
+        }
+
+        ScanStatusText.Text =
+            $"Found {report.Hits.Count} files · visited {report.VisitedFolders} folders · " +
+            $"pruned {report.PrunedFolders} · {report.ProjectRootsDetected} project roots · " +
+            $"skipped {report.NearDuplicatesSkipped} near-dups, {report.ExactDuplicatesSkipped} exact dups";
+        PreviewScanButton.IsEnabled = true;
+        ImportScanButton.IsEnabled = report.Hits.Count > 0;
+    }
+
+    private async void ImportScan_Click(object s, RoutedEventArgs e)
+    {
+        if (_lastScanHits.Count == 0)
+        {
+            MessageBox.Show("Run a preview scan first.", "Import",
+                MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        var confirm = MessageBox.Show(
+            $"Import {_lastScanHits.Count} files into this vault as {_importMode}?",
+            "Confirm import", MessageBoxButton.OKCancel, MessageBoxImage.Question);
+        if (confirm != MessageBoxResult.OK) return;
+
+        ImportScanButton.IsEnabled = false;
+        PreviewScanButton.IsEnabled = false;
+        ScanStatusText.Text = "Importing…";
+
+        var opts = BuildImportOptions();
+        var result = await Task.Run(() => _importer.Import(_lastScanHits, opts));
+
+        ScanStatusText.Text =
+            $"Imported {result.Imported.Count} · skipped {result.Skipped.Count} · errors {result.Errors.Count}";
+
+        // Re-index + refresh everything so graph shows the new notes
+        IndexVault();
+        _dashPhysics.LoadFromGraph(_graph);
+        _graphPhysics.LoadFromGraph(_graph);
+        UpdateUI();
+        RefreshVaultTree();
+
+        PreviewScanButton.IsEnabled = true;
+        ImportScanButton.IsEnabled = true;
+    }
+
+    private void ExportBrain_Click(object s, RoutedEventArgs e)
+    {
+        try
+        {
+            var result = _exporter.Export(_vaultPath, _identity, _graph);
+            ExportStatusText.Text =
+                $"Exported {result.NodeCount} nodes → brain-export.json / .md / manifest.json · CLAUDE.md updated";
+            StatusText.Text = "Brain exported. External tools can now read .obsidianx/brain-export.json";
+        }
+        catch (Exception ex)
+        {
+            ExportStatusText.Text = $"Export failed: {ex.Message}";
+        }
+    }
+
+    private void OpenExportFolder_Click(object s, RoutedEventArgs e)
+    {
+        try
+        {
+            var dir = Path.Combine(_vaultPath, ".obsidianx");
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            Process.Start(new ProcessStartInfo("explorer.exe", dir) { UseShellExecute = true });
+        }
+        catch (Exception ex) { StatusText.Text = $"Open folder failed: {ex.Message}"; }
+    }
+
+    // ═══════════════════════════════════════
+    // MCP — Claude Code CLI integration
+    // ═══════════════════════════════════════
+
+    private string McpServerExePath()
+    {
+        // Prefer the built artifact next to the solution
+        var root = FindSolutionRoot();
+        var candidate = Path.Combine(root, "ObsidianX.Mcp", "bin", "Release", "net9.0", "obsidianx-mcp.exe");
+        if (File.Exists(candidate)) return candidate;
+        candidate = Path.Combine(root, "ObsidianX.Mcp", "bin", "Debug", "net9.0", "obsidianx-mcp.exe");
+        return candidate;
+    }
+
+    private string FindSolutionRoot()
+    {
+        // Walk up from AppContext.BaseDirectory looking for ObsidianX.slnx
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null)
+        {
+            if (File.Exists(Path.Combine(dir.FullName, "ObsidianX.slnx"))) return dir.FullName;
+            dir = dir.Parent;
+        }
+        return AppContext.BaseDirectory;
+    }
+
+    private void PopulateMcpCommands()
+    {
+        var exe = McpServerExePath();
+        var built = File.Exists(exe);
+        var cmd = $"claude mcp add obsidianx-brain -e OBSIDIANX_VAULT=\"{_vaultPath}\" -- \"{exe}\"";
+        McpInstallCommand.Text = cmd;
+
+        var config = Newtonsoft.Json.JsonConvert.SerializeObject(new
+        {
+            mcpServers = new Dictionary<string, object>
+            {
+                ["obsidianx-brain"] = new
+                {
+                    command = exe,
+                    args = Array.Empty<string>(),
+                    env = new Dictionary<string, string> { ["OBSIDIANX_VAULT"] = _vaultPath }
+                }
+            }
+        }, Newtonsoft.Json.Formatting.Indented);
+        McpManualConfig.Text = config;
+
+        McpStatusText.Text = built
+            ? $"MCP server ready · {exe}"
+            : $"MCP server not built yet — click 'Build MCP Server' first. Expected at:\n{exe}";
+    }
+
+    private void BuildMcpServer_Click(object s, RoutedEventArgs e)
+    {
+        McpStatusText.Text = "Building MCP server (Release)…";
+        BuildMcpAsync();
+    }
+
+    private async void BuildMcpAsync()
+    {
+        try
+        {
+            var root = FindSolutionRoot();
+            var psi = new ProcessStartInfo
+            {
+                FileName = "dotnet",
+                WorkingDirectory = root,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            psi.ArgumentList.Add("build");
+            psi.ArgumentList.Add("ObsidianX.Mcp/ObsidianX.Mcp.csproj");
+            psi.ArgumentList.Add("-c");
+            psi.ArgumentList.Add("Release");
+            psi.ArgumentList.Add("-v");
+            psi.ArgumentList.Add("quiet");
+
+            using var proc = Process.Start(psi)!;
+            var stdout = await proc.StandardOutput.ReadToEndAsync();
+            var stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+
+            if (proc.ExitCode == 0)
+            {
+                PopulateMcpCommands();
+                McpStatusText.Text = $"Built successfully · {McpServerExePath()}";
+            }
+            else
+            {
+                McpStatusText.Text = $"Build failed (exit {proc.ExitCode}):\n{stderr}\n{stdout}";
+            }
+        }
+        catch (Exception ex)
+        {
+            McpStatusText.Text = $"Build error: {ex.Message}";
+        }
+    }
+
+    private async void InstallMcp_Click(object s, RoutedEventArgs e)
+    {
+        var exe = McpServerExePath();
+        if (!File.Exists(exe))
+        {
+            McpStatusText.Text = "MCP server not built. Click 'Build MCP Server' first.";
+            return;
+        }
+
+        try
+        {
+            McpStatusText.Text = "Registering with Claude Code CLI…";
+            var psi = new ProcessStartInfo
+            {
+                FileName = "claude",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            psi.ArgumentList.Add("mcp");
+            psi.ArgumentList.Add("add");
+            psi.ArgumentList.Add("obsidianx-brain");
+            psi.ArgumentList.Add("-e");
+            psi.ArgumentList.Add($"OBSIDIANX_VAULT={_vaultPath}");
+            psi.ArgumentList.Add("--");
+            psi.ArgumentList.Add(exe);
+
+            using var proc = Process.Start(psi)!;
+            var stdout = await proc.StandardOutput.ReadToEndAsync();
+            var stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+
+            if (proc.ExitCode == 0)
+                McpStatusText.Text = "Installed! Run `claude` in any folder — the 'obsidianx-brain' server will load.\n" + stdout;
+            else
+                McpStatusText.Text = $"Install failed (exit {proc.ExitCode}). Is `claude` on PATH?\n{stderr}{stdout}";
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            McpStatusText.Text = "Couldn't find `claude` command on PATH. Install Claude Code CLI, or use the manual config below.";
+        }
+        catch (Exception ex)
+        {
+            McpStatusText.Text = $"Install error: {ex.Message}";
+        }
+    }
+
+    private async void UninstallMcp_Click(object s, RoutedEventArgs e)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "claude",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            psi.ArgumentList.Add("mcp");
+            psi.ArgumentList.Add("remove");
+            psi.ArgumentList.Add("obsidianx-brain");
+
+            using var proc = Process.Start(psi)!;
+            var stdout = await proc.StandardOutput.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            McpStatusText.Text = proc.ExitCode == 0 ? "Uninstalled." : "Uninstall failed.\n" + stdout;
+        }
+        catch (Exception ex) { McpStatusText.Text = $"Uninstall error: {ex.Message}"; }
+    }
+
+    private void CopyMcpCommand_Click(object s, RoutedEventArgs e)
+    {
+        try { Clipboard.SetText(McpInstallCommand.Text); McpStatusText.Text = "Command copied to clipboard."; }
+        catch (Exception ex) { McpStatusText.Text = $"Copy failed: {ex.Message}"; }
+    }
+
+    private void CopyMcpConfig_Click(object s, RoutedEventArgs e)
+    {
+        try { Clipboard.SetText(McpManualConfig.Text); McpStatusText.Text = "JSON config copied to clipboard."; }
+        catch (Exception ex) { McpStatusText.Text = $"Copy failed: {ex.Message}"; }
+    }
+
+    // ═══════════════════════════════════════
+    // ACCESS-LOG TAIL + PULSE INJECTION
+    // Tails .obsidianx/access-log.ndjson (written by MCP server when
+    // Claude pulls knowledge). For each new entry, we bump AccessIntensity
+    // on the matching physics node. The render loop then draws those nodes
+    // with a brighter emissive + larger radius that decays exponentially.
+    // ═══════════════════════════════════════
+
+    private string AccessLogPath => Path.Combine(_vaultPath, ".obsidianx", "access-log.ndjson");
+
+    private void StartAccessLogWatcher()
+    {
+        // Seek past existing content on startup so we only react to NEW hits
+        try
+        {
+            if (File.Exists(AccessLogPath))
+                _accessLogOffset = new FileInfo(AccessLogPath).Length;
+        }
+        catch { _accessLogOffset = 0; }
+
+        _accessLogTimer = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = TimeSpan.FromMilliseconds(400)
+        };
+        _accessLogTimer.Tick += (_, _) => PollAccessLog();
+        _accessLogTimer.Start();
+    }
+
+    private void PollAccessLog()
+    {
+        try
+        {
+            if (!File.Exists(AccessLogPath)) return;
+            var fi = new FileInfo(AccessLogPath);
+            // File was truncated (e.g. trim in MCP) — reset offset
+            if (fi.Length < _accessLogOffset) _accessLogOffset = 0;
+            if (fi.Length == _accessLogOffset) return;
+
+            using var fs = new FileStream(AccessLogPath, FileMode.Open,
+                FileAccess.Read, FileShare.ReadWrite);
+            fs.Seek(_accessLogOffset, SeekOrigin.Begin);
+            using var sr = new StreamReader(fs);
+
+            string? line;
+            int newEvents = 0;
+            while ((line = sr.ReadLine()) != null)
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                HandleAccessLine(line);
+                newEvents++;
+            }
+            _accessLogOffset = fs.Position;
+
+            if (newEvents > 0)
+            {
+                _recentAccessCount += newEvents;
+                StatusText.Text = $"🧠 Claude pulled knowledge · {newEvents} node(s) pulsed · total session: {_recentAccessCount}";
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    private void HandleAccessLine(string json)
+    {
+        try
+        {
+            var obj = Newtonsoft.Json.Linq.JObject.Parse(json);
+            var nodeId = obj["node_id"]?.ToString();
+            if (string.IsNullOrEmpty(nodeId)) return;
+
+            BumpPulseForNode(_dashPhysics, nodeId);
+            BumpPulseForNode(_graphPhysics, nodeId);
+        }
+        catch (Newtonsoft.Json.JsonException) { }
+    }
+
+    private static void BumpPulseForNode(PhysicsEngine physics, string nodeId)
+    {
+        var node = physics.Nodes.FirstOrDefault(n => n.Id == nodeId);
+        if (node == null) return;
+        node.AccessIntensity = Math.Min(1.0, node.AccessIntensity + 0.8);
+        node.AccessCount++;
+        node.LastAccessedAt = DateTime.UtcNow;
+    }
+
+    private static void DecayPulses(PhysicsEngine physics, double dt)
+    {
+        // Exponential decay with ~2.5s half-life
+        var factor = Math.Pow(0.5, dt / 2.5);
+        foreach (var n in physics.Nodes)
+        {
+            if (n.AccessIntensity > 0.001)
+                n.AccessIntensity *= factor;
+            else
+                n.AccessIntensity = 0;
+        }
     }
 
     // ═══════════════════════════════════════
