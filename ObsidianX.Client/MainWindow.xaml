@@ -426,6 +426,21 @@
                                                        FontFamily="{StaticResource MonoFont}"/>
                                         </StackPanel>
                                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                            <TextBlock Text="Camera" FontSize="10" VerticalAlignment="Center"
+                                                       Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,6,0"/>
+                                            <ComboBox x:Name="CameraModeCombo" Width="140" FontSize="10"
+                                                      Background="{StaticResource SurfaceBrush}"
+                                                      Foreground="{StaticResource TextPrimaryBrush}"
+                                                      SelectionChanged="CameraMode_Changed" Margin="0,0,10,0">
+                                                <ComboBoxItem Content="Free (drag)" IsSelected="True"/>
+                                                <ComboBoxItem Content="Follow Pulse"/>
+                                                <ComboBoxItem Content="Orbit"/>
+                                                <ComboBoxItem Content="Overview"/>
+                                                <ComboBoxItem Content="Random Walk"/>
+                                            </ComboBox>
+                                            <Button Content="&#x1F3AF; Fit" Style="{StaticResource NeonButton}"
+                                                    Padding="10,3" FontSize="10" Click="FitOverview_Click" Margin="0,0,6,0"
+                                                    ToolTip="Frame the whole graph"/>
                                             <Button Content="&#x1F4A5; Shake" Style="{StaticResource NeonButton}"
                                                     Padding="10,3" FontSize="10" Click="ShakeGraph_Click" Margin="0,0,6,0"/>
                                             <Button Content="&#x1F504; Reset" Style="{StaticResource NeonButton}"

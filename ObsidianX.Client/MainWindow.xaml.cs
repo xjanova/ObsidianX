@@ -78,6 +78,16 @@ public partial class MainWindow : Window
     private double _graphYaw, _graphPitch = 15;
     private double _graphDist = 14;
 
+    // Camera target (what we look at) — moves away from origin in follow/random modes
+    private Point3D _graphTarget = new(0, 0, 0);
+
+    // Camera modes
+    private enum CameraMode { Free, FollowPulse, Orbit, Overview, RandomWalk }
+    private CameraMode _cameraMode = CameraMode.Free;
+    private DateTime _lastRandomTargetChange = DateTime.UtcNow;
+    private int _randomTargetIdx = -1;
+    private readonly Random _cameraRng = new();
+
     // Node selection
     private int? _selectedNodeDash;
     private int? _selectedNodeGraph;
@@ -237,9 +247,93 @@ public partial class MainWindow : Window
 
         if (BrainGraphView.Visibility == Visibility.Visible)
         {
-            UpdateCamera(GraphCam, _graphYaw, _graphPitch, _graphDist);
+            UpdateGraphCameraAuto();
+            UpdateCamera(GraphCam, _graphYaw, _graphPitch, _graphDist, _graphTarget);
             RebuildScene(FullGraphModel, _graphPhysics, _selectedNodeGraph);
         }
+    }
+
+    /// <summary>
+    /// Auto-drive the graph camera based on the current CameraMode.
+    /// Runs every frame; user-driven modes (Free) leave state untouched.
+    /// </summary>
+    private void UpdateGraphCameraAuto()
+    {
+        switch (_cameraMode)
+        {
+            case CameraMode.FollowPulse:
+            {
+                // Look at the node with the highest access intensity
+                PhysicsNode? hot = null;
+                double best = 0.15;
+                foreach (var n in _graphPhysics.Nodes)
+                {
+                    if (n.AccessIntensity > best) { best = n.AccessIntensity; hot = n; }
+                }
+                if (hot != null) LerpGraphTarget(hot.Position, 0.05);
+                // If nothing pulsing, gently drift back toward origin
+                else LerpGraphTarget(new Point3D(0, 0, 0), 0.02);
+                break;
+            }
+            case CameraMode.Orbit:
+            {
+                _graphYaw += 0.25;  // slow continuous rotation
+                break;
+            }
+            case CameraMode.Overview:
+            {
+                // Pull camera out to frame all visible clusters
+                var b = ComputeBounds(_graphPhysics);
+                _graphDist += (Math.Max(14, b.radius * 2.5) - _graphDist) * 0.04;
+                LerpGraphTarget(b.center, 0.04);
+                break;
+            }
+            case CameraMode.RandomWalk:
+            {
+                if (_graphPhysics.Nodes.Count == 0) break;
+                if ((DateTime.UtcNow - _lastRandomTargetChange).TotalSeconds > 8)
+                {
+                    _randomTargetIdx = _cameraRng.Next(_graphPhysics.Nodes.Count);
+                    _lastRandomTargetChange = DateTime.UtcNow;
+                }
+                if (_randomTargetIdx >= 0 && _randomTargetIdx < _graphPhysics.Nodes.Count)
+                {
+                    LerpGraphTarget(_graphPhysics.Nodes[_randomTargetIdx].Position, 0.025);
+                    _graphYaw += 0.05;  // gentle drift
+                }
+                break;
+            }
+        }
+    }
+
+    private void LerpGraphTarget(Point3D to, double t)
+    {
+        _graphTarget = new Point3D(
+            _graphTarget.X + (to.X - _graphTarget.X) * t,
+            _graphTarget.Y + (to.Y - _graphTarget.Y) * t,
+            _graphTarget.Z + (to.Z - _graphTarget.Z) * t);
+    }
+
+    /// <summary>Compute axis-aligned bounding sphere of the visible graph.</summary>
+    private static (Point3D center, double radius) ComputeBounds(PhysicsEngine physics)
+    {
+        if (physics.Nodes.Count == 0) return (new Point3D(0, 0, 0), 8.0);
+
+        double minX = double.MaxValue, minY = double.MaxValue, minZ = double.MaxValue;
+        double maxX = double.MinValue, maxY = double.MinValue, maxZ = double.MinValue;
+        foreach (var n in physics.Nodes)
+        {
+            if (n.Position.X < minX) minX = n.Position.X;
+            if (n.Position.Y < minY) minY = n.Position.Y;
+            if (n.Position.Z < minZ) minZ = n.Position.Z;
+            if (n.Position.X > maxX) maxX = n.Position.X;
+            if (n.Position.Y > maxY) maxY = n.Position.Y;
+            if (n.Position.Z > maxZ) maxZ = n.Position.Z;
+        }
+        var center = new Point3D((minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2);
+        var dx = maxX - center.X; var dy = maxY - center.Y; var dz = maxZ - center.Z;
+        var r = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+        return (center, Math.Max(3, r));
     }
 
     // ═══════════════════════════════════════
@@ -275,13 +369,28 @@ public partial class MainWindow : Window
             for (int i = 0; i < visible.Length; i++) visible[i] = true;
         }
 
-        // Camera position (for distance culling)
+        // Camera + focus target — culling uses distance from what the user
+        // is looking AT (LookAt point), not from the camera lens. This lets
+        // the user "dive into" a cluster: near-focus nodes stay full-detail
+        // while the rest of the graph falls away.
         var cam = parent == BrainModel ? DashCam : GraphCam;
         var camPos = cam.Position;
-        var cullSqr = _cullDistance > 0
-            ? (_cullDistance + Math.Sqrt(physics.Nodes.Count) * 0.5) *
-              (_cullDistance + Math.Sqrt(physics.Nodes.Count) * 0.5)
+        var focus = parent == BrainModel
+            ? new Point3D(0, 0, 0)   // dashboard always orbits origin
+            : _graphTarget;
+        var camDist = parent == BrainModel ? _camDist : _graphDist;
+
+        // Focus radius expands with zoom-out so overview shows everything.
+        // Zoom in → small radius → only nearby nodes visible.
+        var focusRadius = _cullDistance > 0
+            ? _cullDistance * Math.Max(1.0, camDist / 14.0)
             : double.MaxValue;
+        var focusSqr = focusRadius * focusRadius;
+
+        // Radius scale makes nodes smaller when zoomed in (for detail) and
+        // keeps them visible-as-dots when zoomed way out. In the overview
+        // (camDist > 50) we clamp up slightly so dots aren't invisible.
+        double radiusScale = camDist < 6 ? 0.7 : camDist > 40 ? 1.25 : 1.0;
 
         // --- BATCH ALL NODES INTO ONE MESH PER MATERIAL ---
         var colorGroups = new Dictionary<Color, (MeshGeometry3D mesh, bool emissive)>();
@@ -296,13 +405,13 @@ public partial class MainWindow : Window
 
             var node = physics.Nodes[i];
 
-            // Distance culling (keep selected/pulsed regardless)
-            var dx = node.Position.X - camPos.X;
-            var dy = node.Position.Y - camPos.Y;
-            var dz = node.Position.Z - camPos.Z;
+            // Focus-based culling: distance from LookAt, not camera
+            var dx = node.Position.X - focus.X;
+            var dy = node.Position.Y - focus.Y;
+            var dz = node.Position.Z - focus.Z;
             var dsq = dx * dx + dy * dy + dz * dz;
             bool keepAnyway = i == selectedIdx || node.AccessIntensity > 0.05 || node.IsHovered;
-            if (!keepAnyway && dsq > cullSqr) continue;
+            if (!keepAnyway && dsq > focusSqr) continue;
 
             renderedCount++;
 
@@ -314,7 +423,7 @@ public partial class MainWindow : Window
 
             var isSelected = i == selectedIdx;
             var pulse = 1.0 + Math.Sin(_time * 3 + node.PulsePhase) * 0.08;
-            var radius = node.Radius * pulse;
+            var radius = node.Radius * pulse * radiusScale;
 
             if (isSelected || node.IsHovered)
                 radius *= 1.4;
@@ -326,8 +435,8 @@ public partial class MainWindow : Window
                 radius *= (1.0 + 0.8 * intensity) * beat;
             }
 
-            // LOD: far nodes + large graphs use simple sphere; close + selected use detailed
-            var farLod = dsq > cullSqr * 0.3 || physics.Nodes.Count > 150;
+            // LOD: far-from-focus nodes + large graphs use simple sphere
+            var farLod = dsq > focusSqr * 0.3 || physics.Nodes.Count > 150 || camDist > 30;
             var sphereMesh = farLod && !isSelected ? SharedSphereLOD : SharedSphere;
 
             if (!colorGroups.ContainsKey(color))
@@ -392,11 +501,16 @@ public partial class MainWindow : Window
         }
 
         // --- BATCH EDGES — wiki (cyan, solid) vs auto (purple, faded) ---
-        // Edges only render if at least one endpoint is visible.
+        // Edge thickness scales with camera zoom so connections stay legible
+        // in both overview and close-up. Only renders if at least one endpoint
+        // is visible AND at least one is near the camera focus.
         var wikiEdgeMesh = new MeshGeometry3D();
         var autoEdgeMesh = new MeshGeometry3D();
         var idToIdx = new Dictionary<string, int>(physics.Nodes.Count);
         for (int i = 0; i < physics.Nodes.Count; i++) idToIdx[physics.Nodes[i].Id] = i;
+
+        // Scale edge thickness with camera distance so it stays readable
+        var edgeScale = Math.Clamp(camDist / 14.0, 0.5, 2.5);
 
         foreach (var edge in physics.Edges)
         {
@@ -408,8 +522,8 @@ public partial class MainWindow : Window
             var src = physics.Nodes[srcIdx];
             var tgt = physics.Nodes[tgtIdx];
             var target = edge.IsAuto ? autoEdgeMesh : wikiEdgeMesh;
-            var width = edge.IsAuto ? 0.006 : 0.012;
-            AppendLineToMesh(target, src.Position, tgt.Position, width);
+            var baseWidth = edge.IsAuto ? 0.006 : 0.012;
+            AppendLineToMesh(target, src.Position, tgt.Position, baseWidth * edgeScale);
         }
 
         if (wikiEdgeMesh.Positions.Count > 0)
@@ -540,15 +654,18 @@ public partial class MainWindow : Window
     // CAMERA CONTROL
     // ═══════════════════════════════════════
     private static void UpdateCamera(PerspectiveCamera cam, double yaw, double pitch, double dist)
+        => UpdateCamera(cam, yaw, pitch, dist, new Point3D(0, 0, 0));
+
+    private static void UpdateCamera(PerspectiveCamera cam, double yaw, double pitch, double dist, Point3D target)
     {
         double yawRad = yaw * Math.PI / 180;
         double pitchRad = pitch * Math.PI / 180;
-        var pos = new Point3D(
+        var offset = new Vector3D(
             dist * Math.Sin(yawRad) * Math.Cos(pitchRad),
             dist * Math.Sin(pitchRad),
             dist * Math.Cos(yawRad) * Math.Cos(pitchRad));
-        cam.Position = pos;
-        cam.LookDirection = new Vector3D(-pos.X, -pos.Y, -pos.Z);
+        cam.Position = new Point3D(target.X + offset.X, target.Y + offset.Y, target.Z + offset.Z);
+        cam.LookDirection = new Vector3D(-offset.X, -offset.Y, -offset.Z);
     }
 
     // ═══════════════════════════════════════
@@ -646,7 +763,8 @@ public partial class MainWindow : Window
 
     private void FullGraph_MouseWheel(object s, MouseWheelEventArgs e)
     {
-        _graphDist = Math.Clamp(_graphDist - e.Delta * 0.008, 4, 40);
+        // Wide zoom range: 2 (close-up inside a cluster) → 120 (full overview as dots)
+        _graphDist = Math.Clamp(_graphDist - e.Delta * 0.012, 2, 120);
     }
 
     private void FullGraph_RightClick(object s, MouseButtonEventArgs e)
@@ -776,7 +894,34 @@ public partial class MainWindow : Window
     }
 
     private void ShakeGraph_Click(object sender, RoutedEventArgs e) => _graphPhysics.Disturb(2.0);
-    private void ResetCamera_Click(object sender, RoutedEventArgs e) { _graphYaw = 0; _graphPitch = 15; _graphDist = 14; }
+    private void ResetCamera_Click(object sender, RoutedEventArgs e)
+    {
+        _graphYaw = 0; _graphPitch = 15; _graphDist = 14;
+        _graphTarget = new Point3D(0, 0, 0);
+    }
+
+    private void CameraMode_Changed(object s, SelectionChangedEventArgs e)
+    {
+        if (CameraModeCombo == null) return;
+        _cameraMode = CameraModeCombo.SelectedIndex switch
+        {
+            1 => CameraMode.FollowPulse,
+            2 => CameraMode.Orbit,
+            3 => CameraMode.Overview,
+            4 => CameraMode.RandomWalk,
+            _ => CameraMode.Free
+        };
+        if (StatusText != null)
+            StatusText.Text = $"Camera: {_cameraMode}";
+    }
+
+    private void FitOverview_Click(object sender, RoutedEventArgs e)
+    {
+        var b = ComputeBounds(_graphPhysics);
+        _graphTarget = b.center;
+        _graphDist = Math.Clamp(b.radius * 2.5, 6, 120);
+        StatusText.Text = $"Fitted to graph bounds · radius {b.radius:F1}";
+    }
 
     // ═══════════════════════════════════════
     // IDENTITY & INDEXING
