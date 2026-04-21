@@ -1,0 +1,305 @@
+using System.Text;
+using Newtonsoft.Json;
+using ObsidianX.Core.Models;
+
+namespace ObsidianX.Core.Services;
+
+/// <summary>
+/// Exports the brain's expertise in formats that Claude and any external
+/// tool can consume without understanding ObsidianX internals.
+///
+/// Produces three artifacts in .obsidianx/:
+///  • brain-export.json   — full machine-readable index (schema v1)
+///  • brain-export.md     — human-readable summary card
+///  • brain-manifest.json — tiny fingerprint (address, top expertise, last-updated)
+///
+/// Also injects a &lt;!-- BRAIN:BEGIN --&gt; … &lt;!-- BRAIN:END --&gt; section
+/// into CLAUDE.md so any Claude instance opening the folder instantly
+/// sees the owner's expertise profile and hot topics.
+/// </summary>
+public class BrainExporter
+{
+    public const string SchemaVersion = "brain-export/v1";
+
+    private const string ClaudeBeginMarker = "<!-- BRAIN:BEGIN -->";
+    private const string ClaudeEndMarker = "<!-- BRAIN:END -->";
+
+    public ExportResult Export(string vaultPath, BrainIdentity identity, KnowledgeGraph graph)
+    {
+        var exportDir = Path.Combine(vaultPath, ".obsidianx");
+        Directory.CreateDirectory(exportDir);
+
+        var jsonPath = Path.Combine(exportDir, "brain-export.json");
+        var mdPath = Path.Combine(exportDir, "brain-export.md");
+        var manifestPath = Path.Combine(exportDir, "brain-manifest.json");
+
+        var export = BuildExport(identity, graph, vaultPath);
+        File.WriteAllText(jsonPath,
+            JsonConvert.SerializeObject(export, Formatting.Indented));
+
+        File.WriteAllText(mdPath, BuildMarkdown(export));
+
+        var manifest = new
+        {
+            export.BrainAddress,
+            export.DisplayName,
+            export.GeneratedAt,
+            export.TotalNotes,
+            export.TotalWords,
+            TopExpertise = export.Expertise.Take(3)
+                .Select(e => new { e.Category, e.Score }).ToList(),
+            Schema = SchemaVersion
+        };
+        File.WriteAllText(manifestPath,
+            JsonConvert.SerializeObject(manifest, Formatting.Indented));
+
+        // Inject/refresh managed section in CLAUDE.md
+        UpdateClaudeMd(vaultPath, export);
+
+        return new ExportResult
+        {
+            JsonPath = jsonPath,
+            MarkdownPath = mdPath,
+            ManifestPath = manifestPath,
+            ClaudeMdUpdated = true,
+            NodeCount = export.TotalNotes
+        };
+    }
+
+    public static BrainExport BuildExport(BrainIdentity identity, KnowledgeGraph graph, string vaultPath)
+    {
+        var export = new BrainExport
+        {
+            Schema = SchemaVersion,
+            BrainAddress = identity.Address,
+            DisplayName = identity.DisplayName,
+            GeneratedAt = DateTime.UtcNow,
+            VaultPath = vaultPath,
+            TotalNotes = (int)graph.TotalNodes,
+            TotalWords = (int)graph.TotalWords,
+            TotalEdges = (int)graph.TotalEdges
+        };
+
+        foreach (var (category, score) in graph.ExpertiseMap.OrderByDescending(kv => kv.Value.Score))
+        {
+            export.Expertise.Add(new ExpertiseEntry
+            {
+                Category = category.ToString(),
+                Score = Math.Round(score.Score, 3),
+                NoteCount = score.NoteCount,
+                TotalWords = score.TotalWords,
+                GrowthRate = Math.Round(score.GrowthRate, 3),
+                LastUpdated = score.LastUpdated
+            });
+        }
+
+        foreach (var node in graph.Nodes.OrderByDescending(n => n.Importance))
+        {
+            export.Nodes.Add(new NodeSummary
+            {
+                Id = node.Id,
+                Title = node.Title,
+                RelativePath = Path.GetRelativePath(vaultPath, node.FilePath).Replace("\\", "/"),
+                PrimaryCategory = node.PrimaryCategory.ToString(),
+                SecondaryCategories = node.SecondaryCategories.Select(c => c.ToString()).ToList(),
+                Tags = node.Tags,
+                WordCount = node.WordCount,
+                ModifiedAt = node.ModifiedAt,
+                Importance = Math.Round(node.Importance, 3),
+                LinkedNodeIds = node.LinkedNodeIds,
+                Preview = ReadPreview(node.FilePath, 280)
+            });
+        }
+
+        // Top tags across the vault (useful for quick "ask Claude about X" prompts)
+        var tagCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var node in graph.Nodes)
+            foreach (var tag in node.Tags)
+                tagCounts[tag] = tagCounts.GetValueOrDefault(tag) + 1;
+
+        export.TopTags = tagCounts.OrderByDescending(kv => kv.Value).Take(20)
+            .Select(kv => new TagCount { Tag = kv.Key, Count = kv.Value }).ToList();
+
+        return export;
+    }
+
+    private static string ReadPreview(string path, int limit)
+    {
+        try
+        {
+            if (!File.Exists(path)) return string.Empty;
+            var text = File.ReadAllText(path);
+            // Strip YAML frontmatter
+            if (text.StartsWith("---"))
+            {
+                var end = text.IndexOf("\n---", 3, StringComparison.Ordinal);
+                if (end > 0) text = text[(end + 4)..].TrimStart();
+            }
+            text = text.Replace("\r", "").Trim();
+            if (text.Length > limit) text = text[..limit] + "…";
+            return text;
+        }
+        catch (IOException) { return string.Empty; }
+        catch (UnauthorizedAccessException) { return string.Empty; }
+    }
+
+    private static string BuildMarkdown(BrainExport export)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"# Brain: {export.DisplayName}");
+        sb.AppendLine();
+        sb.AppendLine($"- **Address:** `{export.BrainAddress}`");
+        sb.AppendLine($"- **Notes:** {export.TotalNotes} · **Words:** {export.TotalWords:N0} · **Links:** {export.TotalEdges}");
+        sb.AppendLine($"- **Generated:** {export.GeneratedAt:yyyy-MM-dd HH:mm} UTC");
+        sb.AppendLine($"- **Schema:** `{export.Schema}`");
+        sb.AppendLine();
+        sb.AppendLine("## Expertise");
+        sb.AppendLine();
+        sb.AppendLine("| Category | Score | Notes | Words | Growth |");
+        sb.AppendLine("|----------|------:|------:|------:|-------:|");
+        foreach (var e in export.Expertise)
+        {
+            sb.AppendLine($"| {e.Category} | {e.Score:F2} | {e.NoteCount} | {e.TotalWords:N0} | {e.GrowthRate:P0} |");
+        }
+        sb.AppendLine();
+
+        if (export.TopTags.Count > 0)
+        {
+            sb.AppendLine("## Top tags");
+            sb.AppendLine();
+            sb.AppendLine(string.Join(" · ", export.TopTags.Select(t => $"`#{t.Tag}` ({t.Count})")));
+            sb.AppendLine();
+        }
+
+        sb.AppendLine("## Most important notes");
+        sb.AppendLine();
+        foreach (var n in export.Nodes.Take(10))
+        {
+            sb.AppendLine($"- **{n.Title}** — _{n.PrimaryCategory}_ · {n.WordCount} words · `{n.RelativePath}`");
+        }
+        sb.AppendLine();
+        sb.AppendLine("---");
+        sb.AppendLine("> For machine-readable access see `brain-export.json` (schema: " + export.Schema + ")");
+        return sb.ToString();
+    }
+
+    private static void UpdateClaudeMd(string vaultPath, BrainExport export)
+    {
+        var path = Path.Combine(vaultPath, "CLAUDE.md");
+        var injected = BuildClaudeSection(export);
+        if (!File.Exists(path))
+        {
+            File.WriteAllText(path, injected);
+            return;
+        }
+
+        var existing = File.ReadAllText(path);
+        var begin = existing.IndexOf(ClaudeBeginMarker, StringComparison.Ordinal);
+        var end = existing.IndexOf(ClaudeEndMarker, StringComparison.Ordinal);
+
+        string updated;
+        if (begin >= 0 && end > begin)
+        {
+            updated = existing[..begin] + injected + existing[(end + ClaudeEndMarker.Length)..];
+        }
+        else
+        {
+            updated = existing.TrimEnd() + "\n\n" + injected;
+        }
+        File.WriteAllText(path, updated);
+    }
+
+    private static string BuildClaudeSection(BrainExport export)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine(ClaudeBeginMarker);
+        sb.AppendLine("<!-- Auto-managed by ObsidianX BrainExporter. Do not edit by hand. -->");
+        sb.AppendLine();
+        sb.AppendLine("## Brain Profile (for Claude & external tools)");
+        sb.AppendLine();
+        sb.AppendLine($"**Brain:** {export.DisplayName} (`{export.BrainAddress}`)");
+        sb.AppendLine($"**Stats:** {export.TotalNotes} notes · {export.TotalWords:N0} words · {export.TotalEdges} wiki-links");
+        sb.AppendLine($"**Updated:** {export.GeneratedAt:yyyy-MM-dd HH:mm} UTC");
+        sb.AppendLine();
+        sb.AppendLine("**Top expertise** (higher score = deeper knowledge):");
+        foreach (var e in export.Expertise.Take(5))
+        {
+            var bar = new string('█', (int)Math.Round(e.Score * 20));
+            var pad = new string('░', 20 - bar.Length);
+            sb.AppendLine($"- `{e.Category,-25}` {bar}{pad} {e.Score:P0} · {e.NoteCount} notes");
+        }
+        sb.AppendLine();
+        sb.AppendLine("**Hot tags:** " + (export.TopTags.Count == 0 ? "_none yet_"
+            : string.Join(" ", export.TopTags.Take(10).Select(t => $"`#{t.Tag}`"))));
+        sb.AppendLine();
+        sb.AppendLine("**Machine-readable exports:**");
+        sb.AppendLine("- `.obsidianx/brain-export.json` — full index (schema: `" + export.Schema + "`)");
+        sb.AppendLine("- `.obsidianx/brain-manifest.json` — tiny fingerprint");
+        sb.AppendLine("- REST: `GET /api/brain/export`, `/api/brain/search?q=…`, `/api/brain/expertise`");
+        sb.AppendLine();
+        sb.AppendLine("**How to use this brain from an external tool:**");
+        sb.AppendLine("1. Read `.obsidianx/brain-export.json` — gives you every note's title, path, category, tags, preview.");
+        sb.AppendLine("2. Filter by `primaryCategory` or search `tags` / `preview` for relevance.");
+        sb.AppendLine("3. Load full content from `<vaultPath>/<relativePath>` when needed.");
+        sb.AppendLine();
+        sb.AppendLine(ClaudeEndMarker);
+        return sb.ToString();
+    }
+}
+
+// ─────────── Export schema (serialized to JSON) ───────────
+
+public class BrainExport
+{
+    public string Schema { get; set; } = BrainExporter.SchemaVersion;
+    public string BrainAddress { get; set; } = string.Empty;
+    public string DisplayName { get; set; } = string.Empty;
+    public DateTime GeneratedAt { get; set; }
+    public string VaultPath { get; set; } = string.Empty;
+    public int TotalNotes { get; set; }
+    public int TotalWords { get; set; }
+    public int TotalEdges { get; set; }
+    public List<ExpertiseEntry> Expertise { get; set; } = [];
+    public List<TagCount> TopTags { get; set; } = [];
+    public List<NodeSummary> Nodes { get; set; } = [];
+}
+
+public class ExpertiseEntry
+{
+    public string Category { get; set; } = string.Empty;
+    public double Score { get; set; }
+    public int NoteCount { get; set; }
+    public long TotalWords { get; set; }
+    public double GrowthRate { get; set; }
+    public DateTime LastUpdated { get; set; }
+}
+
+public class NodeSummary
+{
+    public string Id { get; set; } = string.Empty;
+    public string Title { get; set; } = string.Empty;
+    public string RelativePath { get; set; } = string.Empty;
+    public string PrimaryCategory { get; set; } = string.Empty;
+    public List<string> SecondaryCategories { get; set; } = [];
+    public List<string> Tags { get; set; } = [];
+    public int WordCount { get; set; }
+    public DateTime ModifiedAt { get; set; }
+    public double Importance { get; set; }
+    public List<string> LinkedNodeIds { get; set; } = [];
+    public string Preview { get; set; } = string.Empty;
+}
+
+public class TagCount
+{
+    public string Tag { get; set; } = string.Empty;
+    public int Count { get; set; }
+}
+
+public class ExportResult
+{
+    public string JsonPath { get; set; } = string.Empty;
+    public string MarkdownPath { get; set; } = string.Empty;
+    public string ManifestPath { get; set; } = string.Empty;
+    public bool ClaudeMdUpdated { get; set; }
+    public int NodeCount { get; set; }
+}
