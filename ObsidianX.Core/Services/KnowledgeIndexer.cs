@@ -5,6 +5,9 @@ namespace ObsidianX.Core.Services;
 
 public partial class KnowledgeIndexer
 {
+    /// <summary>Optional auto-linker that adds semantic edges after indexing.</summary>
+    public AutoLinker? AutoLinker { get; set; } = new();
+
     private static readonly Dictionary<KnowledgeCategory, string[]> CategoryKeywords = new()
     {
         [KnowledgeCategory.Programming] = ["code", "function", "class", "algorithm", "variable", "loop", "array", "api", "debug", "compiler", "syntax", "git", "repository", "refactor", "IDE"],
@@ -63,6 +66,11 @@ public partial class KnowledgeIndexer
             }
         }
 
+        // Auto-link semantically related notes (runs after wiki-links so
+        // user-authored edges take precedence)
+        if (AutoLinker is { Options.Enabled: true })
+            AutoLinker.AddAutoEdges(graph);
+
         // Build expertise map
         foreach (var category in Enum.GetValues<KnowledgeCategory>())
         {
@@ -89,7 +97,7 @@ public partial class KnowledgeIndexer
     {
         var content = File.ReadAllText(filePath);
         var title = Path.GetFileNameWithoutExtension(filePath);
-        var words = content.Split([' ', '\n', '\r', '\t'], StringSplitOptions.RemoveEmptyEntries);
+        var wordCount = ThaiTextSupport.CountWords(content);
         var fileInfo = new FileInfo(filePath);
 
         // Extract tags from YAML frontmatter and #hashtags
@@ -115,10 +123,10 @@ public partial class KnowledgeIndexer
             PrimaryCategory = sorted[0].Key,
             SecondaryCategories = sorted.Skip(1).Take(3).Where(kv => kv.Value > 0.1).Select(kv => kv.Key).ToList(),
             Tags = tags.Distinct().ToList(),
-            WordCount = words.Length,
+            WordCount = wordCount,
             CreatedAt = fileInfo.CreationTimeUtc,
             ModifiedAt = fileInfo.LastWriteTimeUtc,
-            Importance = Math.Log(1 + words.Length) * (1 + tags.Count * 0.1),
+            Importance = Math.Log(1 + wordCount) * (1 + tags.Count * 0.1),
             KeywordScores = sorted.Take(5).ToDictionary(kv => kv.Key.ToString(), kv => kv.Value)
         };
 
@@ -139,10 +147,23 @@ public partial class KnowledgeIndexer
                 score += count * (1.0 / keywords.Length);
             }
 
-            // Boost if tags match
+            // Thai keywords (no lowercasing — Thai has no case)
+            if (ThaiTextSupport.ThaiCategoryKeywords.TryGetValue(category, out var thaiKeywords))
+            {
+                foreach (var keyword in thaiKeywords)
+                {
+                    var count = CountOccurrences(content, keyword);
+                    score += count * (1.0 / thaiKeywords.Length);
+                }
+            }
+
+            // Boost if tags match (English or Thai)
             foreach (var tag in tags)
             {
                 if (keywords.Any(k => tag.Contains(k, StringComparison.OrdinalIgnoreCase)))
+                    score += 2.0;
+                if (thaiKeywords != null &&
+                    thaiKeywords.Any(k => tag.Contains(k, StringComparison.Ordinal)))
                     score += 2.0;
             }
 
