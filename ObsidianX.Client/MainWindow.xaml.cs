@@ -1917,7 +1917,7 @@ public partial class MainWindow : Window
     {
         var exe = McpServerExePath();
         var built = File.Exists(exe);
-        var cmd = $"claude mcp add obsidianx-brain -e OBSIDIANX_VAULT=\"{_vaultPath}\" -- \"{exe}\"";
+        var cmd = $"claude mcp add obsidianx-brain -s user -e OBSIDIANX_VAULT=\"{_vaultPath}\" -- \"{exe}\"";
         McpInstallCommand.Text = cmd;
 
         var config = Newtonsoft.Json.JsonConvert.SerializeObject(new
@@ -1987,6 +1987,74 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// Resolves the `claude` CLI on Windows. npm global installs drop a
+    /// `claude.cmd` shim in %APPDATA%\npm; UseShellExecute=false won't
+    /// locate .cmd files via PATH without an explicit extension, so we
+    /// search the usual places ourselves.
+    /// </summary>
+    private static string? FindClaudeCli()
+    {
+        var pathVar = Environment.GetEnvironmentVariable("PATH") ?? "";
+        var roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        var dirs = new List<string> { Path.Combine(roaming, "npm") };
+        dirs.AddRange(pathVar.Split(';', StringSplitOptions.RemoveEmptyEntries));
+
+        foreach (var name in new[] { "claude.cmd", "claude.exe", "claude.bat", "claude" })
+        {
+            foreach (var d in dirs)
+            {
+                try
+                {
+                    var p = Path.Combine(d.Trim(), name);
+                    if (File.Exists(p)) return p;
+                }
+                catch (ArgumentException) { /* skip invalid path entry */ }
+            }
+        }
+        return null;
+    }
+
+    private static async Task<(int code, string stdout, string stderr)> RunClaudeCliAsync(params string[] args)
+    {
+        var cli = FindClaudeCli();
+        if (cli == null) throw new FileNotFoundException("claude CLI not found on PATH or in %APPDATA%\\npm");
+
+        ProcessStartInfo psi;
+        if (cli.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase)
+         || cli.EndsWith(".bat", StringComparison.OrdinalIgnoreCase))
+        {
+            // .cmd / .bat must run through cmd.exe
+            psi = new ProcessStartInfo("cmd.exe")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            psi.ArgumentList.Add("/c");
+            psi.ArgumentList.Add(cli);
+            foreach (var a in args) psi.ArgumentList.Add(a);
+        }
+        else
+        {
+            psi = new ProcessStartInfo(cli)
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            foreach (var a in args) psi.ArgumentList.Add(a);
+        }
+
+        using var proc = Process.Start(psi)!;
+        var stdout = await proc.StandardOutput.ReadToEndAsync();
+        var stderr = await proc.StandardError.ReadToEndAsync();
+        await proc.WaitForExitAsync();
+        return (proc.ExitCode, stdout, stderr);
+    }
+
     private async void InstallMcp_Click(object s, RoutedEventArgs e)
     {
         var exe = McpServerExePath();
@@ -1998,36 +2066,27 @@ public partial class MainWindow : Window
 
         try
         {
-            McpStatusText.Text = "Registering with Claude Code CLI…";
-            var psi = new ProcessStartInfo
-            {
-                FileName = "claude",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-            psi.ArgumentList.Add("mcp");
-            psi.ArgumentList.Add("add");
-            psi.ArgumentList.Add("obsidianx-brain");
-            psi.ArgumentList.Add("-e");
-            psi.ArgumentList.Add($"OBSIDIANX_VAULT={_vaultPath}");
-            psi.ArgumentList.Add("--");
-            psi.ArgumentList.Add(exe);
+            McpStatusText.Text = "Registering with Claude Code CLI (user scope)…";
+            // Remove old registration first so re-install doesn't error.
+            // Try both scopes silently.
+            await RunClaudeCliAsync("mcp", "remove", "obsidianx-brain");
+            await RunClaudeCliAsync("mcp", "remove", "obsidianx-brain", "-s", "user");
 
-            using var proc = Process.Start(psi)!;
-            var stdout = await proc.StandardOutput.ReadToEndAsync();
-            var stderr = await proc.StandardError.ReadToEndAsync();
-            await proc.WaitForExitAsync();
+            // Install at USER scope so every terminal sees it, not just this project
+            var (code, stdout, stderr) = await RunClaudeCliAsync(
+                "mcp", "add", "obsidianx-brain",
+                "-s", "user",
+                "-e", $"OBSIDIANX_VAULT={_vaultPath}",
+                "--", exe);
 
-            if (proc.ExitCode == 0)
+            if (code == 0)
                 McpStatusText.Text = "Installed! Run `claude` in any folder — the 'obsidianx-brain' server will load.\n" + stdout;
             else
-                McpStatusText.Text = $"Install failed (exit {proc.ExitCode}). Is `claude` on PATH?\n{stderr}{stdout}";
+                McpStatusText.Text = $"Install failed (exit {code}).\n{stderr}{stdout}";
         }
-        catch (System.ComponentModel.Win32Exception)
+        catch (FileNotFoundException)
         {
-            McpStatusText.Text = "Couldn't find `claude` command on PATH. Install Claude Code CLI, or use the manual config below.";
+            McpStatusText.Text = "Couldn't find `claude` on PATH or %APPDATA%\\npm. Install Claude Code CLI, or use the manual config below.";
         }
         catch (Exception ex)
         {
@@ -2039,22 +2098,11 @@ public partial class MainWindow : Window
     {
         try
         {
-            var psi = new ProcessStartInfo
-            {
-                FileName = "claude",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-            psi.ArgumentList.Add("mcp");
-            psi.ArgumentList.Add("remove");
-            psi.ArgumentList.Add("obsidianx-brain");
-
-            using var proc = Process.Start(psi)!;
-            var stdout = await proc.StandardOutput.ReadToEndAsync();
-            await proc.WaitForExitAsync();
-            McpStatusText.Text = proc.ExitCode == 0 ? "Uninstalled." : "Uninstall failed.\n" + stdout;
+            // Remove from both scopes
+            await RunClaudeCliAsync("mcp", "remove", "obsidianx-brain");
+            var (code, stdout, _) = await RunClaudeCliAsync("mcp", "remove", "obsidianx-brain", "-s", "user");
+            McpStatusText.Text = code == 0 || stdout.Contains("not found", StringComparison.OrdinalIgnoreCase)
+                ? "Uninstalled (all scopes)." : "Uninstall result:\n" + stdout;
         }
         catch (Exception ex) { McpStatusText.Text = $"Uninstall error: {ex.Message}"; }
     }
@@ -2119,7 +2167,9 @@ public partial class MainWindow : Window
 
     private void StorageProvider_Changed(object s, SelectionChangedEventArgs e)
     {
-        if (StorageProviderCombo == null) return;
+        // XAML fires SelectionChanged before named children are hooked up —
+        // guard every field we touch.
+        if (StorageProviderCombo == null || MySqlPanel == null) return;
         _storageProvider = StorageProviderCombo.SelectedIndex == 1 ? "MySql" : "Sqlite";
         MySqlPanel.Visibility = _storageProvider == "MySql" ? Visibility.Visible : Visibility.Collapsed;
         SaveSettingsToFile();
