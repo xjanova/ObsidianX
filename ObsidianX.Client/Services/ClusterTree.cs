@@ -269,45 +269,89 @@ public class ClusterTree
         t.LeafCount = t.Children.Sum(c => c.LeafCount);
     }
 
-    /// <summary>Walk the tree and decide at each cluster whether to expand or render as a bubble.</summary>
+    /// <summary>
+    /// Walk the tree and decide at each cluster whether to expand, render
+    /// as a bubble, or hide entirely.
+    ///
+    /// Rendering scope (the "dissolution" rule): once the camera has
+    /// dived close enough that it's effectively inside a specific
+    /// cluster, sibling clusters at outer levels disappear so the user
+    /// isn't looking at the inside of their focus through the walls of
+    /// unrelated bubbles. Only the focus cluster's subtree renders.
+    /// At overview (camera outside the focus cluster), siblings reappear.
+    /// </summary>
     public void Walk(
         Point3D focus,
         double camDist,
         Action<PhysicsNode> onLeaf,
         Action<ClusterTree> onBubble)
     {
-        if (IsLeaf)
+        // Pick the deepest cluster whose bounding sphere actually
+        // contains the camera focus. That becomes the rendering scope.
+        var scope = FindScope(focus, camDist);
+
+        // Inside the scope, recurse with normal expand/bubble logic.
+        WalkSubtree(scope, focus, camDist, onLeaf, onBubble);
+    }
+
+    /// <summary>
+    /// Find the deepest cluster we're effectively "inside". A cluster
+    /// counts as active when focus is within its radius AND camera is
+    /// close enough that we're not still in overview mode for it.
+    /// </summary>
+    private ClusterTree FindScope(Point3D focus, double camDist)
+    {
+        if (IsLeaf) return this;
+
+        // Camera is far enough out that we're looking at the root as a
+        // whole — scope = root so all top-level bubbles remain visible.
+        if (Depth == 0 && camDist > Radius * 2.4)
+            return this;
+
+        // Find deepest child that contains focus AND is close enough
+        // for "inside" mode.
+        ClusterTree deepest = this;
+        foreach (var child in Children)
         {
-            onLeaf(Leaf!);
-            return;
+            if (child.IsLeaf) continue;
+            var dx = child.Center.X - focus.X;
+            var dy = child.Center.Y - focus.Y;
+            var dz = child.Center.Z - focus.Z;
+            var distSq = dx * dx + dy * dy + dz * dz;
+            if (distSq >= child.Radius * child.Radius) continue;    // focus outside child
+            if (camDist > child.Radius * 3.0) continue;             // still in overview of child
+
+            var childScope = child.FindScope(focus, camDist);
+            if (childScope.Depth > deepest.Depth) deepest = childScope;
         }
+        return deepest;
+    }
 
-        // Distance from camera focus to this cluster's center
-        var dx = Center.X - focus.X;
-        var dy = Center.Y - focus.Y;
-        var dz = Center.Z - focus.Z;
-        var distToFocus = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+    /// <summary>Recursively render the subtree of the given scope cluster.</summary>
+    private static void WalkSubtree(
+        ClusterTree scope,
+        Point3D focus,
+        double camDist,
+        Action<PhysicsNode> onLeaf,
+        Action<ClusterTree> onBubble)
+    {
+        if (scope.IsLeaf) { onLeaf(scope.Leaf!); return; }
 
-        // Expansion rule:
-        //   Expand if the camera is zoomed in enough AND the focus is
-        //   close to this cluster. Otherwise, draw the bubble and stop.
-        //
-        //   Deeper clusters expand later (need closer zoom) because
-        //   they're inside their parent.
-        var depthFactor = Math.Pow(0.6, Depth);           // children need closer zoom
-        var expandWhen = camDist < Radius * 6 * depthFactor
-                      && distToFocus < Radius * 4;
-
-        // Root (Depth 0) is always expanded
-        if (Depth == 0) expandWhen = true;
-
-        if (expandWhen)
+        foreach (var child in scope.Children)
         {
-            foreach (var c in Children) c.Walk(focus, camDist, onLeaf, onBubble);
-        }
-        else
-        {
-            onBubble(this);
+            if (child.IsLeaf) { onLeaf(child.Leaf!); continue; }
+
+            // Expand this child further, or stop here and draw a bubble
+            var dx = child.Center.X - focus.X;
+            var dy = child.Center.Y - focus.Y;
+            var dz = child.Center.Z - focus.Z;
+            var distToFocus = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+            var depthFactor = Math.Pow(0.6, child.Depth);
+            var expand = camDist < child.Radius * 6 * depthFactor
+                      && distToFocus < child.Radius * 4;
+
+            if (expand) WalkSubtree(child, focus, camDist, onLeaf, onBubble);
+            else onBubble(child);
         }
     }
 
