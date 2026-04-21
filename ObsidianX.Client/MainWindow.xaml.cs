@@ -48,6 +48,16 @@ public partial class MainWindow : Window
     private DispatcherTimer? _accessLogTimer;
     private int _recentAccessCount;   // for status bar counter
 
+    // AutoLinker config
+    private bool _autoLinkEnabled = true;
+    private bool _showAutoEdges = true;
+    private double _autoLinkThreshold = 0.35;
+
+    // Storage provider (File / Sqlite / MySql)
+    private string _storageProvider = "Sqlite";
+    private string _mySqlConnString = "";
+    private IBrainStorage? _storage;
+
     // Physics
     private readonly PhysicsEngine _dashPhysics = new();
     private readonly PhysicsEngine _graphPhysics = new();
@@ -117,6 +127,8 @@ public partial class MainWindow : Window
         PopulateSettings();
         PopulateImportSettings();
         PopulateMcpCommands();
+        PopulateAutoLinkerSettings();
+        PopulateStorageSettings();
         StartAccessLogWatcher();
 
         // Auto-scan + export on startup, if enabled
@@ -327,22 +339,33 @@ public partial class MainWindow : Window
             group.Children.Add(new GeometryModel3D(glowGroup, glowMat));
         }
 
-        // --- BATCH ALL EDGES INTO ONE MESH ---
-        var edgeMesh = new MeshGeometry3D();
+        // --- BATCH EDGES — wiki (cyan, solid) vs auto (purple, faded) ---
+        var wikiEdgeMesh = new MeshGeometry3D();
+        var autoEdgeMesh = new MeshGeometry3D();
         var nodeIndex = physics.Nodes.ToDictionary(n => n.Id, n => n);
 
         foreach (var edge in physics.Edges)
         {
+            if (edge.IsAuto && !_showAutoEdges) continue;
             if (!nodeIndex.TryGetValue(edge.SourceId, out var src)) continue;
             if (!nodeIndex.TryGetValue(edge.TargetId, out var tgt)) continue;
-            AppendLineToMesh(edgeMesh, src.Position, tgt.Position, 0.012);
+            var target = edge.IsAuto ? autoEdgeMesh : wikiEdgeMesh;
+            var width = edge.IsAuto ? 0.006 : 0.012;
+            AppendLineToMesh(target, src.Position, tgt.Position, width);
         }
 
-        if (edgeMesh.Positions.Count > 0)
+        if (wikiEdgeMesh.Positions.Count > 0)
         {
-            var edgeMat = new EmissiveMaterial(new SolidColorBrush(
-                Color.FromArgb(50, 0, 240, 255)));
-            group.Children.Add(new GeometryModel3D(edgeMesh, edgeMat));
+            var wikiMat = new EmissiveMaterial(new SolidColorBrush(
+                Color.FromArgb(60, 0, 240, 255)));
+            group.Children.Add(new GeometryModel3D(wikiEdgeMesh, wikiMat));
+        }
+        if (autoEdgeMesh.Positions.Count > 0)
+        {
+            // Electric purple, very translucent — auto-links are hints, not facts
+            var autoMat = new EmissiveMaterial(new SolidColorBrush(
+                Color.FromArgb(30, 139, 92, 246)));
+            group.Children.Add(new GeometryModel3D(autoEdgeMesh, autoMat));
         }
 
         parent.Content = group;
@@ -722,8 +745,22 @@ public partial class MainWindow : Window
     {
         StatusText.Text = "Indexing vault...";
         if (!Directory.Exists(_vaultPath)) Directory.CreateDirectory(_vaultPath);
+        _indexer.AutoLinker ??= new AutoLinker();
+        _indexer.AutoLinker.Options.Enabled = _autoLinkEnabled;
+        _indexer.AutoLinker.Options.Threshold = _autoLinkThreshold;
         _graph = _indexer.IndexVault(_vaultPath);
-        StatusText.Text = $"Indexed {_graph.TotalNodes} nodes";
+
+        // Push into configured storage (SQLite by default — FTS5 search)
+        try
+        {
+            _storage ??= BrainStorageFactory.Create(_storageProvider, _vaultPath, _mySqlConnString);
+            _storage.UpsertGraph(_graph);
+        }
+        catch (Exception ex) { Debug.WriteLine($"Storage upsert failed: {ex.Message}"); }
+
+        var wikiEdges = _graph.Edges.Count(e => e.RelationType == "wiki-link");
+        var autoEdges = _graph.Edges.Count - wikiEdges;
+        StatusText.Text = $"Indexed {_graph.TotalNodes} nodes · {wikiEdges} wiki · {autoEdges} auto-links · storage: {_storage?.ProviderName ?? "File"}";
     }
 
     private void CheckClaudeConnection()
@@ -1634,7 +1671,12 @@ public partial class MainWindow : Window
                 ["ScanWholeMachine"] = _scanWholeMachine,
                 ["ScanPatterns"] = _scanPatterns,
                 ["AutoScanOnStartup"] = _autoScanOnStartup,
-                ["ImportMode"] = _importMode.ToString()
+                ["ImportMode"] = _importMode.ToString(),
+                ["AutoLinkEnabled"] = _autoLinkEnabled,
+                ["ShowAutoEdges"] = _showAutoEdges,
+                ["AutoLinkThreshold"] = _autoLinkThreshold,
+                ["StorageProvider"] = _storageProvider,
+                ["MySqlConnectionString"] = _mySqlConnString
             };
             File.WriteAllText(SettingsFilePath,
                 Newtonsoft.Json.JsonConvert.SerializeObject(settings, Newtonsoft.Json.Formatting.Indented));
@@ -1665,6 +1707,16 @@ public partial class MainWindow : Window
                 _scanPaths.Clear();
                 foreach (var p in arr) if (p != null) _scanPaths.Add(p.ToString());
             }
+            if (settings.TryGetValue("AutoLinkEnabled", out var ale) && ale != null)
+                bool.TryParse(ale.ToString(), out _autoLinkEnabled);
+            if (settings.TryGetValue("ShowAutoEdges", out var sae) && sae != null)
+                bool.TryParse(sae.ToString(), out _showAutoEdges);
+            if (settings.TryGetValue("AutoLinkThreshold", out var alt) && alt != null)
+                double.TryParse(alt.ToString(), System.Globalization.CultureInfo.InvariantCulture, out _autoLinkThreshold);
+            if (settings.TryGetValue("StorageProvider", out var sp2) && sp2 != null)
+                _storageProvider = sp2.ToString() ?? _storageProvider;
+            if (settings.TryGetValue("MySqlConnectionString", out var mcs) && mcs != null)
+                _mySqlConnString = mcs.ToString() ?? _mySqlConnString;
         }
         catch (Exception ex) { Debug.WriteLine($"Settings load error: {ex.Message}"); }
     }
@@ -2020,6 +2072,101 @@ public partial class MainWindow : Window
     }
 
     // ═══════════════════════════════════════
+    // AUTO-LINKER UI HANDLERS
+    // ═══════════════════════════════════════
+
+    private void AutoLinkEnabled_Changed(object s, RoutedEventArgs e)
+    {
+        _autoLinkEnabled = AutoLinkEnabledCheck.IsChecked == true;
+        SaveSettingsToFile();
+    }
+
+    private void ShowAutoEdges_Changed(object s, RoutedEventArgs e)
+    {
+        _showAutoEdges = ShowAutoEdgesCheck.IsChecked == true;
+        SaveSettingsToFile();
+    }
+
+    private void AutoLinkThreshold_Changed(object s,
+        RoutedPropertyChangedEventArgs<double> e)
+    {
+        _autoLinkThreshold = e.NewValue;
+        if (AutoLinkThresholdText != null)
+            AutoLinkThresholdText.Text = e.NewValue.ToString("F2");
+        SaveSettingsToFile();
+    }
+
+    private void PopulateAutoLinkerSettings()
+    {
+        if (AutoLinkEnabledCheck == null) return;
+        AutoLinkEnabledCheck.IsChecked = _autoLinkEnabled;
+        ShowAutoEdgesCheck.IsChecked = _showAutoEdges;
+        AutoLinkThresholdSlider.Value = _autoLinkThreshold;
+        AutoLinkThresholdText.Text = _autoLinkThreshold.ToString("F2");
+    }
+
+    // ═══════════════════════════════════════
+    // STORAGE PROVIDER (SQLite / MySQL) UI
+    // ═══════════════════════════════════════
+
+    private void PopulateStorageSettings()
+    {
+        if (StorageProviderCombo == null) return;
+        StorageProviderCombo.SelectedIndex = _storageProvider.Equals("MySql", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+        MySqlConnStringBox.Text = _mySqlConnString;
+        UpdateStorageStatus();
+    }
+
+    private void StorageProvider_Changed(object s, SelectionChangedEventArgs e)
+    {
+        if (StorageProviderCombo == null) return;
+        _storageProvider = StorageProviderCombo.SelectedIndex == 1 ? "MySql" : "Sqlite";
+        MySqlPanel.Visibility = _storageProvider == "MySql" ? Visibility.Visible : Visibility.Collapsed;
+        SaveSettingsToFile();
+    }
+
+    private void SaveMySqlConn_Click(object s, RoutedEventArgs e)
+    {
+        _mySqlConnString = MySqlConnStringBox.Text.Trim();
+        SaveSettingsToFile();
+        ApplyStorage();
+    }
+
+    private void ApplyStorage_Click(object s, RoutedEventArgs e) => ApplyStorage();
+
+    private void ApplyStorage()
+    {
+        try
+        {
+            _storage?.Dispose();
+            _storage = BrainStorageFactory.Create(_storageProvider, _vaultPath, _mySqlConnString);
+            _storage.UpsertGraph(_graph);
+            UpdateStorageStatus();
+            StatusText.Text = $"Storage switched to {_storage.ProviderName} · {_storage.NodeCount()} nodes persisted";
+        }
+        catch (Exception ex)
+        {
+            StorageStatusText.Text = $"Failed to open storage: {ex.Message}";
+        }
+    }
+
+    private void UpdateStorageStatus()
+    {
+        if (StorageStatusText == null) return;
+        try
+        {
+            if (_storage == null)
+                StorageStatusText.Text = "No storage initialized yet — it will auto-init on next index.";
+            else
+                StorageStatusText.Text = $"Active: {_storage.ProviderName} · {_storage.NodeCount()} nodes indexed";
+        }
+        catch (Exception ex)
+        {
+            StorageStatusText.Text = $"Status error: {ex.Message}";
+        }
+    }
+
+    // ═══════════════════════════════════════
     // ACCESS-LOG TAIL + PULSE INJECTION
     // Tails .obsidianx/access-log.ndjson (written by MCP server when
     // Claude pulls knowledge). For each new entry, we bump AccessIntensity
@@ -2092,6 +2239,15 @@ public partial class MainWindow : Window
 
             BumpPulseForNode(_dashPhysics, nodeId);
             BumpPulseForNode(_graphPhysics, nodeId);
+
+            // Also persist into storage for "top accessed" queries
+            try
+            {
+                _storage?.LogAccess(nodeId,
+                    obj["op"]?.ToString() ?? "mcp",
+                    obj["context"]?.ToString());
+            }
+            catch { /* storage is best-effort */ }
         }
         catch (Newtonsoft.Json.JsonException) { }
     }

@@ -31,6 +31,10 @@ public class PhysicsEdge
     public string TargetId { get; set; } = "";
     public double RestLength { get; set; } = 2.0;
     public double Strength { get; set; } = 1.0;
+    /// <summary>Relation type from KnowledgeEdge ("wiki-link", "auto:tag", etc.).</summary>
+    public string RelationType { get; set; } = "wiki-link";
+    /// <summary>True if this edge was inferred by AutoLinker, not authored by the user.</summary>
+    public bool IsAuto => RelationType.StartsWith("auto", StringComparison.Ordinal);
 }
 
 public class PhysicsEngine
@@ -101,7 +105,8 @@ public class PhysicsEngine
                 SourceId = edge.SourceId,
                 TargetId = edge.TargetId,
                 RestLength = SpringLength,
-                Strength = edge.Strength
+                Strength = edge.Strength,
+                RelationType = edge.RelationType
             });
         }
 

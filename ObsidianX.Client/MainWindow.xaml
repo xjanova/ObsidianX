@@ -1077,6 +1077,79 @@
                                             </StackPanel>
                                         </Border>
 
+                                        <!-- Storage Provider -->
+                                        <Border Style="{StaticResource CardPanel}" Margin="0,0,0,12">
+                                            <StackPanel>
+                                                <TextBlock Text="STORAGE BACKEND" FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,8"/>
+                                                <TextBlock FontSize="11" Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap" Margin="0,0,0,12">
+                                                    Cache parsed graph + serve full-text search + persist access history.
+                                                    SQLite = local .obsidianx/brain.db with FTS5 (handles Thai via unicode61).
+                                                    MySQL = shared server DB for team "pool brain".
+                                                </TextBlock>
+                                                <TextBlock Text="Provider" FontSize="11"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                <ComboBox x:Name="StorageProviderCombo" Margin="0,0,0,12"
+                                                          Background="{StaticResource SurfaceBrush}"
+                                                          Foreground="{StaticResource TextPrimaryBrush}"
+                                                          SelectionChanged="StorageProvider_Changed">
+                                                    <ComboBoxItem Content="SQLite — local .obsidianx/brain.db with FTS5" IsSelected="True"/>
+                                                    <ComboBoxItem Content="MySQL — shared server (team pool brain)"/>
+                                                </ComboBox>
+                                                <StackPanel x:Name="MySqlPanel" Visibility="Collapsed">
+                                                    <TextBlock Text="MySQL connection string" FontSize="11"
+                                                               Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                    <TextBox x:Name="MySqlConnStringBox" Style="{StaticResource NeonTextBox}"
+                                                             FontFamily="{StaticResource MonoFont}" FontSize="11"
+                                                             Text="Server=localhost;Port=3306;Database=obsidianx;User=root;Password=;"
+                                                             Margin="0,0,0,8"/>
+                                                    <Button Content="Save connection" Style="{StaticResource NeonButton}"
+                                                            Click="SaveMySqlConn_Click" Padding="12,6" HorizontalAlignment="Left"/>
+                                                </StackPanel>
+                                                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                                    <Button Content="Apply &amp; Rebuild Index" Style="{StaticResource NeonButtonFilled}"
+                                                            Click="ApplyStorage_Click" Padding="16,8"/>
+                                                </StackPanel>
+                                                <TextBlock x:Name="StorageStatusText" FontSize="11"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                        </Border>
+
+                                        <!-- AutoLinker -->
+                                        <Border Style="{StaticResource CardPanel}" Margin="0,0,0,12">
+                                            <StackPanel>
+                                                <TextBlock Text="AUTO-LINKER (connect related notes)" FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,8"/>
+                                                <TextBlock FontSize="11" Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap" Margin="0,0,0,12">
+                                                    Creates edges between semantically related notes that don't have an explicit [[wiki-link]].
+                                                    Uses six signals (tag overlap, category match, title tokens, source folder, keyword co-occurrence)
+                                                    via inverted index — O(N·k), not O(N²). Auto-edges render as faded purple vs. the cyan wiki-links.
+                                                </TextBlock>
+                                                <CheckBox x:Name="AutoLinkEnabledCheck" Content="Enable auto-linker"
+                                                          Foreground="{StaticResource TextPrimaryBrush}" Margin="0,0,0,8"
+                                                          IsChecked="True"
+                                                          Checked="AutoLinkEnabled_Changed" Unchecked="AutoLinkEnabled_Changed"/>
+                                                <CheckBox x:Name="ShowAutoEdgesCheck" Content="Show auto-edges on 3D graph"
+                                                          Foreground="{StaticResource TextPrimaryBrush}" Margin="0,0,0,12"
+                                                          IsChecked="True"
+                                                          Checked="ShowAutoEdges_Changed" Unchecked="ShowAutoEdges_Changed"/>
+
+                                                <TextBlock Text="Threshold (higher = fewer, stronger links)" FontSize="11"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                                    <Slider x:Name="AutoLinkThresholdSlider" Width="260"
+                                                            Minimum="0.15" Maximum="0.7" Value="0.35" TickFrequency="0.05"
+                                                            IsSnapToTickEnabled="True" VerticalAlignment="Center"
+                                                            ValueChanged="AutoLinkThreshold_Changed"/>
+                                                    <TextBlock x:Name="AutoLinkThresholdText" Text="0.35" Margin="12,0,0,0"
+                                                               Foreground="{StaticResource TextPrimaryBrush}"
+                                                               FontFamily="{StaticResource MonoFont}" VerticalAlignment="Center"/>
+                                                </StackPanel>
+                                                <Button Content="Re-index with current settings" Style="{StaticResource NeonButton}"
+                                                        Click="ReindexVault_Click" Padding="16,8" HorizontalAlignment="Left"/>
+                                            </StackPanel>
+                                        </Border>
+
                                         <!-- Claude Code CLI Integration -->
                                         <Border Style="{StaticResource CardPanel}" Margin="0,0,0,12">
                                             <StackPanel>
