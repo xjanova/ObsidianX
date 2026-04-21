@@ -100,6 +100,18 @@ public class PhysicsEngine
     private Dictionary<int, Point3D> _communityCenter = [];
     private Dictionary<int, int> _communityCount = [];
 
+    /// <summary>
+    /// Hierarchical cluster tree built after layout settles. Drives
+    /// the fractal zoom: each bubble contains sub-bubbles or leaves.
+    /// Rebuilt on LoadFromGraph and RebuildClusterTree().
+    /// </summary>
+    public ClusterTree? ClusterTree { get; private set; }
+
+    public void RebuildClusterTree()
+    {
+        ClusterTree = ClusterTree.Build([.. Nodes], [.. Edges]);
+    }
+
     public void LoadFromGraph(KnowledgeGraph graph)
     {
         Nodes.Clear();
@@ -156,6 +168,7 @@ public class PhysicsEngine
         DetectCommunities();
         AutoTune();
         Warmup(80);
+        RebuildClusterTree();
     }
 
     public void AutoTune()
@@ -294,6 +307,9 @@ public class PhysicsEngine
 
         // Cool down over time
         if (Temperature > 0.15) Temperature *= CoolingRate;
+
+        // Keep cluster tree bounds fresh — cheap post-order walk
+        if (ClusterTree != null) ClusterTree.ComputeBounds(ClusterTree);
     }
 
     // ─────────── Community detection (label propagation) ───────────

@@ -429,15 +429,26 @@
                                             <TextBlock Text="Camera" FontSize="10" VerticalAlignment="Center"
                                                        Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,6,0"/>
                                             <ComboBox x:Name="CameraModeCombo" Width="140" FontSize="10"
-                                                      Background="{StaticResource SurfaceBrush}"
+                                                      Background="{StaticResource DarkPanelBrush}"
                                                       Foreground="{StaticResource TextPrimaryBrush}"
+                                                      BorderBrush="{StaticResource NeonCyanBrush}"
                                                       SelectionChanged="CameraMode_Changed" Margin="0,0,10,0">
+                                                <ComboBox.ItemContainerStyle>
+                                                    <Style TargetType="ComboBoxItem">
+                                                        <Setter Property="Background" Value="#0f1420"/>
+                                                        <Setter Property="Foreground" Value="White"/>
+                                                        <Setter Property="Padding" Value="8,4"/>
+                                                    </Style>
+                                                </ComboBox.ItemContainerStyle>
                                                 <ComboBoxItem Content="Free (drag)" IsSelected="True"/>
                                                 <ComboBoxItem Content="Follow Pulse"/>
                                                 <ComboBoxItem Content="Orbit"/>
                                                 <ComboBoxItem Content="Overview"/>
                                                 <ComboBoxItem Content="Random Walk"/>
                                             </ComboBox>
+                                            <Button Content="&#x2B06; Up" Style="{StaticResource NeonButton}"
+                                                    Padding="10,3" FontSize="10" Click="ZoomOutLevel_Click" Margin="0,0,6,0"
+                                                    ToolTip="Zoom back to parent cluster"/>
                                             <Button Content="&#x1F3AF; Fit" Style="{StaticResource NeonButton}"
                                                     Padding="10,3" FontSize="10" Click="FitOverview_Click" Margin="0,0,6,0"
                                                     ToolTip="Frame the whole graph"/>

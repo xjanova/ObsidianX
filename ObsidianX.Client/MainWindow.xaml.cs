@@ -350,23 +350,48 @@ public partial class MainWindow : Window
             return;
         }
 
-        // ── Decide which nodes to render ──
-        //   MaxVisibleNodes caps total draw count — keep highest-importance
-        //   Selected/pulsed nodes are always kept regardless of cap
+        // ── Fractal-zoom: walk the cluster tree and collect visible nodes
+        //    plus bubbles that haven't been expanded yet ──
         bool[] visible = new bool[physics.Nodes.Count];
-        if (_maxVisibleNodes > 0 && physics.Nodes.Count > _maxVisibleNodes)
+        var bubbles = new List<ClusterTree>();
+        var nodeIndexById = new Dictionary<string, int>(physics.Nodes.Count);
+        for (int i = 0; i < physics.Nodes.Count; i++) nodeIndexById[physics.Nodes[i].Id] = i;
+
+        var tree = parent == FullGraphModel ? physics.ClusterTree : null;
+        var fractalFocus = parent == BrainModel ? new Point3D(0, 0, 0) : _graphTarget;
+        var fractalZoom = parent == BrainModel ? _camDist : _graphDist;
+
+        if (tree != null)
         {
-            var ranked = physics.Nodes
-                .Select((n, i) => (i, n.Importance + (n.AccessIntensity > 0.05 ? 1e6 : 0)
-                                       + (i == selectedIdx ? 1e7 : 0)))
-                .OrderByDescending(t => t.Item2)
-                .Take(_maxVisibleNodes)
-                .Select(t => t.i);
-            foreach (var i in ranked) visible[i] = true;
+            tree.Walk(fractalFocus, fractalZoom,
+                onLeaf: n => { if (nodeIndexById.TryGetValue(n.Id, out var idx)) visible[idx] = true; },
+                onBubble: b => bubbles.Add(b));
         }
         else
         {
+            // Dashboard view / fallback — no fractal, everything's a leaf
             for (int i = 0; i < visible.Length; i++) visible[i] = true;
+        }
+
+        // Apply MaxVisibleNodes cap only to the leaves that survived fractal walk
+        if (_maxVisibleNodes > 0)
+        {
+            int visCount = visible.Count(v => v);
+            if (visCount > _maxVisibleNodes)
+            {
+                var rankedKeep = physics.Nodes
+                    .Select((n, i) => (i, score: n.Importance
+                                              + (n.AccessIntensity > 0.05 ? 1e6 : 0)
+                                              + (i == selectedIdx ? 1e7 : 0),
+                                          visible: visible[i]))
+                    .Where(t => t.visible)
+                    .OrderByDescending(t => t.score)
+                    .Take(_maxVisibleNodes)
+                    .Select(t => t.i)
+                    .ToHashSet();
+                for (int i = 0; i < visible.Length; i++)
+                    if (visible[i] && !rankedKeep.Contains(i)) visible[i] = false;
+            }
         }
 
         // Camera + focus target — culling uses distance from what the user
@@ -540,8 +565,62 @@ public partial class MainWindow : Window
             group.Children.Add(new GeometryModel3D(autoEdgeMesh, autoMat));
         }
 
+        // ── Fractal cluster bubbles ──
+        // Each unexpanded cluster renders as a translucent sphere so users
+        // see structure at overview zoom. Dive closer (shrink camDist OR
+        // aim focus at the bubble) and it expands into its children next
+        // frame. Supports click-to-dive via _pendingDiveBubble.
+        if (bubbles.Count > 0)
+        {
+            _lastRenderedBubbles = bubbles;  // for hit-test on click
+
+            var bubbleMeshes = new Dictionary<Color, MeshGeometry3D>();
+            var bubbleOutlines = new Dictionary<Color, MeshGeometry3D>();
+
+            foreach (var b in bubbles)
+            {
+                var baseColor = GetCategoryColor(b.DominantCategory);
+                var bubbleColor = _useClusterColors
+                    ? TintByCommunity(baseColor, b.Id.GetHashCode())
+                    : baseColor;
+
+                if (!bubbleMeshes.TryGetValue(bubbleColor, out var bm))
+                    bubbleMeshes[bubbleColor] = bm = new MeshGeometry3D();
+                if (!bubbleOutlines.TryGetValue(bubbleColor, out var om))
+                    bubbleOutlines[bubbleColor] = om = new MeshGeometry3D();
+
+                // Inner filled sphere, translucent — shows cluster volume
+                AppendSphereToMesh(bm, b.Center, b.Radius * 0.75, SharedSphereLOD);
+                // Outer ring — hints at expansion
+                AppendSphereToMesh(om, b.Center, b.Radius * 0.85, SharedSphereLOD);
+            }
+
+            foreach (var (color, mesh) in bubbleMeshes)
+            {
+                var fillMat = new MaterialGroup();
+                fillMat.Children.Add(new DiffuseMaterial(new SolidColorBrush(
+                    Color.FromArgb(55, color.R, color.G, color.B))));
+                fillMat.Children.Add(new EmissiveMaterial(new SolidColorBrush(
+                    Color.FromArgb(35, color.R, color.G, color.B))));
+                group.Children.Add(new GeometryModel3D(mesh, fillMat) { BackMaterial = fillMat });
+            }
+            foreach (var (color, mesh) in bubbleOutlines)
+            {
+                var outlineMat = new EmissiveMaterial(new SolidColorBrush(
+                    Color.FromArgb(90, color.R, color.G, color.B)));
+                group.Children.Add(new GeometryModel3D(mesh, outlineMat));
+            }
+        }
+        else
+        {
+            _lastRenderedBubbles = null;
+        }
+
         parent.Content = group;
     }
+
+    // Last rendered bubbles (for click-to-dive hit-testing)
+    private List<ClusterTree>? _lastRenderedBubbles;
 
     /// <summary>Append a transformed sphere into a batched mesh (no new objects per node)</summary>
     private static void AppendSphereToMesh(MeshGeometry3D target, Point3D center, double radius, MeshGeometry3D unitSphere)
@@ -736,12 +815,84 @@ public partial class MainWindow : Window
         ((UIElement)s).CaptureMouse();
 
         var mouseOnViewport = e.GetPosition(FullGraphViewport);
+
+        // First try to hit a bubble — click-to-dive. If none hit, fall
+        // through to leaf-node hit-test.
+        if (e.ClickCount == 1 && TryDiveIntoBubble(mouseOnViewport)) return;
+
         var hit = HitTestNode(FullGraphViewport, GraphCam, _graphPhysics, mouseOnViewport);
         if (hit.HasValue)
         {
             _selectedNodeGraph = hit;
             ShowNodeInfo(GraphNodeInfo, GraphNodeTitle, GraphNodeMeta, GraphNodeDot, GraphNodeContent, _graphPhysics.Nodes[hit.Value]);
         }
+    }
+
+    /// <summary>
+    /// Cast a ray through the mouse point and see which bubble (if any)
+    /// it intersects. If hit, lerp the camera target onto that bubble
+    /// and zoom in — the next render will expand it into sub-clusters.
+    /// </summary>
+    private bool TryDiveIntoBubble(Point mouseOnViewport)
+    {
+        if (_lastRenderedBubbles == null || _lastRenderedBubbles.Count == 0) return false;
+
+        // Build a world-space ray from the camera through the mouse point
+        var ray = BuildPickRay(FullGraphViewport, GraphCam, mouseOnViewport);
+        if (ray == null) return (false);
+
+        ClusterTree? best = null;
+        double bestT = double.MaxValue;
+
+        foreach (var b in _lastRenderedBubbles)
+        {
+            // Ray-sphere intersection
+            var oc = ray.Value.origin - b.Center;
+            var a = Vector3D.DotProduct(ray.Value.dir, ray.Value.dir);
+            var bDot = 2 * Vector3D.DotProduct(ray.Value.dir, oc);
+            var cDot = Vector3D.DotProduct(oc, oc) - b.Radius * b.Radius;
+            var disc = bDot * bDot - 4 * a * cDot;
+            if (disc < 0) continue;
+            var t = (-bDot - Math.Sqrt(disc)) / (2 * a);
+            if (t < 0) t = (-bDot + Math.Sqrt(disc)) / (2 * a);
+            if (t > 0 && t < bestT) { bestT = t; best = b; }
+        }
+
+        if (best == null) return false;
+
+        // Dive: aim target at bubble center, shrink distance to fit radius
+        _graphTarget = best.Center;
+        _graphDist = Math.Max(2, best.Radius * 2.4);
+        _cameraMode = CameraMode.Free;  // user took control
+        if (CameraModeCombo != null) CameraModeCombo.SelectedIndex = 0;
+        StatusText.Text = $"🔍 Dived into cluster: {best.Label}";
+        return true;
+    }
+
+    private static (Point3D origin, Vector3D dir)? BuildPickRay(
+        Viewport3D viewport, PerspectiveCamera cam, Point mouseOnViewport)
+    {
+        var w = viewport.ActualWidth;
+        var h = viewport.ActualHeight;
+        if (w <= 0 || h <= 0) return null;
+
+        // Normalized device coords [-1, 1]
+        var ndcX = (2.0 * mouseOnViewport.X / w) - 1.0;
+        var ndcY = 1.0 - (2.0 * mouseOnViewport.Y / h);
+
+        var forward = cam.LookDirection; forward.Normalize();
+        var up = cam.UpDirection; up.Normalize();
+        var right = Vector3D.CrossProduct(forward, up); right.Normalize();
+        up = Vector3D.CrossProduct(right, forward); up.Normalize();
+
+        var aspect = w / h;
+        var fovYRad = cam.FieldOfView * Math.PI / 180;
+        var tanHalfY = Math.Tan(fovYRad / 2);
+        var tanHalfX = tanHalfY * aspect;
+
+        var dir = forward + right * (ndcX * tanHalfX) + up * (ndcY * tanHalfY);
+        dir.Normalize();
+        return (cam.Position, dir);
     }
 
     private void FullGraph_MouseUp(object s, MouseButtonEventArgs e)
@@ -921,6 +1072,46 @@ public partial class MainWindow : Window
         _graphTarget = b.center;
         _graphDist = Math.Clamp(b.radius * 2.5, 6, 120);
         StatusText.Text = $"Fitted to graph bounds · radius {b.radius:F1}";
+    }
+
+    /// <summary>
+    /// Climb one level up the cluster tree: find which bubble the
+    /// camera target is inside, zoom out so that bubble fits the
+    /// viewport. Repeat clicks walk up toward the root.
+    /// </summary>
+    private void ZoomOutLevel_Click(object sender, RoutedEventArgs e)
+    {
+        var tree = _graphPhysics.ClusterTree;
+        if (tree == null) return;
+
+        // Find deepest cluster whose sphere contains the current target
+        ClusterTree? bestContainer = null;
+        WalkAllClusters(tree, c =>
+        {
+            if (c.IsLeaf || c == tree) return;
+            var d = Distance(c.Center, _graphTarget);
+            if (d < c.Radius && (bestContainer == null || c.Depth > bestContainer.Depth))
+                bestContainer = c;
+        });
+
+        // Step up: parent of the cluster we're inside
+        var up = bestContainer?.Parent ?? tree;
+        _graphTarget = up.Center;
+        _graphDist = Math.Clamp(up.Radius * 2.4, 6, 120);
+        var label = up.Depth == 0 ? "Brain (root)" : up.Label;
+        StatusText.Text = $"⬆ Zoomed out to: {label}";
+    }
+
+    private static void WalkAllClusters(ClusterTree t, Action<ClusterTree> visit)
+    {
+        visit(t);
+        foreach (var c in t.Children) WalkAllClusters(c, visit);
+    }
+
+    private static double Distance(Point3D a, Point3D b)
+    {
+        var dx = a.X - b.X; var dy = a.Y - b.Y; var dz = a.Z - b.Z;
+        return Math.Sqrt(dx * dx + dy * dy + dz * dz);
     }
 
     // ═══════════════════════════════════════
