@@ -1077,6 +1077,48 @@
                                             </StackPanel>
                                         </Border>
 
+                                        <!-- Graph Performance -->
+                                        <Border Style="{StaticResource CardPanel}" Margin="0,0,0,12">
+                                            <StackPanel>
+                                                <TextBlock Text="3D GRAPH PERFORMANCE" FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,8"/>
+                                                <TextBlock FontSize="11" Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap" Margin="0,0,0,12">
+                                                    Physics uses Barnes-Hut octree (O(N log N)) and Fruchterman-Reingold forces
+                                                    with per-community gravity — nodes in the same cluster attract each other,
+                                                    not just the origin. Rendering culls distant and low-importance nodes.
+                                                </TextBlock>
+
+                                                <TextBlock Text="Max visible nodes (0 = unlimited)" FontSize="11"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                                    <Slider x:Name="MaxVisibleNodesSlider" Width="260"
+                                                            Minimum="0" Maximum="2000" Value="400" TickFrequency="100"
+                                                            IsSnapToTickEnabled="True" VerticalAlignment="Center"
+                                                            ValueChanged="MaxVisibleNodes_Changed"/>
+                                                    <TextBlock x:Name="MaxVisibleNodesText" Text="400" Margin="12,0,0,0"
+                                                               Foreground="{StaticResource TextPrimaryBrush}"
+                                                               FontFamily="{StaticResource MonoFont}" VerticalAlignment="Center"/>
+                                                </StackPanel>
+
+                                                <TextBlock Text="Cull distance (beyond camera radius, 0 = no cull)" FontSize="11"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                                    <Slider x:Name="CullDistanceSlider" Width="260"
+                                                            Minimum="0" Maximum="40" Value="12" TickFrequency="1"
+                                                            IsSnapToTickEnabled="True" VerticalAlignment="Center"
+                                                            ValueChanged="CullDistance_Changed"/>
+                                                    <TextBlock x:Name="CullDistanceText" Text="12" Margin="12,0,0,0"
+                                                               Foreground="{StaticResource TextPrimaryBrush}"
+                                                               FontFamily="{StaticResource MonoFont}" VerticalAlignment="Center"/>
+                                                </StackPanel>
+
+                                                <CheckBox x:Name="ClusterColorsCheck" Content="Tint nodes by community (cluster colors)"
+                                                          Foreground="{StaticResource TextPrimaryBrush}" Margin="0,0,0,0"
+                                                          IsChecked="True"
+                                                          Checked="ClusterColors_Changed" Unchecked="ClusterColors_Changed"/>
+                                            </StackPanel>
+                                        </Border>
+
                                         <!-- Storage Provider -->
                                         <Border Style="{StaticResource CardPanel}" Margin="0,0,0,12">
                                             <StackPanel>

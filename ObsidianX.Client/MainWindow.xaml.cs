@@ -58,6 +58,11 @@ public partial class MainWindow : Window
     private string _mySqlConnString = "";
     private IBrainStorage? _storage;
 
+    // Graph rendering performance controls
+    private int _maxVisibleNodes = 400;          // 0 = unlimited
+    private double _cullDistance = 12.0;         // camera-space; 0 = disabled
+    private bool _useClusterColors = true;       // tint nodes by community
+
     // Physics
     private readonly PhysicsEngine _dashPhysics = new();
     private readonly PhysicsEngine _graphPhysics = new();
@@ -129,6 +134,7 @@ public partial class MainWindow : Window
         PopulateMcpCommands();
         PopulateAutoLinkerSettings();
         PopulateStorageSettings();
+        PopulateGraphPerfSettings();
         StartAccessLogWatcher();
 
         // Auto-scan + export on startup, if enabled
@@ -207,7 +213,9 @@ public partial class MainWindow : Window
         var now = DateTime.Now;
         if ((now - _lastFpsTime).TotalSeconds >= 1.0)
         {
-            GraphFPS.Text = $"{_frameCount} FPS | {_graphPhysics.Nodes.Count} nodes | E={_graphPhysics.TotalEnergy:F2}";
+            var nodesTotal = _graphPhysics.Nodes.Count;
+            var communities = _graphPhysics.Nodes.Select(n => n.CommunityId).Distinct().Count();
+            GraphFPS.Text = $"{_frameCount} FPS | {nodesTotal} nodes | {communities} clusters | E={_graphPhysics.TotalEnergy:F2}";
             _frameCount = 0;
             _lastFpsTime = now;
         }
@@ -248,35 +256,79 @@ public partial class MainWindow : Window
             return;
         }
 
+        // ── Decide which nodes to render ──
+        //   MaxVisibleNodes caps total draw count — keep highest-importance
+        //   Selected/pulsed nodes are always kept regardless of cap
+        bool[] visible = new bool[physics.Nodes.Count];
+        if (_maxVisibleNodes > 0 && physics.Nodes.Count > _maxVisibleNodes)
+        {
+            var ranked = physics.Nodes
+                .Select((n, i) => (i, n.Importance + (n.AccessIntensity > 0.05 ? 1e6 : 0)
+                                       + (i == selectedIdx ? 1e7 : 0)))
+                .OrderByDescending(t => t.Item2)
+                .Take(_maxVisibleNodes)
+                .Select(t => t.i);
+            foreach (var i in ranked) visible[i] = true;
+        }
+        else
+        {
+            for (int i = 0; i < visible.Length; i++) visible[i] = true;
+        }
+
+        // Camera position (for distance culling)
+        var cam = parent == BrainModel ? DashCam : GraphCam;
+        var camPos = cam.Position;
+        var cullSqr = _cullDistance > 0
+            ? (_cullDistance + Math.Sqrt(physics.Nodes.Count) * 0.5) *
+              (_cullDistance + Math.Sqrt(physics.Nodes.Count) * 0.5)
+            : double.MaxValue;
+
         // --- BATCH ALL NODES INTO ONE MESH PER MATERIAL ---
-        // Group nodes by category color for minimal draw calls
         var colorGroups = new Dictionary<Color, (MeshGeometry3D mesh, bool emissive)>();
-        var glowGroup = new MeshGeometry3D();      // selected/hovered glow
-        var pulseGroups = new Dictionary<Color, MeshGeometry3D>(); // knowledge-pulse (MCP access)
-        var pulseAuraGroup = new MeshGeometry3D(); // outer aura around pulsed nodes
+        var glowGroup = new MeshGeometry3D();
+        var pulseGroups = new Dictionary<Color, MeshGeometry3D>();
+        var pulseAuraGroup = new MeshGeometry3D();
+        int renderedCount = 0;
 
         for (int i = 0; i < physics.Nodes.Count; i++)
         {
+            if (!visible[i]) continue;
+
             var node = physics.Nodes[i];
-            var color = GetCategoryColor(node.Category);
+
+            // Distance culling (keep selected/pulsed regardless)
+            var dx = node.Position.X - camPos.X;
+            var dy = node.Position.Y - camPos.Y;
+            var dz = node.Position.Z - camPos.Z;
+            var dsq = dx * dx + dy * dy + dz * dz;
+            bool keepAnyway = i == selectedIdx || node.AccessIntensity > 0.05 || node.IsHovered;
+            if (!keepAnyway && dsq > cullSqr) continue;
+
+            renderedCount++;
+
+            // Choose color: category color, tinted by community if enabled
+            var baseColor = GetCategoryColor(node.Category);
+            var color = _useClusterColors && node.CommunityId >= 0
+                ? TintByCommunity(baseColor, node.CommunityId)
+                : baseColor;
+
             var isSelected = i == selectedIdx;
             var pulse = 1.0 + Math.Sin(_time * 3 + node.PulsePhase) * 0.08;
             var radius = node.Radius * pulse;
 
             if (isSelected || node.IsHovered)
-                radius *= 1.4; // bigger when selected
+                radius *= 1.4;
 
-            // Knowledge-pulse bump: 0.0 = normal, 1.0 = freshly accessed
             var intensity = node.AccessIntensity;
             if (intensity > 0.05)
             {
-                // Fast oscillation on top of the decay so it "breathes"
                 var beat = 1.0 + Math.Sin(_time * 10 + node.PulsePhase) * 0.15 * intensity;
                 radius *= (1.0 + 0.8 * intensity) * beat;
             }
 
-            // Pick LOD based on node count
-            var sphereMesh = physics.Nodes.Count > 100 ? SharedSphereLOD : SharedSphere;
+            // LOD: far nodes + large graphs use simple sphere; close + selected use detailed
+            var farLod = dsq > cullSqr * 0.3 || physics.Nodes.Count > 150;
+            var sphereMesh = farLod && !isSelected ? SharedSphereLOD : SharedSphere;
 
             if (!colorGroups.ContainsKey(color))
                 colorGroups[color] = (new MeshGeometry3D(), false);
@@ -340,15 +392,21 @@ public partial class MainWindow : Window
         }
 
         // --- BATCH EDGES — wiki (cyan, solid) vs auto (purple, faded) ---
+        // Edges only render if at least one endpoint is visible.
         var wikiEdgeMesh = new MeshGeometry3D();
         var autoEdgeMesh = new MeshGeometry3D();
-        var nodeIndex = physics.Nodes.ToDictionary(n => n.Id, n => n);
+        var idToIdx = new Dictionary<string, int>(physics.Nodes.Count);
+        for (int i = 0; i < physics.Nodes.Count; i++) idToIdx[physics.Nodes[i].Id] = i;
 
         foreach (var edge in physics.Edges)
         {
             if (edge.IsAuto && !_showAutoEdges) continue;
-            if (!nodeIndex.TryGetValue(edge.SourceId, out var src)) continue;
-            if (!nodeIndex.TryGetValue(edge.TargetId, out var tgt)) continue;
+            if (!idToIdx.TryGetValue(edge.SourceId, out var srcIdx)) continue;
+            if (!idToIdx.TryGetValue(edge.TargetId, out var tgtIdx)) continue;
+            if (!visible[srcIdx] || !visible[tgtIdx]) continue;
+
+            var src = physics.Nodes[srcIdx];
+            var tgt = physics.Nodes[tgtIdx];
             var target = edge.IsAuto ? autoEdgeMesh : wikiEdgeMesh;
             var width = edge.IsAuto ? 0.006 : 0.012;
             AppendLineToMesh(target, src.Position, tgt.Position, width);
@@ -1239,6 +1297,23 @@ public partial class MainWindow : Window
         catch (IOException ex) { Debug.WriteLine($"Tree scan error: {ex.Message}"); }
     }
 
+    /// <summary>
+    /// Shift a category color slightly based on community id so visually
+    /// adjacent clusters are still distinguishable while the category
+    /// scheme remains dominant.
+    /// </summary>
+    private static Color TintByCommunity(Color baseColor, int communityId)
+    {
+        // Golden-angle hue rotation — consistent per community id
+        var phase = (communityId * 137.5) % 360.0;
+        var shift = (int)(Math.Sin(phase * Math.PI / 180.0) * 30);
+
+        int r = Math.Clamp(baseColor.R + shift, 20, 255);
+        int g = Math.Clamp(baseColor.G - shift / 2, 20, 255);
+        int b = Math.Clamp(baseColor.B + shift / 3, 20, 255);
+        return Color.FromRgb((byte)r, (byte)g, (byte)b);
+    }
+
     private static Color GetCategoryColor(KnowledgeCategory cat) => cat switch
     {
         KnowledgeCategory.Programming => Color.FromRgb(0, 240, 255),
@@ -1676,7 +1751,10 @@ public partial class MainWindow : Window
                 ["ShowAutoEdges"] = _showAutoEdges,
                 ["AutoLinkThreshold"] = _autoLinkThreshold,
                 ["StorageProvider"] = _storageProvider,
-                ["MySqlConnectionString"] = _mySqlConnString
+                ["MySqlConnectionString"] = _mySqlConnString,
+                ["MaxVisibleNodes"] = _maxVisibleNodes,
+                ["CullDistance"] = _cullDistance,
+                ["UseClusterColors"] = _useClusterColors
             };
             File.WriteAllText(SettingsFilePath,
                 Newtonsoft.Json.JsonConvert.SerializeObject(settings, Newtonsoft.Json.Formatting.Indented));
@@ -1717,6 +1795,12 @@ public partial class MainWindow : Window
                 _storageProvider = sp2.ToString() ?? _storageProvider;
             if (settings.TryGetValue("MySqlConnectionString", out var mcs) && mcs != null)
                 _mySqlConnString = mcs.ToString() ?? _mySqlConnString;
+            if (settings.TryGetValue("MaxVisibleNodes", out var mvn) && mvn != null)
+                int.TryParse(mvn.ToString(), out _maxVisibleNodes);
+            if (settings.TryGetValue("CullDistance", out var cd) && cd != null)
+                double.TryParse(cd.ToString(), System.Globalization.CultureInfo.InvariantCulture, out _cullDistance);
+            if (settings.TryGetValue("UseClusterColors", out var ucc) && ucc != null)
+                bool.TryParse(ucc.ToString(), out _useClusterColors);
         }
         catch (Exception ex) { Debug.WriteLine($"Settings load error: {ex.Message}"); }
     }
@@ -2198,6 +2282,42 @@ public partial class MainWindow : Window
         {
             StorageStatusText.Text = $"Failed to open storage: {ex.Message}";
         }
+    }
+
+    // ═══════════════════════════════════════
+    // GRAPH PERFORMANCE HANDLERS
+    // ═══════════════════════════════════════
+
+    private void MaxVisibleNodes_Changed(object s, RoutedPropertyChangedEventArgs<double> e)
+    {
+        _maxVisibleNodes = (int)e.NewValue;
+        if (MaxVisibleNodesText != null)
+            MaxVisibleNodesText.Text = _maxVisibleNodes == 0 ? "∞" : _maxVisibleNodes.ToString();
+        SaveSettingsToFile();
+    }
+
+    private void CullDistance_Changed(object s, RoutedPropertyChangedEventArgs<double> e)
+    {
+        _cullDistance = e.NewValue;
+        if (CullDistanceText != null)
+            CullDistanceText.Text = _cullDistance == 0 ? "off" : _cullDistance.ToString("F0");
+        SaveSettingsToFile();
+    }
+
+    private void ClusterColors_Changed(object s, RoutedEventArgs e)
+    {
+        _useClusterColors = ClusterColorsCheck.IsChecked == true;
+        SaveSettingsToFile();
+    }
+
+    private void PopulateGraphPerfSettings()
+    {
+        if (MaxVisibleNodesSlider == null) return;
+        MaxVisibleNodesSlider.Value = _maxVisibleNodes;
+        MaxVisibleNodesText.Text = _maxVisibleNodes == 0 ? "∞" : _maxVisibleNodes.ToString();
+        CullDistanceSlider.Value = _cullDistance;
+        CullDistanceText.Text = _cullDistance == 0 ? "off" : _cullDistance.ToString("F0");
+        ClusterColorsCheck.IsChecked = _useClusterColors;
     }
 
     private void UpdateStorageStatus()
