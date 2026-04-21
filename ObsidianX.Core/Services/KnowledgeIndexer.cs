@@ -8,6 +8,13 @@ public partial class KnowledgeIndexer
     /// <summary>Optional auto-linker that adds semantic edges after indexing.</summary>
     public AutoLinker? AutoLinker { get; set; } = new();
 
+    /// <summary>
+    /// User-defined categories. When set, their keywords compete with
+    /// the built-in ones; the best score wins and
+    /// <see cref="KnowledgeNode.CustomCategoryId"/> is set accordingly.
+    /// </summary>
+    public CategoryRegistry? CustomCategories { get; set; }
+
     private static readonly Dictionary<KnowledgeCategory, string[]> CategoryKeywords = new()
     {
         [KnowledgeCategory.Programming] = ["code", "function", "class", "algorithm", "variable", "loop", "array", "api", "debug", "compiler", "syntax", "git", "repository", "refactor", "IDE"],
@@ -110,11 +117,32 @@ public partial class KnowledgeIndexer
         }
         tags.AddRange(HashtagPattern().Matches(content).Select(m => m.Groups[1].Value));
 
-        // Categorize
+        // Categorize — built-in categories
         var scores = CalculateCategoryScores(content, tags);
         if (scores.Count == 0)
             scores[KnowledgeCategory.Other] = 0.1;
         var sorted = scores.OrderByDescending(kv => kv.Value).ToList();
+
+        // Custom categories compete head-to-head with built-ins
+        string? customId = null;
+        double customBestScore = 0;
+        if (CustomCategories != null)
+        {
+            foreach (var cc in CustomCategories.All)
+            {
+                var s = ScoreCustomCategory(content, tags, cc);
+                if (s > customBestScore)
+                {
+                    customBestScore = s;
+                    customId = cc.Id;
+                }
+            }
+        }
+
+        // Built-in score of winner for comparison
+        var builtInBest = sorted[0].Value;
+        // Only assign custom if it clearly beat the built-in winner
+        bool customWins = customBestScore > builtInBest * 1.15 && customBestScore > 0.15;
 
         var node = new KnowledgeNode
         {
@@ -127,10 +155,40 @@ public partial class KnowledgeIndexer
             CreatedAt = fileInfo.CreationTimeUtc,
             ModifiedAt = fileInfo.LastWriteTimeUtc,
             Importance = Math.Log(1 + wordCount) * (1 + tags.Count * 0.1),
-            KeywordScores = sorted.Take(5).ToDictionary(kv => kv.Key.ToString(), kv => kv.Value)
+            KeywordScores = sorted.Take(5).ToDictionary(kv => kv.Key.ToString(), kv => kv.Value),
+            CustomCategoryId = customWins ? customId : null
         };
 
         return node;
+    }
+
+    private static double ScoreCustomCategory(string content, List<string> tags, CustomCategory cc)
+    {
+        var lower = content.ToLowerInvariant();
+        double score = 0;
+
+        foreach (var kw in cc.KeywordsEn)
+        {
+            if (string.IsNullOrWhiteSpace(kw)) continue;
+            var count = CountOccurrences(lower, kw.ToLowerInvariant());
+            score += count * (1.0 / Math.Max(1, cc.KeywordsEn.Count));
+        }
+        foreach (var kw in cc.KeywordsTh)
+        {
+            if (string.IsNullOrWhiteSpace(kw)) continue;
+            var count = CountOccurrences(content, kw);
+            score += count * (1.0 / Math.Max(1, cc.KeywordsTh.Count));
+        }
+
+        foreach (var tag in tags)
+        {
+            if (cc.KeywordsEn.Any(k => tag.Contains(k, StringComparison.OrdinalIgnoreCase))) score += 2.0;
+            if (cc.KeywordsTh.Any(k => tag.Contains(k, StringComparison.Ordinal))) score += 2.0;
+            // Match tag against display name directly
+            if (tag.Contains(cc.DisplayName, StringComparison.OrdinalIgnoreCase)) score += 2.5;
+        }
+
+        return Math.Min(1.0, score / 10.0);
     }
 
     private static Dictionary<KnowledgeCategory, double> CalculateCategoryScores(string content, List<string> tags)

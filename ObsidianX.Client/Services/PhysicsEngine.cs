@@ -28,6 +28,9 @@ public class PhysicsNode
 
     // Importance score (for max-visible-nodes filter)
     public double Importance { get; set; }
+
+    /// <summary>If set, the node matched a user-defined custom category.</summary>
+    public string? CustomCategoryId { get; set; }
 }
 
 public class PhysicsEdge
@@ -148,7 +151,8 @@ public class PhysicsEngine
                 Mass = Math.Max(0.5, Math.Log(1 + node.WordCount) * 0.3),
                 Radius = Math.Max(0.08, Math.Min(0.35, Math.Log(1 + node.WordCount) * 0.035)),
                 PulsePhase = _rng.NextDouble() * Math.PI * 2,
-                LinkedIds = node.LinkedNodeIds
+                LinkedIds = node.LinkedNodeIds,
+                CustomCategoryId = node.CustomCategoryId
             });
             i++;
         }

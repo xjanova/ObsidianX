@@ -466,6 +466,7 @@
                                             MouseMove="FullGraph_MouseMove"
                                             MouseWheel="FullGraph_MouseWheel"
                                             MouseRightButtonDown="FullGraph_RightClick">
+                                    <Grid>
                                     <Viewport3D x:Name="FullGraphViewport" ClipToBounds="True"
                                                 IsHitTestVisible="False">
                                         <Viewport3D.Camera>
@@ -484,6 +485,26 @@
                                         </ModelVisual3D>
                                         <ModelVisual3D x:Name="FullGraphModel"/>
                                     </Viewport3D>
+
+                                    <!-- Depth indicator + breadcrumb overlay -->
+                                    <Border VerticalAlignment="Top" HorizontalAlignment="Left"
+                                            Background="#B30B0B1A" BorderBrush="{StaticResource NeonCyanBrush}"
+                                            BorderThickness="1" CornerRadius="6" Padding="10,6"
+                                            Margin="12" Panel.ZIndex="10">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock x:Name="DepthIndicator" Text="Depth 0 / 5"
+                                                       Foreground="{StaticResource NeonCyanBrush}"
+                                                       FontFamily="{StaticResource MonoFont}" FontSize="11"
+                                                       VerticalAlignment="Center" Margin="0,0,10,0"/>
+                                            <TextBlock Text="·" Foreground="{StaticResource TextMutedBrush}"
+                                                       VerticalAlignment="Center" Margin="0,0,10,0"/>
+                                            <TextBlock x:Name="BreadcrumbText" Text="Brain"
+                                                       Foreground="{StaticResource TextPrimaryBrush}"
+                                                       FontSize="11" VerticalAlignment="Center"
+                                                       TextTrimming="CharacterEllipsis" MaxWidth="600"/>
+                                        </StackPanel>
+                                    </Border>
+                                    </Grid>
                                     </Border>
 
                                     <!-- Selected Node Info with Content Preview -->
@@ -1100,6 +1121,73 @@
                                                 </StackPanel>
                                                 <TextBlock x:Name="ExportStatusText" FontSize="11"
                                                            Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                        </Border>
+
+                                        <!-- Custom Knowledge Categories -->
+                                        <Border Style="{StaticResource CardPanel}" Margin="0,0,0,12">
+                                            <StackPanel>
+                                                <TextBlock Text="CUSTOM KNOWLEDGE CATEGORIES" FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,8"/>
+                                                <TextBlock FontSize="11" Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap" Margin="0,0,0,12">
+                                                    Teach ObsidianX new subjects beyond the 25 built-in domains. A custom category matches notes by
+                                                    keywords in Thai and English; when a note scores higher on yours than on any built-in, the node
+                                                    gets your color and clusters with its peers.
+                                                </TextBlock>
+
+                                                <ListBox x:Name="CustomCategoryList" Height="140"
+                                                         Background="{StaticResource DarkPanelBrush}"
+                                                         Foreground="{StaticResource TextPrimaryBrush}"
+                                                         BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1"
+                                                         Margin="0,0,0,8"/>
+
+                                                <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+                                                    <Button Content="+ New" Style="{StaticResource NeonButtonFilled}"
+                                                            Click="NewCategory_Click" Padding="12,6" Margin="0,0,8,0"/>
+                                                    <Button Content="Edit" Style="{StaticResource NeonButton}"
+                                                            Click="EditCategory_Click" Padding="12,6" Margin="0,0,8,0"/>
+                                                    <Button Content="Delete" Style="{StaticResource NeonButton}"
+                                                            Click="DeleteCategory_Click" Padding="12,6"/>
+                                                </StackPanel>
+
+                                                <Border BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="0,1,0,0" Padding="0,12,0,0">
+                                                    <StackPanel x:Name="CategoryEditor" Visibility="Collapsed">
+                                                        <TextBlock Text="Display name (e.g. Thai Classical Literature)" FontSize="11"
+                                                                   Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                        <TextBox x:Name="CategoryNameBox" Style="{StaticResource NeonTextBox}" Margin="0,0,0,8"/>
+
+                                                        <TextBlock Text="Color (hex, e.g. #FF00F0FF)" FontSize="11"
+                                                                   Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                        <TextBox x:Name="CategoryColorBox" Style="{StaticResource NeonTextBox}"
+                                                                 Text="#FF00F0FF" FontFamily="{StaticResource MonoFont}" Margin="0,0,0,8"/>
+
+                                                        <TextBlock Text="English keywords (comma-separated)" FontSize="11"
+                                                                   Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                        <TextBox x:Name="CategoryEnBox" Style="{StaticResource NeonTextBox}"
+                                                                 AcceptsReturn="True" Height="40" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+                                                        <TextBlock Text="Thai keywords (comma-separated)" FontSize="11"
+                                                                   Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                        <TextBox x:Name="CategoryThBox" Style="{StaticResource NeonTextBox}"
+                                                                 AcceptsReturn="True" Height="40" TextWrapping="Wrap" Margin="0,0,0,8"/>
+
+                                                        <TextBlock Text="Description (optional)" FontSize="11"
+                                                                   Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                        <TextBox x:Name="CategoryDescBox" Style="{StaticResource NeonTextBox}"
+                                                                 Margin="0,0,0,8"/>
+
+                                                        <StackPanel Orientation="Horizontal">
+                                                            <Button Content="Save" Style="{StaticResource NeonButtonFilled}"
+                                                                    Click="SaveCategory_Click" Padding="16,6" Margin="0,0,8,0"/>
+                                                            <Button Content="Cancel" Style="{StaticResource NeonButton}"
+                                                                    Click="CancelCategoryEdit_Click" Padding="16,6"/>
+                                                        </StackPanel>
+                                                    </StackPanel>
+                                                </Border>
+
+                                                <TextBlock x:Name="CategoryStatusText" FontSize="11"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"
+                                                           Margin="0,8,0,0"/>
                                             </StackPanel>
                                         </Border>
 

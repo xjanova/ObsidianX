@@ -14,6 +14,14 @@ public class KnowledgeNode
     public DateTime ModifiedAt { get; set; }
     public double Importance { get; set; }
     public Dictionary<string, double> KeywordScores { get; set; } = new();
+
+    /// <summary>
+    /// If set, this note scored higher on a user-defined custom category
+    /// than any built-in one. The renderer uses the custom color and
+    /// display name; the enum <see cref="PrimaryCategory"/> still gets
+    /// set to the best-matching built-in for backward compatibility.
+    /// </summary>
+    public string? CustomCategoryId { get; set; }
 }
 
 public class KnowledgeGraph

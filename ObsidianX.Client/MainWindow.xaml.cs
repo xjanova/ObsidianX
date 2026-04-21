@@ -63,6 +63,9 @@ public partial class MainWindow : Window
     private double _cullDistance = 12.0;         // camera-space; 0 = disabled
     private bool _useClusterColors = true;       // tint nodes by community
 
+    // Custom category registry (user-defined knowledge domains)
+    private CategoryRegistry? _categories;
+
     // Physics
     private readonly PhysicsEngine _dashPhysics = new();
     private readonly PhysicsEngine _graphPhysics = new();
@@ -145,6 +148,7 @@ public partial class MainWindow : Window
         PopulateAutoLinkerSettings();
         PopulateStorageSettings();
         PopulateGraphPerfSettings();
+        PopulateCustomCategories();
         StartAccessLogWatcher();
 
         // Auto-scan + export on startup, if enabled
@@ -250,7 +254,60 @@ public partial class MainWindow : Window
             UpdateGraphCameraAuto();
             UpdateCamera(GraphCam, _graphYaw, _graphPitch, _graphDist, _graphTarget);
             RebuildScene(FullGraphModel, _graphPhysics, _selectedNodeGraph);
+            UpdateDepthBreadcrumb();
         }
+    }
+
+    /// <summary>
+    /// Find the deepest cluster whose bounding sphere contains the camera
+    /// target, then render the path from root to that cluster as a
+    /// breadcrumb and show the current depth.
+    /// </summary>
+    private void UpdateDepthBreadcrumb()
+    {
+        var tree = _graphPhysics.ClusterTree;
+        if (tree == null || DepthIndicator == null) return;
+
+        ClusterTree? deepest = tree;
+        int maxDepth = FindMaxDepth(tree);
+        WalkAllClusters(tree, c =>
+        {
+            if (c == tree) return;
+            var dx = c.Center.X - _graphTarget.X;
+            var dy = c.Center.Y - _graphTarget.Y;
+            var dz = c.Center.Z - _graphTarget.Z;
+            var d = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+            if (d < c.Radius && c.Depth > deepest!.Depth) deepest = c;
+        });
+
+        DepthIndicator.Text = $"Depth {deepest!.Depth} / {maxDepth}";
+
+        // Build breadcrumb from root → deepest
+        var path = new List<string>();
+        var cur = deepest;
+        while (cur != null)
+        {
+            path.Insert(0, cur.Depth == 0 ? "Brain" : ShortLabel(cur.Label));
+            cur = cur.Parent;
+        }
+        BreadcrumbText.Text = string.Join("  ›  ", path);
+    }
+
+    private static int FindMaxDepth(ClusterTree t)
+    {
+        int max = t.Depth;
+        foreach (var c in t.Children)
+        {
+            var d = FindMaxDepth(c);
+            if (d > max) max = d;
+        }
+        return max;
+    }
+
+    private static string ShortLabel(string raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return "cluster";
+        return raw.Length > 30 ? raw[..30] + "…" : raw;
     }
 
     /// <summary>
@@ -441,7 +498,7 @@ public partial class MainWindow : Window
             renderedCount++;
 
             // Choose color: category color, tinted by community if enabled
-            var baseColor = GetCategoryColor(node.Category);
+            var baseColor = ResolveNodeColor(node);
             var color = _useClusterColors && node.CommunityId >= 0
                 ? TintByCommunity(baseColor, node.CommunityId)
                 : baseColor;
@@ -579,7 +636,7 @@ public partial class MainWindow : Window
 
             foreach (var b in bubbles)
             {
-                var baseColor = GetCategoryColor(b.DominantCategory);
+                var baseColor = ResolveBubbleColor(b);
                 var bubbleColor = _useClusterColors
                     ? TintByCommunity(baseColor, b.Id.GetHashCode())
                     : baseColor;
@@ -1142,6 +1199,8 @@ public partial class MainWindow : Window
         _indexer.AutoLinker ??= new AutoLinker();
         _indexer.AutoLinker.Options.Enabled = _autoLinkEnabled;
         _indexer.AutoLinker.Options.Threshold = _autoLinkThreshold;
+        _categories ??= new CategoryRegistry(_vaultPath);
+        _indexer.CustomCategories = _categories;
         _graph = _indexer.IndexVault(_vaultPath);
 
         // Push into configured storage (SQLite by default — FTS5 search)
@@ -1631,6 +1690,68 @@ public partial class MainWindow : Window
         }
         catch (UnauthorizedAccessException) { /* Skip folders we can't read */ }
         catch (IOException ex) { Debug.WriteLine($"Tree scan error: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// Node color priority: user's custom category color → built-in
+    /// category color. Lets notes that scored highest on a user-defined
+    /// subject paint in the color the user picked for that subject.
+    /// </summary>
+    private Color ResolveNodeColor(PhysicsNode node)
+    {
+        if (!string.IsNullOrEmpty(node.CustomCategoryId) && _categories != null)
+        {
+            var cat = _categories.FindById(node.CustomCategoryId);
+            if (cat != null && TryParseColor(cat.ColorHex, out var c)) return c;
+        }
+        return GetCategoryColor(node.Category);
+    }
+
+    /// <summary>Cluster bubbles: if most members share a custom category, paint with it.</summary>
+    private Color ResolveBubbleColor(ClusterTree bubble)
+    {
+        if (_categories == null) return GetCategoryColor(bubble.DominantCategory);
+
+        // Tally custom categories among descendant leaves
+        var counts = new Dictionary<string, int>();
+        int totalLeaves = 0;
+        CountLeafCustomCats(bubble, counts, ref totalLeaves);
+        if (counts.Count > 0 && totalLeaves > 0)
+        {
+            var top = counts.OrderByDescending(kv => kv.Value).First();
+            if (top.Value * 2 >= totalLeaves)   // simple majority
+            {
+                var cat = _categories.FindById(top.Key);
+                if (cat != null && TryParseColor(cat.ColorHex, out var c)) return c;
+            }
+        }
+        return GetCategoryColor(bubble.DominantCategory);
+    }
+
+    private static void CountLeafCustomCats(ClusterTree t, Dictionary<string, int> counts, ref int total)
+    {
+        if (t.IsLeaf)
+        {
+            total++;
+            var id = t.Leaf!.CustomCategoryId;
+            if (!string.IsNullOrEmpty(id))
+                counts[id] = counts.GetValueOrDefault(id) + 1;
+            return;
+        }
+        foreach (var c in t.Children) CountLeafCustomCats(c, counts, ref total);
+    }
+
+    private static bool TryParseColor(string hex, out Color color)
+    {
+        color = Colors.White;
+        if (string.IsNullOrWhiteSpace(hex)) return false;
+        try
+        {
+            var obj = ColorConverter.ConvertFromString(hex.StartsWith('#') ? hex : "#" + hex);
+            if (obj is Color c) { color = c; return true; }
+        }
+        catch (FormatException) { }
+        return false;
     }
 
     /// <summary>
@@ -2654,6 +2775,131 @@ public partial class MainWindow : Window
         CullDistanceSlider.Value = _cullDistance;
         CullDistanceText.Text = _cullDistance == 0 ? "off" : _cullDistance.ToString("F0");
         ClusterColorsCheck.IsChecked = _useClusterColors;
+    }
+
+    // ═══════════════════════════════════════
+    // CUSTOM CATEGORY UI
+    // ═══════════════════════════════════════
+
+    private string? _editingCategoryId;   // null = creating new
+
+    private void PopulateCustomCategories()
+    {
+        if (CustomCategoryList == null) return;
+        _categories ??= new CategoryRegistry(_vaultPath);
+
+        CustomCategoryList.Items.Clear();
+        foreach (var c in _categories.All)
+        {
+            var label = string.IsNullOrEmpty(c.ColorHex) ? "" : $"  [{c.ColorHex}]";
+            CustomCategoryList.Items.Add(
+                $"{c.DisplayName}{label}   ·  {c.KeywordsEn.Count} EN / {c.KeywordsTh.Count} TH keywords");
+        }
+        if (CategoryStatusText != null)
+            CategoryStatusText.Text = $"{_categories.All.Count} custom category·ies defined";
+    }
+
+    private void NewCategory_Click(object s, RoutedEventArgs e)
+    {
+        _editingCategoryId = null;
+        CategoryNameBox.Text = "";
+        CategoryColorBox.Text = "#FF00F0FF";
+        CategoryEnBox.Text = "";
+        CategoryThBox.Text = "";
+        CategoryDescBox.Text = "";
+        CategoryEditor.Visibility = Visibility.Visible;
+    }
+
+    private void EditCategory_Click(object s, RoutedEventArgs e)
+    {
+        if (CustomCategoryList.SelectedIndex < 0 || _categories == null) return;
+        var cat = _categories.All[CustomCategoryList.SelectedIndex];
+        _editingCategoryId = cat.Id;
+        CategoryNameBox.Text = cat.DisplayName;
+        CategoryColorBox.Text = cat.ColorHex;
+        CategoryEnBox.Text = string.Join(", ", cat.KeywordsEn);
+        CategoryThBox.Text = string.Join(", ", cat.KeywordsTh);
+        CategoryDescBox.Text = cat.Description;
+        CategoryEditor.Visibility = Visibility.Visible;
+    }
+
+    private void DeleteCategory_Click(object s, RoutedEventArgs e)
+    {
+        if (CustomCategoryList.SelectedIndex < 0 || _categories == null) return;
+        var cat = _categories.All[CustomCategoryList.SelectedIndex];
+        var confirm = MessageBox.Show(
+            $"Delete custom category \"{cat.DisplayName}\"?\n\nNotes assigned to it will fall back to their built-in category on next index.",
+            "Delete category", MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+        if (confirm != MessageBoxResult.OK) return;
+        _categories.Remove(cat.Id);
+        PopulateCustomCategories();
+        ReindexAfterCategoryChange();
+    }
+
+    private void SaveCategory_Click(object s, RoutedEventArgs e)
+    {
+        _categories ??= new CategoryRegistry(_vaultPath);
+        var name = CategoryNameBox.Text.Trim();
+        if (string.IsNullOrEmpty(name))
+        {
+            CategoryStatusText.Text = "Name is required.";
+            return;
+        }
+
+        var en = CategoryEnBox.Text.Split([',', ';', '\n'], StringSplitOptions.RemoveEmptyEntries
+                                                                | StringSplitOptions.TrimEntries).ToList();
+        var th = CategoryThBox.Text.Split([',', ';', '\n'], StringSplitOptions.RemoveEmptyEntries
+                                                                | StringSplitOptions.TrimEntries).ToList();
+
+        if (_editingCategoryId == null)
+        {
+            var cat = new CustomCategory
+            {
+                DisplayName = name,
+                ColorHex = CategoryColorBox.Text.Trim(),
+                KeywordsEn = en,
+                KeywordsTh = th,
+                Description = CategoryDescBox.Text.Trim()
+            };
+            _categories.Add(cat);
+        }
+        else
+        {
+            var existing = _categories.FindById(_editingCategoryId);
+            if (existing == null)
+            {
+                CategoryStatusText.Text = "Category vanished — reloading.";
+                PopulateCustomCategories();
+                return;
+            }
+            existing.DisplayName = name;
+            existing.ColorHex = CategoryColorBox.Text.Trim();
+            existing.KeywordsEn = en;
+            existing.KeywordsTh = th;
+            existing.Description = CategoryDescBox.Text.Trim();
+            _categories.Update(existing);
+        }
+
+        CategoryEditor.Visibility = Visibility.Collapsed;
+        _editingCategoryId = null;
+        PopulateCustomCategories();
+        ReindexAfterCategoryChange();
+    }
+
+    private void CancelCategoryEdit_Click(object s, RoutedEventArgs e)
+    {
+        CategoryEditor.Visibility = Visibility.Collapsed;
+        _editingCategoryId = null;
+    }
+
+    private void ReindexAfterCategoryChange()
+    {
+        IndexVault();
+        _dashPhysics.LoadFromGraph(_graph);
+        _graphPhysics.LoadFromGraph(_graph);
+        UpdateUI();
+        RefreshVaultTree();
+        CategoryStatusText.Text = $"Re-indexed · {_graph.Nodes.Count(n => !string.IsNullOrEmpty(n.CustomCategoryId))} notes matched a custom category";
     }
 
     private void UpdateStorageStatus()
