@@ -94,19 +94,24 @@ internal static class Program
         },
         ["instructions"] =
             "This is xman's personal brain (ObsidianX), a living knowledge graph that grows over time.\n\n" +
-            "READING: Use brain_search to find notes by keyword, brain_get_note to fetch full content, " +
-            "brain_expertise to see the owner's knowledge domains, brain_list to browse by category/tag, " +
-            "brain_stats for overview. ALWAYS prefer citing the owner's notes over generic answers when " +
-            "they're relevant — they represent the owner's actual knowledge.\n\n" +
-            "WRITING (IMPORTANT — the brain should grow from every session):\n" +
-            "• When you SOLVE a non-trivial problem, DISCOVER a new fact or technique, or the user says " +
-            "  'remember this' / 'save this' / 'add a note' / 'จำไว้ด้วย' / 'บันทึก' — call brain_create_note " +
-            "  with a concise title and the insight in markdown.\n" +
-            "• When adding to an existing topic, use brain_append_note with the note id from brain_search.\n" +
-            "• For bug fixes, root-cause analyses, new patterns, debugging tricks — these are exactly " +
-            "  what the brain should capture. Don't wait for the user to ask; proactively save.\n" +
-            "• Pick a reasonable folder like 'Notes/Claude-Sessions', 'Programming', 'AI', etc.\n\n" +
-            "This is how the brain gets smarter. Every good answer should leave a trace in the vault."
+            "AUTO-JOURNAL — The server AUTOMATICALLY logs every tool call you make to " +
+            ".obsidianx/sessions/<date>.md. You never need to say 'I searched for X' — the brain is " +
+            "already tracking it. Focus your writes on SUBSTANCE, not bookkeeping.\n\n" +
+            "READING: brain_search (keyword), brain_get_note (full content by id), brain_expertise " +
+            "(owner's domains ranked), brain_list (category/tag filter), brain_stats (overview). " +
+            "ALWAYS prefer citing the owner's notes over generic answers — they represent actual " +
+            "first-hand knowledge.\n\n" +
+            "WRITING (proactively — this is how the brain gets smarter):\n" +
+            "• brain_create_note — full standalone note with YAML frontmatter. Use when you solved a " +
+            "  non-trivial problem, discovered a reusable technique, or the user says 'remember this' / " +
+            "  'save' / 'add a note' / 'จำไว้' / 'บันทึก'. Pick a folder like Notes/Claude-Sessions, " +
+            "  Programming, AI, Debugging, etc.\n" +
+            "• brain_append_note — add content to an existing note (id from brain_search).\n" +
+            "• brain_remember — ultra-lightweight one-liner to today's session journal. Use for small " +
+            "  in-progress thoughts that don't warrant a standalone note. Perfect for 'oh interesting, " +
+            "  so <library> behaves like <X>' mid-debugging.\n\n" +
+            "Rule of thumb: if you just spent > 2 tool calls figuring something out and the answer " +
+            "is non-trivial, SAVE IT. Every good answer should leave a trace in the vault."
     });
 
     // ───────────── tools/list ─────────────
@@ -199,6 +204,19 @@ internal static class Program
                         ["content"] = new JObject { ["type"] = "string", ["description"] = "markdown to append (preceded by blank line)" }
                     },
                     ["required"] = new JArray { "content" }
+                }),
+            Tool("brain_remember",
+                "Quick-save a short thought to today's session journal. Use when the insight " +
+                "doesn't deserve its own note — e.g. small observations, one-liners, in-progress " +
+                "ideas. Appended to .obsidianx/sessions/<date>.md under a '> REMEMBER:' quote.",
+                new JObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JObject
+                    {
+                        ["text"] = new JObject { ["type"] = "string", ["description"] = "the thought to remember (markdown ok)" }
+                    },
+                    ["required"] = new JArray { "text" }
                 })
         }
     });
@@ -229,8 +247,13 @@ internal static class Program
                 "brain_import_path"  => BrainImportPath(args),
                 "brain_create_note"  => BrainCreateNote(args),
                 "brain_append_note"  => BrainAppendNote(args),
+                "brain_remember"     => BrainRemember(args),
                 _ => throw new InvalidOperationException($"unknown tool: {name}")
             };
+
+            // Auto-journal: every successful tool call leaves a trace in
+            // the daily session log. The brain auto-records what happens.
+            AutoLogSession(name ?? "unknown", SummarizeArgs(name, args));
 
             return BuildResult(id, new JObject
             {
@@ -523,6 +546,48 @@ internal static class Program
         };
     }
 
+    private static JToken BrainRemember(JObject args)
+    {
+        var text = args["text"]?.ToString() ?? throw new ArgumentException("text is required");
+        if (string.IsNullOrWhiteSpace(text)) throw new ArgumentException("text is empty");
+
+        var now = DateTime.Now;
+        var dir = Path.Combine(_vaultPath, ".obsidianx", "sessions");
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, $"{now:yyyy-MM-dd}.md");
+
+        var block = new StringBuilder();
+        block.AppendLine();
+        block.AppendLine($"> **REMEMBER** `{now:HH:mm:ss}`  ");
+        foreach (var line in text.Split('\n'))
+            block.AppendLine($"> {line.TrimEnd()}");
+
+        File.AppendAllText(path, block.ToString());
+
+        return new JObject
+        {
+            ["success"] = true,
+            ["path"] = Path.GetRelativePath(_vaultPath, path).Replace("\\", "/"),
+            ["length"] = text.Length
+        };
+    }
+
+    /// <summary>Compact one-line summary of a tool's args for the session journal.</summary>
+    private static string? SummarizeArgs(string? tool, JObject args)
+    {
+        return tool switch
+        {
+            "brain_search"      => $"q=\"{args["query"]?.ToString()}\"",
+            "brain_get_note"    => $"id={args["id"]?.ToString()}",
+            "brain_list"        => $"category={args["category"]?.ToString() ?? "-"} tag={args["tag"]?.ToString() ?? "-"}",
+            "brain_import_path" => $"path={args["path"]?.ToString()}",
+            "brain_create_note" => $"title=\"{args["title"]?.ToString()}\" folder={args["folder"]?.ToString() ?? "Notes"}",
+            "brain_append_note" => $"id={args["id"]?.ToString() ?? args["path"]?.ToString()}",
+            "brain_remember"    => args["text"]?.ToString()?.Length is int n ? $"{n} chars" : null,
+            _ => null
+        };
+    }
+
     /// <summary>Mirror of KnowledgeNode.IdFromPath so MCP-written notes
     /// carry the SAME id the client will compute on next re-index.</summary>
     private static string ComputeStableId(string filePath)
@@ -602,6 +667,76 @@ internal static class Program
     }
 
     private static readonly object _accessLogLock = new();
+    private static readonly object _sessionLogLock = new();
+    private static DateTime _lastSessionWrite = DateTime.MinValue;
+
+    /// <summary>
+    /// Auto-session journal — every tool call gets logged to
+    /// <c>.obsidianx/sessions/YYYY-MM-DD.md</c> so the brain remembers
+    /// what happened in every Claude session without Claude having to
+    /// do anything. The user gets a permanent audit trail of what was
+    /// asked, read, and written through MCP.
+    /// A session header ("# Session ...") is written on the first call
+    /// of the day OR after a 30-minute gap, so each focused sitting is
+    /// its own section.
+    /// </summary>
+    private static void AutoLogSession(string tool, string? context, string? extra = null)
+    {
+        try
+        {
+            var now = DateTime.Now;   // local time for human readability
+            var dir = Path.Combine(_vaultPath, ".obsidianx", "sessions");
+            Directory.CreateDirectory(dir);
+            var dailyPath = Path.Combine(dir, $"{now:yyyy-MM-dd}.md");
+
+            lock (_sessionLogLock)
+            {
+                var sb = new StringBuilder();
+                var isNewFile = !File.Exists(dailyPath);
+                var gapFromLast = (DateTime.UtcNow - _lastSessionWrite).TotalMinutes;
+
+                if (isNewFile)
+                {
+                    sb.AppendLine("---");
+                    sb.AppendLine($"date: {now:yyyy-MM-dd}");
+                    sb.AppendLine("source: claude-mcp-auto");
+                    sb.AppendLine("tags:");
+                    sb.AppendLine("  - session");
+                    sb.AppendLine("  - auto-log");
+                    sb.AppendLine("  - claude");
+                    sb.AppendLine("---");
+                    sb.AppendLine();
+                    sb.AppendLine($"# Brain Session — {now:yyyy-MM-dd}");
+                    sb.AppendLine();
+                }
+
+                if (isNewFile || gapFromLast > 30)
+                {
+                    sb.AppendLine();
+                    sb.AppendLine($"## {now:HH:mm} — session opened");
+                    sb.AppendLine();
+                }
+
+                var line = $"- `{now:HH:mm:ss}`  **{tool}**";
+                if (!string.IsNullOrEmpty(context)) line += $"  ·  {EscapeMarkdown(context)}";
+                if (!string.IsNullOrEmpty(extra))   line += $"  ·  {EscapeMarkdown(extra)}";
+                sb.AppendLine(line);
+
+                File.AppendAllText(dailyPath, sb.ToString());
+                _lastSessionWrite = DateTime.UtcNow;
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    private static string EscapeMarkdown(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        // Cap length + escape pipe + strip newlines so one event = one line
+        if (s.Length > 180) s = s[..180] + "…";
+        return s.Replace("\n", " ").Replace("\r", "").Replace("|", "\\|");
+    }
 
     /// <summary>
     /// Append an access event to access-log.ndjson. The 3D graph watcher
