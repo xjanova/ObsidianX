@@ -136,11 +136,49 @@ public class BrainExporter
                 if (end > 0) text = text[(end + 4)..].TrimStart();
             }
             text = text.Replace("\r", "").Trim();
-            if (text.Length > limit) text = text[..limit] + "…";
-            return text;
+            if (text.Length > limit)
+            {
+                // Don't split a UTF-16 surrogate pair — that orphans a
+                // high-surrogate like 🧠's 0xD83D and makes UTF-8
+                // encoding throw on File.WriteAllText downstream.
+                var cut = limit;
+                if (cut > 0 && char.IsHighSurrogate(text[cut - 1])) cut--;
+                text = text[..cut] + "…";
+            }
+            return SanitizeForJson(text);
         }
         catch (IOException) { return string.Empty; }
         catch (UnauthorizedAccessException) { return string.Empty; }
+    }
+
+    /// <summary>
+    /// Strip orphaned surrogates (broken emoji halves) that would crash
+    /// UTF-8 writers. Happens when a file contains a truncated emoji at
+    /// its end or somewhere in the body, or when a slice cuts between
+    /// surrogate halves.
+    /// </summary>
+    private static string SanitizeForJson(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return s;
+        var sb = new System.Text.StringBuilder(s.Length);
+        for (int i = 0; i < s.Length; i++)
+        {
+            var c = s[i];
+            if (char.IsHighSurrogate(c))
+            {
+                if (i + 1 < s.Length && char.IsLowSurrogate(s[i + 1]))
+                {
+                    sb.Append(c); sb.Append(s[i + 1]); i++;
+                }
+                // orphaned high — skip
+            }
+            else if (char.IsLowSurrogate(c))
+            {
+                // orphaned low — skip
+            }
+            else sb.Append(c);
+        }
+        return sb.ToString();
     }
 
     private static string BuildMarkdown(BrainExport export)

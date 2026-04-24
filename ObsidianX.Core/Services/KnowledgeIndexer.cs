@@ -146,6 +146,9 @@ public partial class KnowledgeIndexer
 
         var node = new KnowledgeNode
         {
+            // Stable id from path — survives re-indexing so access-log
+            // pulses, brain-export.json, and the live graph stay in sync.
+            Id = KnowledgeNode.IdFromPath(filePath),
             Title = title,
             FilePath = filePath,
             PrimaryCategory = sorted[0].Key,

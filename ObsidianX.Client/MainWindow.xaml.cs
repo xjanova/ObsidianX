@@ -1939,9 +1939,37 @@ public partial class MainWindow : Window
         }
         catch (Exception ex) { Debug.WriteLine($"Storage upsert failed: {ex.Message}"); }
 
+        // Keep brain-export.json in sync so Claude (via MCP) sees the
+        // SAME node IDs we rendered. Skipping this caused the pulse
+        // LEDs to miss their targets because IDs drifted across
+        // re-index runs. Now stable IDs + fresh export → always sync.
+        string exportMsg;
+        try
+        {
+            if (_identity == null)
+                exportMsg = " · export SKIPPED (identity not ready)";
+            else
+            {
+                var r = _exporter.Export(_vaultPath, _identity, _graph);
+                exportMsg = $" · exported {r.NodeCount} nodes → brain-export.json";
+            }
+        }
+        catch (Exception ex)
+        {
+            exportMsg = $" · EXPORT FAILED: {ex.Message}";
+            Debug.WriteLine($"Export after index failed: {ex}");
+            // File-logged so the user can inspect after the fact
+            try
+            {
+                var logPath = Path.Combine(_vaultPath, ".obsidianx", "export-error.log");
+                File.AppendAllText(logPath, $"[{DateTime.Now:O}] {ex}\n\n");
+            }
+            catch { }
+        }
+
         var wikiEdges = _graph.Edges.Count(e => e.RelationType == "wiki-link");
         var autoEdges = _graph.Edges.Count - wikiEdges;
-        StatusText.Text = $"Indexed {_graph.TotalNodes} nodes · {wikiEdges} wiki · {autoEdges} auto-links · storage: {_storage?.ProviderName ?? "File"}";
+        StatusText.Text = $"Indexed {_graph.TotalNodes} nodes · {wikiEdges} wiki · {autoEdges} auto-links · storage: {_storage?.ProviderName ?? "File"}{exportMsg}";
     }
 
     private void CheckClaudeConnection()
@@ -3963,8 +3991,22 @@ public partial class MainWindow : Window
             var nodeId = obj["node_id"]?.ToString();
             if (string.IsNullOrEmpty(nodeId)) return;
 
-            BumpPulseForNode(_dashPhysics, nodeId);
-            BumpPulseForNode(_graphPhysics, nodeId);
+            var bumped = BumpPulseForNode(_dashPhysics, nodeId)
+                       | BumpPulseForNode(_graphPhysics, nodeId);
+
+            // Fallback: if the access-log carries a stale id (e.g. the
+            // brain was re-exported with different ids since the log was
+            // written), try matching via the context field which carries
+            // a title or path hint.
+            if (!bumped)
+            {
+                var hint = obj["context"]?.ToString();
+                if (!string.IsNullOrEmpty(hint))
+                {
+                    FindAndBumpByTitleOrPath(_dashPhysics, hint);
+                    FindAndBumpByTitleOrPath(_graphPhysics, hint);
+                }
+            }
 
             // Also persist into storage for "top accessed" queries
             try
@@ -3976,6 +4018,20 @@ public partial class MainWindow : Window
             catch { /* storage is best-effort */ }
         }
         catch (Newtonsoft.Json.JsonException) { }
+    }
+
+    private static void FindAndBumpByTitleOrPath(PhysicsEngine physics, string hint)
+    {
+        foreach (var n in physics.Nodes)
+        {
+            if (n.Title.Equals(hint, StringComparison.OrdinalIgnoreCase))
+            {
+                n.AccessIntensity = Math.Min(1.0, n.AccessIntensity + 0.8);
+                n.AccessCount++;
+                n.LastAccessedAt = DateTime.UtcNow;
+                return;
+            }
+        }
     }
 
     /// <summary>
@@ -3996,13 +4052,14 @@ public partial class MainWindow : Window
         catch { /* best-effort */ }
     }
 
-    private static void BumpPulseForNode(PhysicsEngine physics, string nodeId)
+    private static bool BumpPulseForNode(PhysicsEngine physics, string nodeId)
     {
         var node = physics.Nodes.FirstOrDefault(n => n.Id == nodeId);
-        if (node == null) return;
+        if (node == null) return false;
         node.AccessIntensity = Math.Min(1.0, node.AccessIntensity + 0.8);
         node.AccessCount++;
         node.LastAccessedAt = DateTime.UtcNow;
+        return true;
     }
 
     private static void DecayPulses(PhysicsEngine physics, double dt)
