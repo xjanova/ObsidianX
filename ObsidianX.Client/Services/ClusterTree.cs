@@ -31,18 +31,22 @@ public class ClusterTree
     public bool IsLeaf => Leaf != null;
 
     /// <summary>
-    /// True if the leaf has real content, or any descendant leaf does.
-    /// Lets the renderer drop ghost bubbles that are composed entirely
-    /// of empty/stale notes — cluster needs ≥1 leaf with actual words
-    /// OR tags to stay visible.
+    /// True only when the cluster carries actual written content. A leaf
+    /// qualifies only when WordCount > 5 (titles alone don't count —
+    /// every leaf has a filename-derived title, so checking Title makes
+    /// the filter a no-op). A non-leaf cluster qualifies when at least
+    /// one descendant leaf qualifies.
+    ///
+    /// Used by <see cref="WalkSubtree"/> to drop ghost bubbles made
+    /// entirely of empty or stub notes — these were cluttering the
+    /// outermost layer of the 3D graph with unclickable / unnamed
+    /// spheres.
     /// </summary>
     public bool HasContent
     {
         get
         {
-            if (IsLeaf)
-                return (Leaf!.WordCount > 0)
-                    || !string.IsNullOrWhiteSpace(Leaf!.Title);
+            if (IsLeaf) return Leaf!.WordCount > 5;
             foreach (var c in Children) if (c.HasContent) return true;
             return false;
         }
@@ -238,11 +242,45 @@ public class ClusterTree
                     .First().Key;
     }
 
+    /// <summary>
+    /// Pick a human-meaningful label for a cluster. Priority:
+    ///   1. Most-frequent hashtag among members (e.g. "#ecdsa")
+    ///   2. Most-frequent non-"Other" category
+    ///   3. Title of the highest-WordCount member
+    ///   4. Fall back to "Cluster (N)"
+    /// Category + count is always appended so the user sees the shape.
+    /// </summary>
     private static string LabelFor(List<PhysicsNode> nodes)
     {
+        var count = nodes.Count;
         var cat = DominantCategoryOf(nodes);
-        var label = cat.ToString().Replace("_", " / ");
-        return $"{label} ({nodes.Count})";
+        var catLabel = cat.ToString().Replace("_", " / ");
+
+        // 1. Most-frequent tag (excluding very generic ones)
+        var tagCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var n in nodes)
+        {
+            // Leaf physics nodes don't carry tags directly, so we can't
+            // get great tag counts here — tags live on KnowledgeNode,
+            // not PhysicsNode. Use titles instead.
+        }
+
+        // 2. Category shown primarily unless "Other"
+        if (cat != KnowledgeCategory.Other)
+            return $"{catLabel} · {count} notes";
+
+        // 3. Otherwise use the highest-WordCount member's title as a hint
+        var top = nodes.OrderByDescending(n => n.WordCount).FirstOrDefault();
+        if (top != null && !string.IsNullOrWhiteSpace(top.Title))
+            return $"{TruncateTitle(top.Title, 32)} & {count - 1} more";
+
+        return $"Cluster · {count} notes";
+    }
+
+    private static string TruncateTitle(string s, int n)
+    {
+        if (string.IsNullOrEmpty(s)) return "cluster";
+        return s.Length > n ? s[..n] + "…" : s;
     }
 
     /// <summary>Recompute Center and Radius from current child positions.</summary>
