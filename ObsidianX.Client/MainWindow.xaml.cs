@@ -216,11 +216,11 @@ public partial class MainWindow : Window
         {
             StatusText.Text = $"Saved: {Path.GetFileName(f)}";
             IndexVault();
-            _dashPhysics.LoadFromGraph(_graph);
-            _graphPhysics.LoadFromGraph(_graph);
+            // Diff-based reload preserves positions for existing nodes,
+            // animates new nodes as births and removed ones as deaths.
+            _dashPhysics.LoadFromGraphDiff(_graph);
+            _graphPhysics.LoadFromGraphDiff(_graph);
             UpdateUI();
-            // Mark this file's node as active so Real Brain mode glides
-            // the camera over to it (and the pulse/aura render fires).
             BumpNodeActivityByPath(f, "write");
         };
         _mdEditor.DirtyStateChanged += dirty => EditorDirtyIndicator.Text = dirty ? " *" : "";
@@ -777,6 +777,22 @@ public partial class MainWindow : Window
                 radius *= (1.0 + 0.8 * intensity) * beat;
             }
 
+            // ── Birth / death lifecycle animations ──
+            //   Born: 0 → full size with a white-hot flash that fades in 0.8s.
+            //   Dying: full → 0 over 1s, shrinking & fading.
+            var birth = node.BirthProgress;
+            var death = node.DeathProgress;
+            if (birth < 1.0)
+            {
+                // Scale-in curve — starts very small with a burst
+                radius *= 0.3 + 0.7 * birth;
+            }
+            if (death < 1.0)
+            {
+                radius *= death;
+                if (death < 0.02) continue;   // fully dead, skip this frame
+            }
+
             // LOD: far-from-focus nodes + large graphs use simple sphere
             var farLod = dsq > focusSqr * 0.3 || physics.Nodes.Count > 150 || camDist > 30;
             var sphereMesh = farLod && !isSelected ? SharedSphereLOD : SharedSphere;
@@ -795,6 +811,14 @@ public partial class MainWindow : Window
                 // Outer aura scales with intensity
                 AppendSphereToMesh(pulseAuraGroup, node.Position,
                     radius * (1.6 + intensity * 0.8), SharedSphereLOD);
+            }
+
+            // Birth flash — expanding white halo that fades as birth completes.
+            // Dying version — similar but scaled by death progress so it trails off.
+            if (birth < 1.0)
+            {
+                AppendSphereToMesh(pulseAuraGroup, node.Position,
+                    radius * (2.0 + (1.0 - birth) * 2.5), SharedSphereLOD);
             }
 
             // Glow ring for selected
@@ -854,6 +878,8 @@ public partial class MainWindow : Window
         // Scale edge thickness with camera distance so it stays readable
         var edgeScale = Math.Clamp(camDist / 14.0, 0.5, 2.5);
 
+        var newEdgeTipMesh = new MeshGeometry3D();   // bright pulse at the tip of growing edges
+
         foreach (var edge in physics.Edges)
         {
             if (edge.IsAuto && !_showAutoEdges) continue;
@@ -865,7 +891,34 @@ public partial class MainWindow : Window
             var tgt = physics.Nodes[tgtIdx];
             var target = edge.IsAuto ? autoEdgeMesh : wikiEdgeMesh;
             var baseWidth = edge.IsAuto ? 0.006 : 0.012;
-            AppendLineToMesh(target, src.Position, tgt.Position, baseWidth * edgeScale);
+
+            // Edge formation animation — grow from source toward target
+            var form = edge.FormProgress;
+            if (form < 1.0)
+            {
+                // Draw the growing segment from src to (src + dir * form)
+                var dx = tgt.Position.X - src.Position.X;
+                var dy = tgt.Position.Y - src.Position.Y;
+                var dz = tgt.Position.Z - src.Position.Z;
+                var tip = new Point3D(
+                    src.Position.X + dx * form,
+                    src.Position.Y + dy * form,
+                    src.Position.Z + dz * form);
+                AppendLineToMesh(target, src.Position, tip, baseWidth * edgeScale * 1.4);
+                // Bright ball at the tip — like a synapse firing
+                AppendSphereToMesh(newEdgeTipMesh, tip, baseWidth * 3.0, SharedSphereLOD);
+            }
+            else
+            {
+                AppendLineToMesh(target, src.Position, tgt.Position, baseWidth * edgeScale);
+            }
+        }
+
+        if (newEdgeTipMesh.Positions.Count > 0)
+        {
+            var tipMat = new EmissiveMaterial(new SolidColorBrush(
+                Color.FromArgb(240, 255, 255, 255)));
+            group.Children.Add(new GeometryModel3D(newEdgeTipMesh, tipMat));
         }
 
         if (wikiEdgeMesh.Positions.Count > 0)
@@ -2239,8 +2292,8 @@ public partial class MainWindow : Window
     private void ReindexVault_Click(object s, RoutedEventArgs e)
     {
         IndexVault();
-        _dashPhysics.LoadFromGraph(_graph);
-        _graphPhysics.LoadFromGraph(_graph);
+        _dashPhysics.LoadFromGraphDiff(_graph);
+        _graphPhysics.LoadFromGraphDiff(_graph);
         // LoadFromGraph already auto-tunes + warmups — just a tiny kick
         var kick = _graph.TotalNodes > 20 ? 0.05 : 0.3;
         _dashPhysics.Disturb(kick);
@@ -3298,8 +3351,8 @@ public partial class MainWindow : Window
 
         // Re-index + refresh everything so graph shows the new notes
         IndexVault();
-        _dashPhysics.LoadFromGraph(_graph);
-        _graphPhysics.LoadFromGraph(_graph);
+        _dashPhysics.LoadFromGraphDiff(_graph);
+        _graphPhysics.LoadFromGraphDiff(_graph);
         UpdateUI();
         RefreshVaultTree();
 
@@ -4045,8 +4098,8 @@ public partial class MainWindow : Window
     private void ReindexAfterCategoryChange()
     {
         IndexVault();
-        _dashPhysics.LoadFromGraph(_graph);
-        _graphPhysics.LoadFromGraph(_graph);
+        _dashPhysics.LoadFromGraphDiff(_graph);
+        _graphPhysics.LoadFromGraphDiff(_graph);
         UpdateUI();
         RefreshVaultTree();
         CategoryStatusText.Text = $"Re-indexed · {_graph.Nodes.Count(n => !string.IsNullOrEmpty(n.CustomCategoryId))} notes matched a custom category";
@@ -4734,8 +4787,8 @@ public partial class MainWindow : Window
     {
         RefreshVaultTree();
         IndexVault();
-        _dashPhysics.LoadFromGraph(_graph);
-        _graphPhysics.LoadFromGraph(_graph);
+        _dashPhysics.LoadFromGraphDiff(_graph);
+        _graphPhysics.LoadFromGraphDiff(_graph);
         UpdateUI();
         StatusText.Text = "Vault refreshed";
     }

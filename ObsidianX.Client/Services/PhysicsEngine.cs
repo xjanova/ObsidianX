@@ -34,6 +34,34 @@ public class PhysicsNode
 
     /// <summary>If set, the node matched a user-defined custom category.</summary>
     public string? CustomCategoryId { get; set; }
+
+    // ── Lifecycle animation state ──
+    /// <summary>When this node first appeared in the graph. null = pre-existing.</summary>
+    public DateTime? BirthAt { get; set; }
+    /// <summary>When this node was marked for removal. Still rendered while the death animation plays.</summary>
+    public DateTime? DyingAt { get; set; }
+
+    /// <summary>0 = just born, 1 = fully alive. Controls scale/glow.</summary>
+    public double BirthProgress
+    {
+        get
+        {
+            if (BirthAt == null) return 1.0;
+            var age = (DateTime.UtcNow - BirthAt.Value).TotalSeconds;
+            return Math.Min(1.0, age / 0.8);
+        }
+    }
+
+    /// <summary>1 = not dying, 0 = fully gone. Controls shrink/fade-out.</summary>
+    public double DeathProgress
+    {
+        get
+        {
+            if (DyingAt == null) return 1.0;
+            var age = (DateTime.UtcNow - DyingAt.Value).TotalSeconds;
+            return Math.Max(0.0, 1.0 - age / 1.0);
+        }
+    }
 }
 
 public class PhysicsEdge
@@ -44,6 +72,20 @@ public class PhysicsEdge
     public double Strength { get; set; } = 1.0;
     public string RelationType { get; set; } = "wiki-link";
     public bool IsAuto => RelationType.StartsWith("auto", StringComparison.Ordinal);
+
+    /// <summary>Edge formation animation — null = pre-existing.</summary>
+    public DateTime? BirthAt { get; set; }
+
+    /// <summary>0 = just formed, 1 = fully drawn. Controls how far the edge is drawn along the line.</summary>
+    public double FormProgress
+    {
+        get
+        {
+            if (BirthAt == null) return 1.0;
+            var age = (DateTime.UtcNow - BirthAt.Value).TotalSeconds;
+            return Math.Min(1.0, age / 0.9);
+        }
+    }
 }
 
 /// <summary>
@@ -116,6 +158,113 @@ public class PhysicsEngine
     public void RebuildClusterTree()
     {
         ClusterTree = ClusterTree.Build([.. Nodes], [.. Edges]);
+    }
+
+    /// <summary>
+    /// Diff-aware reload: keeps existing nodes' positions, marks new
+    /// ones with BirthAt, marks missing ones with DyingAt (they'll still
+    /// render for ~1s while the shrink-fade animation plays). Same for
+    /// edges. Use this when the graph changed incrementally (file
+    /// save, new import) instead of the hard Reset LoadFromGraph does.
+    /// </summary>
+    public void LoadFromGraphDiff(KnowledgeGraph graph)
+    {
+        var now = DateTime.UtcNow;
+        var byId = Nodes.ToDictionary(n => n.Id);
+        var newIds = new HashSet<string>(graph.Nodes.Select(n => n.Id));
+
+        // Mark deaths — node no longer in graph
+        foreach (var n in Nodes.Where(n => !newIds.Contains(n.Id)))
+        {
+            n.DyingAt ??= now;
+        }
+        // Drop fully-dead after animation
+        Nodes.RemoveAll(n => n.DyingAt.HasValue &&
+            (now - n.DyingAt.Value).TotalSeconds > 1.2);
+
+        // Update existing + add births
+        int total = Math.Max(1, graph.Nodes.Count);
+        int i = 0;
+        foreach (var gn in graph.Nodes)
+        {
+            if (byId.TryGetValue(gn.Id, out var existing))
+            {
+                // Preserve position + velocity; refresh metadata
+                existing.Title = gn.Title;
+                existing.Category = gn.PrimaryCategory;
+                existing.WordCount = gn.WordCount;
+                existing.Importance = gn.Importance;
+                existing.LinkedIds = gn.LinkedNodeIds;
+                existing.CustomCategoryId = gn.CustomCategoryId;
+                existing.DyingAt = null;   // cancel pending death if it re-appeared
+            }
+            else
+            {
+                // Birth — place on Fibonacci sphere, flag as freshly born
+                double radius = 3.0 + Math.Sqrt(total) * 0.15;
+                double phi = Math.Acos(1 - 2.0 * (i + 0.5) / total);
+                double theta = Math.PI * (1 + Math.Sqrt(5)) * i;
+                double r = radius + (_rng.NextDouble() - 0.5) * 0.3;
+
+                Nodes.Add(new PhysicsNode
+                {
+                    Id = gn.Id,
+                    Title = gn.Title,
+                    Category = gn.PrimaryCategory,
+                    WordCount = gn.WordCount,
+                    Importance = gn.Importance,
+                    Position = new Point3D(
+                        r * Math.Sin(phi) * Math.Cos(theta),
+                        r * Math.Cos(phi),
+                        r * Math.Sin(phi) * Math.Sin(theta)),
+                    Velocity = new Vector3D(
+                        (_rng.NextDouble() - 0.5) * 0.05,
+                        (_rng.NextDouble() - 0.5) * 0.05,
+                        (_rng.NextDouble() - 0.5) * 0.05),
+                    Mass = Math.Max(0.5, Math.Log(1 + gn.WordCount) * 0.3),
+                    Radius = Math.Max(0.08, Math.Min(0.35, Math.Log(1 + gn.WordCount) * 0.035)),
+                    PulsePhase = _rng.NextDouble() * Math.PI * 2,
+                    LinkedIds = gn.LinkedNodeIds,
+                    CustomCategoryId = gn.CustomCategoryId,
+                    BirthAt = now
+                });
+            }
+            i++;
+        }
+
+        // Diff edges — match by (src, tgt, relation)
+        var existingEdges = Edges
+            .GroupBy(e => (e.SourceId, e.TargetId, e.RelationType))
+            .ToDictionary(g => g.Key, g => g.First());
+
+        var graphKeys = new HashSet<(string, string, string)>();
+        foreach (var ge in graph.Edges)
+            graphKeys.Add((ge.SourceId, ge.TargetId, ge.RelationType));
+
+        // Remove edges not present in new graph (edges have no death animation — instant)
+        Edges.RemoveAll(e => !graphKeys.Contains((e.SourceId, e.TargetId, e.RelationType)));
+
+        // Add new edges with birth timestamp
+        foreach (var ge in graph.Edges)
+        {
+            var key = (ge.SourceId, ge.TargetId, ge.RelationType);
+            if (!existingEdges.ContainsKey(key))
+            {
+                Edges.Add(new PhysicsEdge
+                {
+                    SourceId = ge.SourceId,
+                    TargetId = ge.TargetId,
+                    RestLength = IdealLength,
+                    Strength = ge.Strength,
+                    RelationType = ge.RelationType,
+                    BirthAt = now
+                });
+            }
+        }
+
+        DetectCommunities();
+        AutoTune();
+        RebuildClusterTree();
     }
 
     public void LoadFromGraph(KnowledgeGraph graph)

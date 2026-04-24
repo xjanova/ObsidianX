@@ -33,6 +33,12 @@ internal static class Program
 
         Log($"Starting MCP server · vault={_vaultPath}");
 
+        // If ObsidianX client isn't running, bring it up. The MCP server
+        // is spawned by Claude Desktop / Claude Code on first connection,
+        // so this effectively "opens the brain visualiser automatically"
+        // whenever the user starts talking to Claude.
+        TryLaunchClientIfNotRunning();
+
         var reader = Console.In;
         var writer = Console.Out;
 
@@ -799,6 +805,66 @@ internal static class Program
     private static void Log(string msg)
     {
         try { Console.Error.WriteLine($"[obsidianx-mcp] {msg}"); } catch { }
+    }
+
+    /// <summary>
+    /// Spawn ObsidianX.Client if no instance is already running. Walks
+    /// up from the MCP exe's own location to find the Client build
+    /// output, respecting both Release and Debug configurations. No-op
+    /// if the client is already alive or the exe can't be found — MCP
+    /// must never block on UI side-effects.
+    /// </summary>
+    private static void TryLaunchClientIfNotRunning()
+    {
+        try
+        {
+            // Already running? Leave it alone.
+            if (System.Diagnostics.Process.GetProcessesByName("ObsidianX.Client").Length > 0)
+                return;
+
+            // The MCP exe lives at
+            //   <solnRoot>/ObsidianX.Mcp/bin/<cfg>/net9.0/obsidianx-mcp.exe
+            // Client sits at
+            //   <solnRoot>/ObsidianX.Client/bin/<cfg>/net10.0-windows/ObsidianX.Client.exe
+            var mcpExe = System.Reflection.Assembly.GetExecutingAssembly().Location;
+            if (string.IsNullOrEmpty(mcpExe)) mcpExe = Environment.GetCommandLineArgs()[0];
+            var solnRoot = FindSolutionRoot(Path.GetDirectoryName(mcpExe) ?? "");
+            if (solnRoot == null) { Log("client launch: solution root not found"); return; }
+
+            string[] candidates =
+            [
+                Path.Combine(solnRoot, "ObsidianX.Client", "bin", "Release", "net10.0-windows", "ObsidianX.Client.exe"),
+                Path.Combine(solnRoot, "ObsidianX.Client", "bin", "Debug",   "net10.0-windows", "ObsidianX.Client.exe")
+            ];
+
+            foreach (var c in candidates)
+            {
+                if (!File.Exists(c)) continue;
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = c,
+                    WorkingDirectory = Path.GetDirectoryName(c)!,
+                    UseShellExecute = true,    // detach from our stdin/stdout
+                    CreateNoWindow = false
+                };
+                System.Diagnostics.Process.Start(psi);
+                Log($"launched client: {c}");
+                return;
+            }
+            Log("client launch: exe not found under " + solnRoot);
+        }
+        catch (Exception ex) { Log($"client launch failed: {ex.Message}"); }
+    }
+
+    private static string? FindSolutionRoot(string startDir)
+    {
+        var dir = new DirectoryInfo(startDir);
+        while (dir != null)
+        {
+            if (File.Exists(Path.Combine(dir.FullName, "ObsidianX.slnx"))) return dir.FullName;
+            dir = dir.Parent;
+        }
+        return null;
     }
 
     // ───────────── JSON-RPC framing ─────────────
