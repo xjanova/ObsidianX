@@ -198,12 +198,43 @@ app.MapGet("/api/brain/note/{id}", (string id) =>
 static AiHubService BuildHub()
 {
     var hub = new AiHubService(ResolveVaultPath());
+
+    // Ollama is always registered (even if not running — UI shows as offline)
     var ollamaUrl = Environment.GetEnvironmentVariable("OBSIDIANX_OLLAMA_URL")
                  ?? "http://localhost:11434";
     hub.Register(new OllamaBackend(ollamaUrl));
+
+    // Cloud / hosted backends — only register when API key is present so
+    // the /api/ai/backends list reflects what's actually reachable.
+    var nimKey = ReadKey("NVIDIA_NIM_API_KEY", "nim_api_key");
+    if (!string.IsNullOrWhiteSpace(nimKey)) hub.Register(new NvidiaNimBackend(nimKey));
+
+    var openRouterKey = ReadKey("OPENROUTER_API_KEY", "openrouter_api_key");
+    if (!string.IsNullOrWhiteSpace(openRouterKey)) hub.Register(new OpenRouterBackend(openRouterKey));
+
+    var deepSeekKey = ReadKey("DEEPSEEK_API_KEY", "deepseek_api_key");
+    if (!string.IsNullOrWhiteSpace(deepSeekKey)) hub.Register(new DeepSeekBackend(deepSeekKey));
+
     hub.DefaultModel = Environment.GetEnvironmentVariable("OBSIDIANX_DEFAULT_MODEL")
                     ?? "llama3.2";
     return hub;
+}
+
+/// <summary>Look up a key from env var first, then from
+/// .obsidianx/ai-keys.json under the given JSON field.</summary>
+static string? ReadKey(string envName, string jsonField)
+{
+    var env = Environment.GetEnvironmentVariable(envName);
+    if (!string.IsNullOrWhiteSpace(env)) return env;
+
+    try
+    {
+        var path = Path.Combine(ResolveVaultPath(), ".obsidianx", "ai-keys.json");
+        if (!File.Exists(path)) return null;
+        var root = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(path));
+        return root[jsonField]?.ToString();
+    }
+    catch { return null; }
 }
 
 // ─────────────── Ollama model manager ───────────────
@@ -520,6 +551,89 @@ Console.WriteLine("  [OK] Server ready at http://localhost:5142");
 Console.WriteLine("  [OK] SignalR hub at http://localhost:5142/brain-hub");
 Console.WriteLine("  [OK] Waiting for brains to connect...\n");
 Console.ResetColor();
+
+// ─────────────── Probe endpoints ───────────────
+// Claude Code and the Anthropic SDK check these at startup. Without
+// them a redirected client may assume the endpoint is broken.
+
+app.MapGet("/v1/models", async () =>
+{
+    var hub = BuildHub();
+    var all = new List<object>();
+    foreach (var (name, be) in hub.Backends)
+    {
+        if (!await be.IsAvailableAsync()) continue;
+        foreach (var m in await be.ListModelsAsync())
+            all.Add(new
+            {
+                id = m,
+                @object = "model",
+                created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                owned_by = name
+            });
+    }
+    return Results.Ok(new { @object = "list", data = all });
+});
+
+// Anthropic SDK's token counter endpoint — fast response, no model call.
+// We approximate with 1 token ≈ 4 characters which matches most
+// modern tokenizers well enough to make claude_code's budget display work.
+app.MapPost("/v1/messages/count_tokens", async (HttpContext ctx) =>
+{
+    using var sr = new StreamReader(ctx.Request.Body);
+    var body = Newtonsoft.Json.Linq.JObject.Parse(await sr.ReadToEndAsync());
+    long chars = 0;
+    foreach (var m in body["messages"] as Newtonsoft.Json.Linq.JArray ?? [])
+    {
+        var c = m["content"];
+        if (c is Newtonsoft.Json.Linq.JValue v) chars += (v.ToString() ?? "").Length;
+        else if (c is Newtonsoft.Json.Linq.JArray arr)
+            foreach (var block in arr) chars += (block["text"]?.ToString() ?? "").Length;
+    }
+    var system = body["system"]?.ToString();
+    if (!string.IsNullOrEmpty(system)) chars += system.Length;
+    return Results.Ok(new { input_tokens = (int)Math.Ceiling(chars / 4.0) });
+});
+
+// ─────────────── Secret key management ───────────────
+// The ObsidianX client writes API keys here so backends auto-register
+// on next BuildHub() call. Stored at .obsidianx/ai-keys.json (local
+// machine only, never committed to the vault's content).
+
+app.MapGet("/api/ai/keys/status", () =>
+{
+    string[] services = ["nim_api_key", "openrouter_api_key", "deepseek_api_key"];
+    var status = services.ToDictionary(
+        s => s,
+        s => !string.IsNullOrEmpty(ReadKey(s.ToUpperInvariant(), s)));
+    return Results.Ok(status);
+});
+
+app.MapPost("/api/ai/keys", async (HttpContext ctx) =>
+{
+    using var sr = new StreamReader(ctx.Request.Body);
+    var body = Newtonsoft.Json.Linq.JObject.Parse(await sr.ReadToEndAsync());
+
+    var path = Path.Combine(ResolveVaultPath(), ".obsidianx", "ai-keys.json");
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    Newtonsoft.Json.Linq.JObject existing;
+    if (File.Exists(path))
+    {
+        try { existing = Newtonsoft.Json.Linq.JObject.Parse(await File.ReadAllTextAsync(path)); }
+        catch { existing = new Newtonsoft.Json.Linq.JObject(); }
+    }
+    else existing = new Newtonsoft.Json.Linq.JObject();
+
+    // Merge — empty string means "clear this key"
+    foreach (var prop in body.Properties())
+    {
+        var v = prop.Value?.ToString();
+        if (string.IsNullOrEmpty(v)) existing.Remove(prop.Name);
+        else existing[prop.Name] = v;
+    }
+    await File.WriteAllTextAsync(path, existing.ToString(Newtonsoft.Json.Formatting.Indented));
+    return Results.Ok(new { saved = body.Properties().Select(p => p.Name).ToArray() });
+});
 
 // Router stats — live counters of traffic through our local AI proxy
 app.MapGet("/api/ai/stats/router", () => Results.Ok(RouterStats.Snapshot()));

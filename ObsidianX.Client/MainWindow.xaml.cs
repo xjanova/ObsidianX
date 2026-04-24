@@ -171,6 +171,7 @@ public partial class MainWindow : Window
         StartAccessLogWatcher();
         StartMcpStatusWatcher();
         _ = LoadAiBackends();
+        _ = RefreshAiKeyStatus();
         InitRedirectToggle();
 
         // Auto-scan + export on startup, if enabled
@@ -2678,6 +2679,82 @@ public partial class MainWindow : Window
         }
         if (AiModelCombo.Items.Count > 0) AiModelCombo.SelectedIndex = 0;
     }
+
+    // ═══════════════════════════════════════
+    // CLOUD AI BACKEND KEYS
+    // ═══════════════════════════════════════
+
+    private async void SaveAiKeys_Click(object s, RoutedEventArgs e)
+    {
+        var payload = new Newtonsoft.Json.Linq.JObject();
+        var nim = NimKeyBox.Password?.Trim() ?? "";
+        var orou = OpenRouterKeyBox.Password?.Trim() ?? "";
+        var ds = DeepSeekKeyBox.Password?.Trim() ?? "";
+        if (!string.IsNullOrEmpty(nim)) payload["nim_api_key"] = nim;
+        if (!string.IsNullOrEmpty(orou)) payload["openrouter_api_key"] = orou;
+        if (!string.IsNullOrEmpty(ds)) payload["deepseek_api_key"] = ds;
+
+        if (payload.Count == 0)
+        {
+            AiKeysStatus.Text = "No keys entered.";
+            return;
+        }
+
+        try
+        {
+            using var http = new HttpClient();
+            using var req = new HttpRequestMessage(HttpMethod.Post, AiServerBase + "/api/ai/keys")
+            {
+                Content = new StringContent(payload.ToString(), System.Text.Encoding.UTF8, "application/json")
+            };
+            var resp = await http.SendAsync(req);
+            if (resp.IsSuccessStatusCode)
+            {
+                AiKeysStatus.Text = $"✅ Saved {payload.Count} key(s). Click 'Refresh backends' to reload.";
+                // Clear inputs so key isn't shown back
+                NimKeyBox.Password = "";
+                OpenRouterKeyBox.Password = "";
+                DeepSeekKeyBox.Password = "";
+                await RefreshAiKeyStatus();
+            }
+            else
+            {
+                AiKeysStatus.Text = $"❌ Failed: {await resp.Content.ReadAsStringAsync()}";
+            }
+        }
+        catch (Exception ex) { AiKeysStatus.Text = $"❌ Error: {ex.Message}"; }
+    }
+
+    private async void RefreshAfterKeys_Click(object s, RoutedEventArgs e)
+    {
+        await LoadAiBackends();
+        await RefreshAiKeyStatus();
+        AiKeysStatus.Text = "Backends reloaded. Check the Backend dropdown in Claude view.";
+    }
+
+    private async Task RefreshAiKeyStatus()
+    {
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+            var json = await http.GetStringAsync(AiServerBase + "/api/ai/keys/status");
+            var root = Newtonsoft.Json.Linq.JObject.Parse(json);
+
+            NimKeyStatus.Text = IsKeySet(root, "nim_api_key") ? "✓ configured" : "(not set)";
+            OpenRouterKeyStatus.Text = IsKeySet(root, "openrouter_api_key") ? "✓ configured" : "(not set)";
+            DeepSeekKeyStatus.Text = IsKeySet(root, "deepseek_api_key") ? "✓ configured" : "(not set)";
+
+            var greenBrush = (SolidColorBrush)FindResource("NeonGreenBrush");
+            var mutedBrush = (SolidColorBrush)FindResource("TextMutedBrush");
+            NimKeyStatus.Foreground = IsKeySet(root, "nim_api_key") ? greenBrush : mutedBrush;
+            OpenRouterKeyStatus.Foreground = IsKeySet(root, "openrouter_api_key") ? greenBrush : mutedBrush;
+            DeepSeekKeyStatus.Foreground = IsKeySet(root, "deepseek_api_key") ? greenBrush : mutedBrush;
+        }
+        catch { /* server might not be up */ }
+    }
+
+    private static bool IsKeySet(Newtonsoft.Json.Linq.JObject root, string field) =>
+        root[field]?.ToObject<bool>() == true;
 
     // ═══════════════════════════════════════
     // REDIRECT CLAUDE DESKTOP → LOCAL AI
