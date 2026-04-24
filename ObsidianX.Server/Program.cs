@@ -158,6 +158,66 @@ app.MapGet("/api/brain/note/{id}", (string id) =>
     });
 });
 
+// ─────────────── AI Hub endpoints ───────────────
+// Lets any client (our WPF app, cURL, Open WebUI, a mobile app,
+// custom scripts) query a local LLM backend with the brain's
+// context automatically attached. Currently wraps Ollama; more
+// backends come online as adapters are added.
+static AiHubService BuildHub()
+{
+    var hub = new AiHubService(ResolveVaultPath());
+    var ollamaUrl = Environment.GetEnvironmentVariable("OBSIDIANX_OLLAMA_URL")
+                 ?? "http://localhost:11434";
+    hub.Register(new OllamaBackend(ollamaUrl));
+    hub.DefaultModel = Environment.GetEnvironmentVariable("OBSIDIANX_DEFAULT_MODEL")
+                    ?? "llama3.2";
+    return hub;
+}
+
+app.MapGet("/api/ai/backends", async () =>
+{
+    var hub = BuildHub();
+    var list = new List<object>();
+    foreach (var (name, be) in hub.Backends)
+    {
+        var available = await be.IsAvailableAsync();
+        var models = available ? await be.ListModelsAsync() : [];
+        list.Add(new { name, available, models });
+    }
+    return Results.Ok(new
+    {
+        defaultBackend = hub.DefaultBackend,
+        defaultModel = hub.DefaultModel,
+        backends = list
+    });
+});
+
+app.MapPost("/api/ai/chat", async (AiChatRequest req) =>
+{
+    try
+    {
+        var hub = BuildHub();
+        var reply = await hub.ChatAsync(
+            req.Message,
+            backendName: req.Backend,
+            model: req.Model,
+            history: req.History);
+        return Results.Ok(new
+        {
+            reply = reply.Content,
+            model = reply.Model,
+            backend = reply.BackendName,
+            elapsed_ms = reply.Elapsed.TotalMilliseconds,
+            tokens = new { prompt = reply.PromptTokens, completion = reply.CompletionTokens },
+            context_notes = reply.ContextNoteIds
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new { error = ex.Message, type = ex.GetType().Name });
+    }
+});
+
 // SignalR hub for real-time brain connections
 app.MapHub<BrainHub>("/brain-hub");
 
@@ -168,3 +228,11 @@ Console.WriteLine("  [OK] Waiting for brains to connect...\n");
 Console.ResetColor();
 
 app.Run("http://0.0.0.0:5142");
+
+
+public record AiChatRequest(
+    string Message,
+    string? Backend = null,
+    string? Model = null,
+    List<ChatMessage>? History = null
+);
