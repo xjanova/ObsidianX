@@ -29,7 +29,7 @@ Console.WriteLine(@"
 
   ╔══════════════════════════════════════════════╗
   ║   ObsidianX Server — Brain Matchmaking Hub   ║
-  ║   Neural Knowledge Network v1.0.0             ║
+  ║   Neural Knowledge Network v2.0.0             ║
   ╚══════════════════════════════════════════════╝
 ");
 Console.ResetColor();

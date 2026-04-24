@@ -1420,6 +1420,8 @@
                                                             Click="CopyMcpCommand_Click" Padding="16,8" Margin="0,0,8,0"/>
                                                     <Button Content="Build MCP Server" Style="{StaticResource NeonButton}"
                                                             Click="BuildMcpServer_Click" Padding="16,8" Margin="0,0,8,0"/>
+                                                    <Button Content="Test" Style="{StaticResource NeonButton}"
+                                                            Click="TestMcp_Click" Padding="16,8" Margin="0,0,8,0"/>
                                                     <Button Content="Uninstall" Style="{StaticResource NeonButton}"
                                                             Click="UninstallMcp_Click" Padding="16,8"/>
                                                 </StackPanel>
@@ -1451,7 +1453,7 @@
                                             <StackPanel>
                                                 <TextBlock Text="ABOUT" FontSize="11" FontWeight="SemiBold"
                                                            Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,8"/>
-                                                <TextBlock Text="ObsidianX — Neural Knowledge Engine v1.0.0"
+                                                <TextBlock Text="ObsidianX — Neural Knowledge Network v2.0.0"
                                                            FontSize="13" Foreground="{StaticResource TextPrimaryBrush}"/>
                                                 <TextBlock Text="Decentralized brain-to-brain knowledge sharing"
                                                            FontSize="11" Foreground="{StaticResource TextSecondaryBrush}" Margin="0,4,0,0"/>
@@ -1501,7 +1503,7 @@
                             <Ellipse x:Name="StatusDot" Width="6" Height="6" Fill="{StaticResource NeonGreenBrush}" Margin="0,0,6,0"/>
                             <TextBlock x:Name="StatusText" Text="Ready" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
                         </StackPanel>
-                        <TextBlock x:Name="VersionText" Text="ObsidianX v1.0.0" FontSize="10"
+                        <TextBlock x:Name="VersionText" Text="ObsidianX v2.0.0" FontSize="10"
                                    Foreground="{StaticResource TextMutedBrush}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
                     </Grid>
                 </Border>

@@ -7,6 +7,10 @@
     <Nullable>enable</Nullable>
     <AssemblyName>obsidianx-mcp</AssemblyName>
     <RootNamespace>ObsidianX.Mcp</RootNamespace>
+    <Version>2.0.0</Version>
+    <AssemblyVersion>2.0.0.0</AssemblyVersion>
+    <FileVersion>2.0.0.0</FileVersion>
+    <Product>ObsidianX MCP Server</Product>
   </PropertyGroup>
 
   <ItemGroup>

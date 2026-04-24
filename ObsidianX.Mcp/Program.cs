@@ -21,7 +21,7 @@ internal static class Program
 {
     private const string ProtocolVersion = "2025-06-18";
     private const string ServerName = "obsidianx-brain";
-    private const string ServerVersion = "1.0.0";
+    private const string ServerVersion = "2.0.0";
 
     private static string _vaultPath = ResolveVault(Environment.GetCommandLineArgs());
 

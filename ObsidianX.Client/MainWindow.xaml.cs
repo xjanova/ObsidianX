@@ -686,10 +686,12 @@ public partial class MainWindow : Window
                 if (!bubbleOutlines.TryGetValue(bubbleColor, out var om))
                     bubbleOutlines[bubbleColor] = om = new MeshGeometry3D();
 
-                // Inner filled sphere, translucent — shows cluster volume
-                AppendSphereToMesh(bm, b.Center, b.Radius * 0.75, SharedSphereLOD);
-                // Outer ring — hints at expansion
-                AppendSphereToMesh(om, b.Center, b.Radius * 0.85, SharedSphereLOD);
+                // Inner filled sphere — sized for readability, not raw bounds
+                // (bounds are often larger than visual needs and overlap peers)
+                var visualR = Math.Min(b.Radius * 0.45, 0.6 + Math.Log(1 + b.LeafCount) * 0.18);
+                AppendSphereToMesh(bm, b.Center, visualR, SharedSphereLOD);
+                // Outer ring — slightly larger, hints at expansion
+                AppendSphereToMesh(om, b.Center, visualR * 1.15, SharedSphereLOD);
             }
 
             foreach (var (color, mesh) in bubbleMeshes)
@@ -3001,16 +3003,25 @@ public partial class MainWindow : Window
         var exe = McpServerExePath();
         if (!File.Exists(exe))
         {
-            McpStatusText.Text = "MCP server not built. Click 'Build MCP Server' first.";
+            McpStatusText.Text = "❌ MCP server not built yet. Click 'Build MCP Server' first.";
+            return;
+        }
+
+        var cli = FindClaudeCli();
+        if (cli == null)
+        {
+            McpStatusText.Text = "❌ Couldn't find `claude` CLI on PATH or %APPDATA%\\npm.\n" +
+                                 "Install Claude Code CLI (npm i -g @anthropic-ai/claude-code) or use the manual JSON below.";
             return;
         }
 
         try
         {
-            McpStatusText.Text = "Registering with Claude Code CLI (user scope)…";
-            // Remove old registration first so re-install doesn't error.
-            // Try both scopes silently.
-            await RunClaudeCliAsync("mcp", "remove", "obsidianx-brain");
+            McpStatusText.Text = $"⏳ Found claude at: {cli}\n⏳ Unregistering old entries and adding at user scope…";
+
+            // Clean up any stale registrations — ignore results, these fail
+            // silently when nothing's registered or multiple scopes exist.
+            await RunClaudeCliAsync("mcp", "remove", "obsidianx-brain", "-s", "local");
             await RunClaudeCliAsync("mcp", "remove", "obsidianx-brain", "-s", "user");
 
             // Install at USER scope so every terminal sees it, not just this project
@@ -3020,18 +3031,79 @@ public partial class MainWindow : Window
                 "-e", $"OBSIDIANX_VAULT={_vaultPath}",
                 "--", exe);
 
-            if (code == 0)
-                McpStatusText.Text = "Installed! Run `claude` in any folder — the 'obsidianx-brain' server will load.\n" + stdout;
+            // Verify by listing — the list output is the real ground truth
+            var (listCode, listOut, _) = await RunClaudeCliAsync("mcp", "list");
+            var connected = listOut.Contains("obsidianx-brain") && listOut.Contains("Connected");
+
+            if (connected)
+            {
+                McpStatusText.Text =
+                    $"✅ INSTALLED & CONNECTED\n" +
+                    $"Server registered at user scope. Run `claude` in any terminal\n" +
+                    $"and it will have brain_search / brain_get_note / brain_expertise tools.\n\n" +
+                    $"Path: {exe}";
+            }
+            else if (code == 0)
+            {
+                McpStatusText.Text =
+                    $"⚠ Installed but can't verify connection.\n" +
+                    $"`claude mcp list` output:\n{listOut}";
+            }
             else
-                McpStatusText.Text = $"Install failed (exit {code}).\n{stderr}{stdout}";
+            {
+                McpStatusText.Text =
+                    $"❌ Install failed (exit {code})\n" +
+                    $"stderr: {stderr}\n" +
+                    $"stdout: {stdout}";
+            }
         }
-        catch (FileNotFoundException)
+        catch (FileNotFoundException ex)
         {
-            McpStatusText.Text = "Couldn't find `claude` on PATH or %APPDATA%\\npm. Install Claude Code CLI, or use the manual config below.";
+            McpStatusText.Text = $"❌ claude CLI not found: {ex.Message}";
         }
         catch (Exception ex)
         {
-            McpStatusText.Text = $"Install error: {ex.Message}";
+            McpStatusText.Text = $"❌ Install error: {ex.Message}\n{ex.StackTrace}";
+        }
+    }
+
+    private async void TestMcp_Click(object s, RoutedEventArgs e)
+    {
+        try
+        {
+            McpStatusText.Text = "⏳ Checking Claude Code CLI + MCP registration…";
+
+            var cli = FindClaudeCli();
+            if (cli == null)
+            {
+                McpStatusText.Text = "❌ claude CLI not found. Install via: npm i -g @anthropic-ai/claude-code";
+                return;
+            }
+
+            var (code, stdout, stderr) = await RunClaudeCliAsync("mcp", "list");
+            var exe = McpServerExePath();
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"▸ claude CLI: {cli}");
+            sb.AppendLine($"▸ MCP exe: {exe}  {(File.Exists(exe) ? "(exists)" : "(MISSING — build it)")}");
+            sb.AppendLine($"▸ Vault: {_vaultPath}");
+            sb.AppendLine($"▸ exit: {code}");
+            sb.AppendLine();
+            if (stdout.Contains("obsidianx-brain") && stdout.Contains("Connected"))
+                sb.AppendLine("✅ obsidianx-brain is registered AND connected");
+            else if (stdout.Contains("obsidianx-brain"))
+                sb.AppendLine("⚠ obsidianx-brain is registered but not connected");
+            else
+                sb.AppendLine("❌ obsidianx-brain is NOT registered — click Install");
+            sb.AppendLine();
+            sb.Append("Raw output:\n" + stdout);
+            if (!string.IsNullOrWhiteSpace(stderr)) sb.Append("\nstderr: " + stderr);
+
+            McpStatusText.Text = sb.ToString();
+        }
+        catch (Exception ex)
+        {
+            McpStatusText.Text = $"❌ Test failed: {ex.Message}";
         }
     }
 

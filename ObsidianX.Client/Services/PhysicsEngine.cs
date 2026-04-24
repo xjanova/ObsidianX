@@ -273,6 +273,30 @@ public class PhysicsEngine
             forces[i] += toOrigin * CenterGravity;
         }
 
+        // ── 3b. Inter-cluster repulsion — push whole communities apart so
+        // top-level bubbles don't overlap and become one unreadable blob.
+        // Each node gets a small extra shove away from other communities'
+        // centers, scaled by their distance.
+        if (_communityCenter.Count > 1)
+        {
+            for (int i = 0; i < Nodes.Count; i++)
+            {
+                var n = Nodes[i];
+                foreach (var (cid, center) in _communityCenter)
+                {
+                    if (cid == n.CommunityId) continue;
+                    var dx = n.Position.X - center.X;
+                    var dy = n.Position.Y - center.Y;
+                    var dz = n.Position.Z - center.Z;
+                    var distSq = dx * dx + dy * dy + dz * dz;
+                    if (distSq < 0.01) continue;
+                    // Inverse-distance push, capped so close clusters really bounce apart
+                    var mag = Math.Min(1.5, 4.0 / distSq);
+                    forces[i] += new Vector3D(dx, dy, dz) * (mag / Math.Sqrt(distSq));
+                }
+            }
+        }
+
         // ── 4. Integrate ──
         for (int i = 0; i < Nodes.Count; i++)
         {
