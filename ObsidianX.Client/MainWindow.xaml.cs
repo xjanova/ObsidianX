@@ -215,6 +215,7 @@ public partial class MainWindow : Window
         // Global keyboard shortcuts
         InputBindings.Add(new KeyBinding(new RelayCommand(OpenQuickSwitcher), Key.O, ModifierKeys.Control));
         InputBindings.Add(new KeyBinding(new RelayCommand(CreateNewNote), Key.N, ModifierKeys.Control));
+        InputBindings.Add(new KeyBinding(new RelayCommand(FocusGraphSearch), Key.F, ModifierKeys.Control));
 
         // Start render loop
         CompositionTarget.Rendering += OnRenderFrame;
@@ -1079,9 +1080,27 @@ public partial class MainWindow : Window
 
         var mouseOnViewport = e.GetPosition(FullGraphViewport);
 
-        // First try to hit a bubble — click-to-dive. If none hit, fall
-        // through to leaf-node hit-test.
-        if (e.ClickCount == 1 && TryDiveIntoBubble(mouseOnViewport)) return;
+        // Double-click anywhere: dive into the bubble under the cursor.
+        // Single-click: select a leaf node (if hit) and show its info,
+        // but leave bubbles alone so the user can orbit without diving.
+        if (e.ClickCount == 2)
+        {
+            if (TryDiveIntoBubble(mouseOnViewport)) return;
+            // Double-click on a leaf → dive to that leaf
+            var leafHit = HitTestNode(FullGraphViewport, GraphCam, _graphPhysics, mouseOnViewport);
+            if (leafHit.HasValue)
+            {
+                var n = _graphPhysics.Nodes[leafHit.Value];
+                _graphTarget = n.Position;
+                _graphDist = Math.Max(2.0, n.Radius * 8);
+                _cameraMode = CameraMode.Free;
+                if (CameraModeCombo != null) CameraModeCombo.SelectedIndex = 0;
+                _selectedNodeGraph = leafHit;
+                ShowNodeInfo(GraphNodeInfo, GraphNodeTitle, GraphNodeMeta, GraphNodeDot, GraphNodeContent, n);
+                StatusText.Text = $"🔍 Dived onto: {n.Title}";
+            }
+            return;
+        }
 
         var hit = HitTestNode(FullGraphViewport, GraphCam, _graphPhysics, mouseOnViewport);
         if (hit.HasValue)
@@ -1342,6 +1361,184 @@ public partial class MainWindow : Window
     /// camera target is inside, zoom out so that bubble fits the
     /// viewport. Repeat clicks walk up toward the root.
     /// </summary>
+    // ═══════════════════════════════════════
+    // BRAIN GRAPH SEARCH (TextBox + dropdown + fly-to)
+    // ═══════════════════════════════════════
+
+    private List<(string id, string title, int physicsIdx)> _lastSearchHits = [];
+
+    /// <summary>Ctrl+F: switch to the BrainGraph view and focus the search box.</summary>
+    private void FocusGraphSearch()
+    {
+        // If we're not on the graph view, simulate a nav click to switch
+        if (BrainGraphView.Visibility != Visibility.Visible)
+            Nav_Click(NavBrainGraph, new RoutedEventArgs());
+
+        GraphSearchBox?.Focus();
+        GraphSearchBox?.SelectAll();
+    }
+
+    private void GraphSearch_GotFocus(object s, RoutedEventArgs e)
+    {
+        // If there's already text, re-run the search
+        if (!string.IsNullOrWhiteSpace(GraphSearchBox.Text))
+            RunGraphSearch(GraphSearchBox.Text);
+    }
+
+    private void GraphSearch_TextChanged(object s, TextChangedEventArgs e)
+    {
+        var q = GraphSearchBox.Text;
+        if (string.IsNullOrWhiteSpace(q))
+        {
+            GraphSearchResults.Visibility = Visibility.Collapsed;
+            _lastSearchHits.Clear();
+            return;
+        }
+        RunGraphSearch(q);
+    }
+
+    private void GraphSearch_KeyDown(object s, KeyEventArgs e)
+    {
+        if (e.Key == Key.Escape)
+        {
+            GraphSearchBox.Text = "";
+            GraphSearchResults.Visibility = Visibility.Collapsed;
+            FullGraphViewport.Focus();
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Enter)
+        {
+            if (_lastSearchHits.Count > 0) FlyToSearchHit(0);
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Down && _lastSearchHits.Count > 0)
+        {
+            GraphSearchList.Focus();
+            GraphSearchList.SelectedIndex = 0;
+            e.Handled = true;
+        }
+    }
+
+    private void GraphSearchList_DoubleClick(object s, MouseButtonEventArgs e)
+    {
+        if (GraphSearchList.SelectedIndex >= 0)
+            FlyToSearchHit(GraphSearchList.SelectedIndex);
+    }
+
+    private void GraphSearchList_KeyDown(object s, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter && GraphSearchList.SelectedIndex >= 0)
+        {
+            FlyToSearchHit(GraphSearchList.SelectedIndex);
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Escape)
+        {
+            GraphSearchBox.Text = "";
+            GraphSearchResults.Visibility = Visibility.Collapsed;
+            e.Handled = true;
+        }
+    }
+
+    private void RunGraphSearch(string query)
+    {
+        _lastSearchHits.Clear();
+        GraphSearchList.Items.Clear();
+
+        // Prefer SQLite FTS5 (handles Thai via unicode61). Falls back to
+        // in-memory title/tag/preview scan if storage isn't ready yet.
+        List<SearchResult> hits;
+        try
+        {
+            _storage ??= BrainStorageFactory.Create(_storageProvider, _vaultPath, _mySqlConnString);
+            hits = _storage.Search(query, 25);
+        }
+        catch
+        {
+            hits = FallbackSearch(query, 25);
+        }
+
+        // Build physics-index mapping so we can lerp camera to the node
+        var idToIdx = new Dictionary<string, int>(_graphPhysics.Nodes.Count);
+        for (int i = 0; i < _graphPhysics.Nodes.Count; i++)
+            idToIdx[_graphPhysics.Nodes[i].Id] = i;
+
+        foreach (var h in hits)
+        {
+            if (!idToIdx.TryGetValue(h.NodeId, out var idx)) continue;
+            _lastSearchHits.Add((h.NodeId, h.Title, idx));
+            var cat = string.IsNullOrEmpty(h.Category) ? "" : $"  · {h.Category}";
+            var display = $"{h.Title}{cat}";
+            GraphSearchList.Items.Add(new System.Windows.Controls.ListBoxItem
+            {
+                Content = display,
+                Padding = new Thickness(10, 6, 10, 6),
+                Foreground = new SolidColorBrush(Color.FromRgb(224, 224, 255))
+            });
+        }
+
+        GraphSearchSummary.Text = _lastSearchHits.Count == 0
+            ? $"No matches for \"{query}\""
+            : $"{_lastSearchHits.Count} match·es · Enter to fly to first · ↓ to browse";
+        GraphSearchResults.Visibility = Visibility.Visible;
+    }
+
+    private List<SearchResult> FallbackSearch(string query, int limit)
+    {
+        var ql = query.ToLowerInvariant();
+        return _graph.Nodes
+            .Select(n => new { n, score = ScoreForSearch(n, ql) })
+            .Where(x => x.score > 0)
+            .OrderByDescending(x => x.score)
+            .Take(limit)
+            .Select(x => new SearchResult
+            {
+                NodeId = x.n.Id,
+                Title = x.n.Title,
+                RelativePath = Path.GetRelativePath(_vaultPath, x.n.FilePath).Replace("\\", "/"),
+                Category = x.n.PrimaryCategory.ToString(),
+                Score = x.score
+            }).ToList();
+    }
+
+    private static double ScoreForSearch(KnowledgeNode n, string ql)
+    {
+        double s = 0;
+        if (n.Title.Contains(ql, StringComparison.OrdinalIgnoreCase)) s += 3;
+        if (n.Tags.Any(t => t.Contains(ql, StringComparison.OrdinalIgnoreCase))) s += 2;
+        if (n.PrimaryCategory.ToString().Contains(ql, StringComparison.OrdinalIgnoreCase)) s += 1;
+        return s;
+    }
+
+    /// <summary>
+    /// Fly the camera onto the Nth search hit: lerp target to its
+    /// position, shrink camDist, pulse the node briefly so it stands
+    /// out, and close the search dropdown.
+    /// </summary>
+    private void FlyToSearchHit(int idx)
+    {
+        if (idx < 0 || idx >= _lastSearchHits.Count) return;
+        var (id, title, pidx) = _lastSearchHits[idx];
+        if (pidx < 0 || pidx >= _graphPhysics.Nodes.Count) return;
+
+        var node = _graphPhysics.Nodes[pidx];
+        _graphTarget = node.Position;
+        _graphDist = Math.Max(3.0, node.Radius * 10);
+        _cameraMode = CameraMode.Free;
+        if (CameraModeCombo != null) CameraModeCombo.SelectedIndex = 0;
+        _selectedNodeGraph = pidx;
+
+        // Highlight pulse — shows up as bright ripple + aura for ~3s
+        node.AccessIntensity = 1.0;
+        node.LastAccessedAt = DateTime.UtcNow;
+
+        GraphSearchResults.Visibility = Visibility.Collapsed;
+        FullGraphViewport.Focus();
+
+        ShowNodeInfo(GraphNodeInfo, GraphNodeTitle, GraphNodeMeta, GraphNodeDot, GraphNodeContent, node);
+        StatusText.Text = $"🎯 Flew to: {title}";
+    }
+
     private void ZoomOutLevel_Click(object sender, RoutedEventArgs e)
     {
         var tree = _graphPhysics.ClusterTree;

@@ -420,10 +420,23 @@
                                     <Grid Grid.Row="0" Margin="0,0,0,8">
                                         <StackPanel Orientation="Horizontal">
                                             <TextBlock Text="BRAIN GRAPH" FontSize="11" FontWeight="SemiBold"
-                                                       Foreground="{StaticResource TextMutedBrush}"/>
+                                                       Foreground="{StaticResource TextMutedBrush}"
+                                                       VerticalAlignment="Center"/>
                                             <TextBlock x:Name="GraphFPS" Text="" FontSize="10"
                                                        Foreground="{StaticResource TextMutedBrush}" Margin="12,0,0,0"
-                                                       FontFamily="{StaticResource MonoFont}"/>
+                                                       FontFamily="{StaticResource MonoFont}"
+                                                       VerticalAlignment="Center"/>
+                                            <TextBox x:Name="GraphSearchBox" Width="260" Margin="20,0,0,0"
+                                                     Background="{StaticResource DarkPanelBrush}"
+                                                     Foreground="{StaticResource TextPrimaryBrush}"
+                                                     BorderBrush="{StaticResource NeonCyanBrush}"
+                                                     BorderThickness="1" FontSize="11" Padding="8,3"
+                                                     CaretBrush="{StaticResource NeonCyanBrush}"
+                                                     VerticalAlignment="Center"
+                                                     ToolTip="Ctrl+F to focus · Enter to fly to top hit · Esc to close"
+                                                     TextChanged="GraphSearch_TextChanged"
+                                                     KeyDown="GraphSearch_KeyDown"
+                                                     GotFocus="GraphSearch_GotFocus"/>
                                         </StackPanel>
                                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                                             <TextBlock Text="Camera" FontSize="10" VerticalAlignment="Center"
@@ -539,6 +552,29 @@
                                             </LinearGradientBrush>
                                         </Rectangle.Fill>
                                     </Rectangle>
+
+                                    <!-- Search results dropdown -->
+                                    <Border x:Name="GraphSearchResults" Visibility="Collapsed"
+                                            HorizontalAlignment="Right" VerticalAlignment="Top"
+                                            Margin="0,48,12,0" Panel.ZIndex="20"
+                                            Background="#F00B0B1A" BorderBrush="{StaticResource NeonCyanBrush}"
+                                            BorderThickness="1" CornerRadius="6" MaxWidth="420">
+                                        <Border.Effect>
+                                            <DropShadowEffect Color="{StaticResource NeonCyanColor}"
+                                                              BlurRadius="20" Opacity="0.4" ShadowDepth="0"/>
+                                        </Border.Effect>
+                                        <StackPanel>
+                                            <TextBlock x:Name="GraphSearchSummary" FontSize="10"
+                                                       Foreground="{StaticResource TextMutedBrush}"
+                                                       Padding="10,6,10,4"
+                                                       FontFamily="{StaticResource MonoFont}"/>
+                                            <ListBox x:Name="GraphSearchList" MaxHeight="320"
+                                                     Background="Transparent" BorderThickness="0"
+                                                     Foreground="{StaticResource TextPrimaryBrush}"
+                                                     MouseDoubleClick="GraphSearchList_DoubleClick"
+                                                     KeyDown="GraphSearchList_KeyDown"/>
+                                        </StackPanel>
+                                    </Border>
 
                                     <!-- Depth indicator + breadcrumb overlay -->
                                     <Border VerticalAlignment="Top" HorizontalAlignment="Left"
