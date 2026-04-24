@@ -1412,7 +1412,12 @@ public partial class MainWindow : Window
 
     private void FullGraph_MouseMove(object s, MouseEventArgs e)
     {
-        if (!_isDragging) return;
+        if (!_isDragging)
+        {
+            // Not dragging — update hover tooltip instead
+            UpdateHoverLabel(e.GetPosition((IInputElement)s));
+            return;
+        }
         var pos = e.GetPosition((IInputElement)s);
         var dx = pos.X - _lastMouse.X;
         var dy = pos.Y - _lastMouse.Y;
@@ -1421,6 +1426,69 @@ public partial class MainWindow : Window
         _graphYaw += dx * 0.5;
         _graphPitch = Math.Clamp(_graphPitch + dy * 0.3, -80, 80);
         _lastMouse = pos;
+        // Hide tooltip while dragging
+        if (HoverLabel != null) HoverLabel.Visibility = Visibility.Collapsed;
+    }
+
+    /// <summary>
+    /// Hover tooltip — shows the primary name of whatever the mouse is
+    /// over. Leaf nodes show title + category. Cluster bubbles show the
+    /// cluster label + member count + sample of leaf titles.
+    /// </summary>
+    private void UpdateHoverLabel(Point mouseOnElement)
+    {
+        if (HoverLabel == null) return;
+
+        // Mouse position is relative to the catch-border; translate to viewport
+        var mouseOnViewport = mouseOnElement;
+
+        // Try leaf first — precise hit wins over a cluster covering the same spot
+        var leafIdx = HitTestNode(FullGraphViewport, GraphCam, _graphPhysics, mouseOnViewport);
+        if (leafIdx.HasValue)
+        {
+            var n = _graphPhysics.Nodes[leafIdx.Value];
+            HoverTitle.Text = string.IsNullOrWhiteSpace(n.Title) ? "(untitled)" : n.Title;
+            var customTag = "";
+            if (!string.IsNullOrEmpty(n.CustomCategoryId) && _categories != null)
+            {
+                var cc = _categories.FindById(n.CustomCategoryId);
+                if (cc != null) customTag = $"  ·  {cc.DisplayName}";
+            }
+            HoverSubtitle.Text = $"{n.Category}{customTag}  ·  {n.WordCount:N0} words";
+            PlaceHoverLabel(mouseOnElement);
+            return;
+        }
+
+        // Then bubble
+        var bubbleHit = HitTestBubble(mouseOnViewport);
+        if (bubbleHit != null)
+        {
+            HoverTitle.Text = bubbleHit.Label;
+            var leafSamples = GatherLeafTitles(bubbleHit).Take(4).ToList();
+            var sample = leafSamples.Count > 0 ? string.Join(" · ", leafSamples) : "no notes";
+            var more = bubbleHit.LeafCount > leafSamples.Count ? $" +{bubbleHit.LeafCount - leafSamples.Count} more" : "";
+            HoverSubtitle.Text = $"{bubbleHit.LeafCount} notes  ·  depth {bubbleHit.Depth}\n{sample}{more}";
+            PlaceHoverLabel(mouseOnElement);
+            return;
+        }
+
+        // Nothing under cursor
+        HoverLabel.Visibility = Visibility.Collapsed;
+    }
+
+    private void PlaceHoverLabel(Point mouse)
+    {
+        var offsetX = mouse.X + 18;
+        var offsetY = mouse.Y + 16;
+
+        // Clamp into the viewport so tooltip doesn't get clipped off the edge
+        var w = FullGraphViewport.ActualWidth;
+        var h = FullGraphViewport.ActualHeight;
+        if (offsetX + 300 > w) offsetX = mouse.X - 310;
+        if (offsetY + 80 > h) offsetY = mouse.Y - 90;
+
+        HoverLabel.Margin = new Thickness(offsetX, offsetY, 0, 0);
+        HoverLabel.Visibility = Visibility.Visible;
     }
 
     /// <summary>

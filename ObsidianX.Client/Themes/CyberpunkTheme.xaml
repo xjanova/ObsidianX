@@ -231,14 +231,94 @@
         </Style.Triggers>
     </Style>
 
-    <!-- Default ComboBox styling so dropdown items are readable on the
-         dark cyberpunk theme (white-on-white was unreadable). -->
+    <!-- Dark ComboBox with fully custom template — the stock WPF template
+         renders the SELECTED item through a ContentPresenter that falls
+         back to SystemColors.WindowBrushKey (white) regardless of our
+         Foreground setter. Overriding the template is the only reliable
+         fix to make the current value readable on the cyberpunk theme. -->
     <Style TargetType="ComboBox">
         <Setter Property="Background" Value="{StaticResource DarkPanelBrush}"/>
         <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}"/>
         <Setter Property="BorderBrush" Value="{StaticResource SurfaceLightBrush}"/>
         <Setter Property="BorderThickness" Value="1"/>
         <Setter Property="Padding" Value="8,4"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ComboBox">
+                    <Grid SnapsToDevicePixels="True">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="22"/>
+                        </Grid.ColumnDefinitions>
+
+                        <!-- Outer box -->
+                        <Border x:Name="OuterBorder" Grid.ColumnSpan="2"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="3"/>
+
+                        <!-- Currently-selected item (the bit that was going white) -->
+                        <ContentPresenter x:Name="SelectionBox" Grid.Column="0"
+                                          Margin="{TemplateBinding Padding}"
+                                          VerticalAlignment="Center" HorizontalAlignment="Stretch"
+                                          Content="{TemplateBinding SelectionBoxItem}"
+                                          ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                          ContentStringFormat="{TemplateBinding SelectionBoxItemStringFormat}"
+                                          IsHitTestVisible="False"
+                                          TextElement.Foreground="{TemplateBinding Foreground}"
+                                          TextElement.FontFamily="{TemplateBinding FontFamily}"
+                                          TextElement.FontSize="{TemplateBinding FontSize}"/>
+
+                        <!-- Dropdown arrow -->
+                        <Path Grid.Column="1" Data="M 0,0 L 4,5 L 8,0 Z"
+                              Fill="{StaticResource NeonCyanBrush}"
+                              HorizontalAlignment="Center" VerticalAlignment="Center"
+                              Width="8" Height="5" IsHitTestVisible="False"/>
+
+                        <!-- Clickable toggle -->
+                        <ToggleButton Grid.ColumnSpan="2" Background="Transparent"
+                                      BorderThickness="0" Focusable="False"
+                                      IsChecked="{Binding IsDropDownOpen, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay}">
+                            <ToggleButton.Template>
+                                <ControlTemplate TargetType="ToggleButton">
+                                    <Border Background="Transparent"/>
+                                </ControlTemplate>
+                            </ToggleButton.Template>
+                        </ToggleButton>
+
+                        <!-- Dropdown popup -->
+                        <Popup Placement="Bottom" AllowsTransparency="True"
+                               IsOpen="{TemplateBinding IsDropDownOpen}"
+                               PopupAnimation="Slide" Focusable="False">
+                            <Border Background="{StaticResource DarkPanelBrush}"
+                                    BorderBrush="{StaticResource NeonCyanBrush}"
+                                    BorderThickness="1" CornerRadius="3"
+                                    MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}">
+                                <Border.Effect>
+                                    <DropShadowEffect Color="{StaticResource NeonCyanColor}"
+                                                      BlurRadius="12" Opacity="0.3" ShadowDepth="0"/>
+                                </Border.Effect>
+                                <ScrollViewer MaxHeight="320" VerticalScrollBarVisibility="Auto">
+                                    <ItemsPresenter SnapsToDevicePixels="True"/>
+                                </ScrollViewer>
+                            </Border>
+                        </Popup>
+                    </Grid>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="OuterBorder" Property="BorderBrush"
+                                    Value="{StaticResource NeonCyanBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsDropDownOpen" Value="True">
+                            <Setter TargetName="OuterBorder" Property="BorderBrush"
+                                    Value="{StaticResource NeonCyanBrush}"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
     </Style>
 
     <Style TargetType="ComboBoxItem">

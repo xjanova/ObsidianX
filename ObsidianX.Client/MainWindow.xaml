@@ -503,6 +503,26 @@
                                     <!-- Activity labels — HUD tags that float next to nodes being read/written -->
                                     <Canvas x:Name="ActivityLabels" IsHitTestVisible="False" Panel.ZIndex="8"/>
 
+                                    <!-- Hover tooltip — floats next to the bubble/node under the mouse -->
+                                    <Border x:Name="HoverLabel" Visibility="Collapsed"
+                                            IsHitTestVisible="False" Panel.ZIndex="11"
+                                            Background="#E60B0B1A" BorderBrush="{StaticResource NeonCyanBrush}"
+                                            BorderThickness="1" CornerRadius="4" Padding="8,5"
+                                            HorizontalAlignment="Left" VerticalAlignment="Top">
+                                        <Border.Effect>
+                                            <DropShadowEffect Color="{StaticResource NeonCyanColor}"
+                                                              BlurRadius="12" Opacity="0.4" ShadowDepth="0"/>
+                                        </Border.Effect>
+                                        <StackPanel>
+                                            <TextBlock x:Name="HoverTitle" FontSize="12" FontWeight="SemiBold"
+                                                       Foreground="{StaticResource NeonCyanBrush}"
+                                                       FontFamily="{StaticResource MonoFont}"/>
+                                            <TextBlock x:Name="HoverSubtitle" FontSize="10" Margin="0,2,0,0"
+                                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                                       TextWrapping="Wrap" MaxWidth="280"/>
+                                        </StackPanel>
+                                    </Border>
+
                                     <!-- HUD CORNER BRACKETS (sci-fi frame) -->
                                     <Canvas IsHitTestVisible="False" Panel.ZIndex="9">
                                         <!-- Top-left bracket -->
