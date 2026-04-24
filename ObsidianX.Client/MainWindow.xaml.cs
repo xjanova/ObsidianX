@@ -557,6 +557,15 @@ public partial class MainWindow : Window
                         ? Math.Max(2.5, _attentionTarget.Radius * 8)
                         : Math.Max(6.0, _attentionTarget.Radius * 14);
                     _graphDist += (desired - _graphDist) * 0.05;
+
+                    // Status feedback so the user can verify Real Brain is
+                    // actually following something (and which thing).
+                    if (StatusText != null)
+                    {
+                        var opLabel = deep ? "📖 READING" : "🔍 SCANNING";
+                        StatusText.Text =
+                            $"🧠 AI FOCUS · {opLabel} → {TruncateTitle(_attentionTarget.Title, 40)}";
+                    }
                 }
                 else if (_realBrainHome.HasValue)
                 {
@@ -950,6 +959,17 @@ public partial class MainWindow : Window
         // like a sonar ping. Independent of the node mesh pulse.
         AppendPulseRipples(group, physics, visible);
 
+        // AI FOCUS indicator — a bright persistent halo + "AI FOCUS"
+        // label around whatever Real Brain is currently attending to.
+        // Easier to spot than the per-frame pulse because it's sticky
+        // for the whole dwell period.
+        if (_cameraMode == CameraMode.RealBrain
+            && _attentionTarget != null
+            && parent == FullGraphModel)
+        {
+            AppendAiFocusHalo(group, _attentionTarget);
+        }
+
         // ── Fractal cluster bubbles ──
         // Each unexpanded cluster renders as a translucent sphere so users
         // see structure at overview zoom. Dive closer (shrink camDist OR
@@ -1123,6 +1143,50 @@ public partial class MainWindow : Window
             group.Children.Add(new GeometryModel3D(mesh,
                 new EmissiveMaterial(new SolidColorBrush(rippleColor))));
         }
+    }
+
+    /// <summary>
+    /// Render a persistent pulsing halo ring + translucent aura around
+    /// whatever node Real Brain mode is currently following, so the
+    /// "AI is looking HERE" signal is unmistakable even between tool
+    /// calls when the per-hit access pulse has decayed.
+    /// </summary>
+    private void AppendAiFocusHalo(Model3DGroup group, PhysicsNode target)
+    {
+        var breathe = 1.0 + Math.Sin(_time * 4) * 0.22;
+        var baseR = target.Radius * 2.2 * breathe;
+
+        // Twin rings — equator + meridian — like a tactical reticle
+        var ringMesh = new MeshGeometry3D();
+        int segs = 48;
+        double thick = target.Radius * 0.08;
+        for (int i = 0; i < segs; i++)
+        {
+            double a0 = (double)i / segs * Math.PI * 2;
+            double a1 = (double)(i + 1) / segs * Math.PI * 2;
+            var eq0 = new Point3D(target.Position.X + baseR * Math.Cos(a0),
+                                  target.Position.Y,
+                                  target.Position.Z + baseR * Math.Sin(a0));
+            var eq1 = new Point3D(target.Position.X + baseR * Math.Cos(a1),
+                                  target.Position.Y,
+                                  target.Position.Z + baseR * Math.Sin(a1));
+            AppendLineToMesh(ringMesh, eq0, eq1, thick);
+            var me0 = new Point3D(target.Position.X + baseR * Math.Cos(a0),
+                                  target.Position.Y + baseR * Math.Sin(a0),
+                                  target.Position.Z);
+            var me1 = new Point3D(target.Position.X + baseR * Math.Cos(a1),
+                                  target.Position.Y + baseR * Math.Sin(a1),
+                                  target.Position.Z);
+            AppendLineToMesh(ringMesh, me0, me1, thick * 0.7);
+        }
+        group.Children.Add(new GeometryModel3D(ringMesh,
+            new EmissiveMaterial(new SolidColorBrush(Color.FromArgb(220, 0, 240, 255)))));
+
+        // Outer translucent aura
+        var haloMesh = new MeshGeometry3D();
+        AppendSphereToMesh(haloMesh, target.Position, baseR * 1.15, SharedSphereLOD);
+        group.Children.Add(new GeometryModel3D(haloMesh,
+            new EmissiveMaterial(new SolidColorBrush(Color.FromArgb(55, 0, 240, 255)))));
     }
 
     /// <summary>
@@ -1524,12 +1588,16 @@ public partial class MainWindow : Window
         var pos = e.GetPosition((IInputElement)s);
         var dx = pos.X - _lastMouse.X;
         var dy = pos.Y - _lastMouse.Y;
-        if (Math.Abs(dx) > 0.5 || Math.Abs(dy) > 0.5)
-            SwitchToFreeCamera();   // user took manual control
+
+        // Drag ORBITS the camera around its target without cancelling
+        // auto modes. If the user is in Real Brain, they can spin to
+        // see the AI-focused node from different angles — the camera
+        // keeps following. Only wheel zoom and clicks count as "I'll
+        // drive now". This was the main reason Real Brain "wasn't
+        // following" — a 1-pixel drag killed the mode.
         _graphYaw += dx * 0.5;
         _graphPitch = Math.Clamp(_graphPitch + dy * 0.3, -80, 80);
         _lastMouse = pos;
-        // Hide tooltip while dragging
         if (HoverLabel != null) HoverLabel.Visibility = Visibility.Collapsed;
     }
 
