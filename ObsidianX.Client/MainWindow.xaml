@@ -486,6 +486,60 @@
                                         <ModelVisual3D x:Name="FullGraphModel"/>
                                     </Viewport3D>
 
+                                    <!-- HUD CORNER BRACKETS (sci-fi frame) -->
+                                    <Canvas IsHitTestVisible="False" Panel.ZIndex="9">
+                                        <!-- Top-left bracket -->
+                                        <Path Stroke="{StaticResource NeonCyanBrush}" StrokeThickness="1.5"
+                                              Opacity="0.8"
+                                              Data="M 8,30 L 8,8 L 30,8"
+                                              Canvas.Left="0" Canvas.Top="0"/>
+                                        <!-- Top-right bracket -->
+                                        <Path Stroke="{StaticResource NeonCyanBrush}" StrokeThickness="1.5"
+                                              Opacity="0.8"
+                                              Data="M -30,8 L -8,8 L -8,30"
+                                              Canvas.Right="0" Canvas.Top="0"/>
+                                        <!-- Bottom-left -->
+                                        <Path Stroke="{StaticResource NeonCyanBrush}" StrokeThickness="1.5"
+                                              Opacity="0.8"
+                                              Data="M 8,-30 L 8,-8 L 30,-8"
+                                              Canvas.Left="0" Canvas.Bottom="0"/>
+                                        <!-- Bottom-right -->
+                                        <Path Stroke="{StaticResource NeonCyanBrush}" StrokeThickness="1.5"
+                                              Opacity="0.8"
+                                              Data="M -30,-8 L -8,-8 L -8,-30"
+                                              Canvas.Right="0" Canvas.Bottom="0"/>
+                                    </Canvas>
+
+                                    <!-- Center reticle (holographic crosshair) -->
+                                    <Grid IsHitTestVisible="False" Panel.ZIndex="9"
+                                          HorizontalAlignment="Center" VerticalAlignment="Center">
+                                        <Ellipse Width="40" Height="40"
+                                                 Stroke="{StaticResource NeonCyanBrush}" StrokeThickness="1"
+                                                 Opacity="0.25" StrokeDashArray="2 4"/>
+                                        <Ellipse Width="80" Height="80"
+                                                 Stroke="{StaticResource NeonCyanBrush}" StrokeThickness="1"
+                                                 Opacity="0.12" StrokeDashArray="1 6"/>
+                                        <Line X1="-8" Y1="0" X2="8" Y2="0"
+                                              Stroke="{StaticResource NeonCyanBrush}" StrokeThickness="1"
+                                              Opacity="0.4" VerticalAlignment="Center"/>
+                                        <Line X1="0" Y1="-8" X2="0" Y2="8"
+                                              Stroke="{StaticResource NeonCyanBrush}" StrokeThickness="1"
+                                              Opacity="0.4" HorizontalAlignment="Center"/>
+                                    </Grid>
+
+                                    <!-- Horizontal scanline (animated via code-behind) -->
+                                    <Rectangle x:Name="Scanline" Height="1"
+                                               VerticalAlignment="Top" Opacity="0.5"
+                                               IsHitTestVisible="False" Panel.ZIndex="9">
+                                        <Rectangle.Fill>
+                                            <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                                                <GradientStop Color="Transparent" Offset="0"/>
+                                                <GradientStop Color="#FF00F0FF" Offset="0.5"/>
+                                                <GradientStop Color="Transparent" Offset="1"/>
+                                            </LinearGradientBrush>
+                                        </Rectangle.Fill>
+                                    </Rectangle>
+
                                     <!-- Depth indicator + breadcrumb overlay -->
                                     <Border VerticalAlignment="Top" HorizontalAlignment="Left"
                                             Background="#B30B0B1A" BorderBrush="{StaticResource NeonCyanBrush}"

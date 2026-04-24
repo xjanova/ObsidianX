@@ -98,6 +98,11 @@ public partial class MainWindow : Window
     // Pre-built sphere mesh (shared for performance)
     private static readonly MeshGeometry3D SharedSphere = BuildUnitSphere(10, 6);
     private static readonly MeshGeometry3D SharedSphereLOD = BuildUnitSphere(6, 4);
+    private static readonly MeshGeometry3D SharedSphereTiny = BuildUnitSphere(4, 3);
+
+    // Static starfield — generated once, rendered as tiny dots at large radius
+    // so the graph looks like it's floating in deep space.
+    private static readonly List<(Point3D pos, double r, Color c)> Starfield = BuildStarfield(350);
 
     private readonly Dictionary<string, string> _viewMap = new()
     {
@@ -255,7 +260,26 @@ public partial class MainWindow : Window
             UpdateCamera(GraphCam, _graphYaw, _graphPitch, _graphDist, _graphTarget);
             RebuildScene(FullGraphModel, _graphPhysics, _selectedNodeGraph);
             UpdateDepthBreadcrumb();
+            UpdateScanline();
         }
+    }
+
+    /// <summary>
+    /// Walks the scanline down the viewport on a slow loop. A full
+    /// sweep takes ~5 seconds. Using the Height/Margin keeps it
+    /// independent of actual viewport size.
+    /// </summary>
+    private void UpdateScanline()
+    {
+        if (Scanline == null || FullGraphViewport == null) return;
+        var h = FullGraphViewport.ActualHeight;
+        if (h <= 0) return;
+
+        var phase = (_time * 0.2) % 1.0;        // one sweep per 5s
+        var width = FullGraphViewport.ActualWidth;
+        Scanline.Width = width;
+        Scanline.Margin = new Thickness(0, phase * h, 0, 0);
+        Scanline.Opacity = 0.15 + Math.Sin(phase * Math.PI) * 0.35;
     }
 
     /// <summary>
@@ -399,6 +423,9 @@ public partial class MainWindow : Window
     private void RebuildScene(ModelVisual3D parent, PhysicsEngine physics, int? selectedIdx)
     {
         var group = new Model3DGroup();
+
+        // Sci-fi background layer (drawn first = behind everything)
+        if (parent == FullGraphModel) BuildStarfieldScene(group);
 
         if (physics.Nodes.Count == 0)
         {
@@ -622,6 +649,21 @@ public partial class MainWindow : Window
             group.Children.Add(new GeometryModel3D(autoEdgeMesh, autoMat));
         }
 
+        // Scope ring — holographic torus marking the boundary of the
+        // cluster the camera is currently "inside". Gives the classic
+        // sci-fi "you are here" feel.
+        if (tree != null && parent == FullGraphModel)
+        {
+            var scope = FindCurrentScope(tree, fractalFocus, fractalZoom);
+            if (scope != null && scope.Depth > 0)
+                AppendScopeRing(group, scope.Center, scope.Radius,
+                    GetCategoryColor(scope.DominantCategory));
+        }
+
+        // Pulse ripples — expanding rings on nodes hit by MCP access,
+        // like a sonar ping. Independent of the node mesh pulse.
+        AppendPulseRipples(group, physics, visible);
+
         // ── Fractal cluster bubbles ──
         // Each unexpanded cluster renders as a translucent sphere so users
         // see structure at overview zoom. Dive closer (shrink camDist OR
@@ -678,6 +720,139 @@ public partial class MainWindow : Window
 
     // Last rendered bubbles (for click-to-dive hit-testing)
     private List<ClusterTree>? _lastRenderedBubbles;
+
+    // ═══════════════════════════════════════
+    // SCI-FI VISUAL LAYERS
+    // ═══════════════════════════════════════
+
+    /// <summary>
+    /// Emissive starfield on a large shell so the graph feels like
+    /// it's floating in deep space. Drawn first so all 3D content
+    /// sits in front of it. Alpha is low — stars don't compete with
+    /// the actual graph for attention.
+    /// </summary>
+    private static void BuildStarfieldScene(Model3DGroup group)
+    {
+        // Batch by color for cheaper draw calls
+        var batches = new Dictionary<Color, MeshGeometry3D>();
+        foreach (var (pos, r, c) in Starfield)
+        {
+            if (!batches.TryGetValue(c, out var mesh))
+                batches[c] = mesh = new MeshGeometry3D();
+            AppendSphereToMesh(mesh, pos, r, SharedSphereTiny);
+        }
+        foreach (var (c, mesh) in batches)
+        {
+            var mat = new EmissiveMaterial(new SolidColorBrush(c));
+            group.Children.Add(new GeometryModel3D(mesh, mat));
+        }
+    }
+
+    /// <summary>
+    /// Thin glowing torus at the equator of the current scope — the
+    /// user's "you are inside this" indicator. Pulses with a slow
+    /// sine so it reads as holographic rather than static.
+    /// </summary>
+    private void AppendScopeRing(Model3DGroup group, Point3D center, double radius, Color color)
+    {
+        var mesh = new MeshGeometry3D();
+        int segments = 64;
+        double thickness = radius * 0.012 * (1.0 + 0.3 * Math.Sin(_time * 2));
+        double r = radius * 0.98;
+
+        for (int i = 0; i < segments; i++)
+        {
+            double a0 = (double)i / segments * Math.PI * 2;
+            double a1 = (double)(i + 1) / segments * Math.PI * 2;
+            var p0 = new Point3D(center.X + r * Math.Cos(a0), center.Y, center.Z + r * Math.Sin(a0));
+            var p1 = new Point3D(center.X + r * Math.Cos(a1), center.Y, center.Z + r * Math.Sin(a1));
+            AppendLineToMesh(mesh, p0, p1, thickness);
+        }
+
+        var ringColor = Color.FromArgb(170,
+            (byte)Math.Min(255, color.R + 80),
+            (byte)Math.Min(255, color.G + 80),
+            (byte)Math.Min(255, color.B + 80));
+        var mat = new EmissiveMaterial(new SolidColorBrush(ringColor));
+        group.Children.Add(new GeometryModel3D(mesh, mat));
+
+        // Secondary perpendicular ring for holographic feel
+        var mesh2 = new MeshGeometry3D();
+        for (int i = 0; i < segments; i++)
+        {
+            double a0 = (double)i / segments * Math.PI * 2;
+            double a1 = (double)(i + 1) / segments * Math.PI * 2;
+            var p0 = new Point3D(center.X, center.Y + r * Math.Cos(a0), center.Z + r * Math.Sin(a0));
+            var p1 = new Point3D(center.X, center.Y + r * Math.Cos(a1), center.Z + r * Math.Sin(a1));
+            AppendLineToMesh(mesh2, p0, p1, thickness * 0.6);
+        }
+        var dimRing = Color.FromArgb(80, color.R, color.G, color.B);
+        group.Children.Add(new GeometryModel3D(mesh2, new EmissiveMaterial(new SolidColorBrush(dimRing))));
+    }
+
+    /// <summary>
+    /// Sonar-style expanding rings on nodes that got hit by MCP access
+    /// in the last ~1.5 seconds. Independent layer so they glow even
+    /// after the node-pulse decays.
+    /// </summary>
+    private void AppendPulseRipples(Model3DGroup group, PhysicsEngine physics, bool[] visible)
+    {
+        var mesh = new MeshGeometry3D();
+        int count = 0;
+
+        for (int i = 0; i < physics.Nodes.Count; i++)
+        {
+            if (!visible[i]) continue;
+            var n = physics.Nodes[i];
+            if (n.AccessIntensity < 0.1) continue;
+
+            // The ripple radius expands with (1 - intensity) so a fresh
+            // hit starts tiny and grows as it fades.
+            var growth = 1.0 - n.AccessIntensity;
+            var ringR = n.Radius * (2.0 + growth * 4.5);
+            double thick = n.Radius * 0.08 * (0.4 + n.AccessIntensity * 0.8);
+
+            int segs = 32;
+            for (int s = 0; s < segs; s++)
+            {
+                double a0 = (double)s / segs * Math.PI * 2;
+                double a1 = (double)(s + 1) / segs * Math.PI * 2;
+                var p0 = new Point3D(n.Position.X + ringR * Math.Cos(a0), n.Position.Y, n.Position.Z + ringR * Math.Sin(a0));
+                var p1 = new Point3D(n.Position.X + ringR * Math.Cos(a1), n.Position.Y, n.Position.Z + ringR * Math.Sin(a1));
+                AppendLineToMesh(mesh, p0, p1, thick);
+            }
+            count++;
+        }
+
+        if (count > 0)
+        {
+            var rippleColor = Color.FromArgb(180, 0, 240, 255);
+            group.Children.Add(new GeometryModel3D(mesh,
+                new EmissiveMaterial(new SolidColorBrush(rippleColor))));
+        }
+    }
+
+    /// <summary>Which cluster is the camera currently "inside"?</summary>
+    private static ClusterTree? FindCurrentScope(ClusterTree root, Point3D focus, double camDist)
+    {
+        if (root.Depth == 0 && camDist > root.Radius * 2.4) return null;
+
+        ClusterTree? deepest = null;
+        void Visit(ClusterTree t)
+        {
+            if (t.IsLeaf) return;
+            var dx = t.Center.X - focus.X;
+            var dy = t.Center.Y - focus.Y;
+            var dz = t.Center.Z - focus.Z;
+            var distSq = dx * dx + dy * dy + dz * dz;
+            if (distSq < t.Radius * t.Radius && camDist < t.Radius * 3.0
+                && (deepest == null || t.Depth > deepest.Depth))
+                deepest = t;
+            foreach (var c in t.Children) Visit(c);
+        }
+        Visit(root);
+        return deepest;
+    }
 
     /// <summary>Append a transformed sphere into a batched mesh (no new objects per node)</summary>
     private static void AppendSphereToMesh(MeshGeometry3D target, Point3D center, double radius, MeshGeometry3D unitSphere)
@@ -755,6 +930,37 @@ public partial class MainWindow : Window
         var orbitMat = new MaterialGroup();
         orbitMat.Children.Add(new EmissiveMaterial(new SolidColorBrush(Color.FromArgb(180, 0, 240, 255))));
         group.Children.Add(new GeometryModel3D(orbitMesh, orbitMat));
+    }
+
+    /// <summary>Random star points on a big shell for the background.</summary>
+    private static List<(Point3D pos, double r, Color c)> BuildStarfield(int count)
+    {
+        var rng = new Random(42);
+        var stars = new List<(Point3D pos, double r, Color c)>(count);
+        for (int i = 0; i < count; i++)
+        {
+            // Fibonacci sphere on a large radius — stars fill all directions
+            var t = (i + 0.5) / count;
+            var phi = Math.Acos(1 - 2 * t);
+            var theta = Math.PI * (1 + Math.Sqrt(5)) * i;
+            var r = 60 + rng.NextDouble() * 40;
+            var pos = new Point3D(
+                r * Math.Sin(phi) * Math.Cos(theta),
+                r * Math.Cos(phi),
+                r * Math.Sin(phi) * Math.Sin(theta));
+
+            // Mostly dim white, a few cyan/purple accent stars
+            var pick = rng.NextDouble();
+            Color col;
+            byte alpha = (byte)(80 + rng.Next(120));
+            if (pick < 0.07) col = Color.FromArgb(alpha, 0, 240, 255);         // cyan
+            else if (pick < 0.12) col = Color.FromArgb(alpha, 139, 92, 246);   // purple
+            else col = Color.FromArgb(alpha, 200, 200, 220);                   // white-ish
+
+            var size = 0.05 + rng.NextDouble() * 0.15;
+            stars.Add((pos, size, col));
+        }
+        return stars;
     }
 
     private static MeshGeometry3D BuildUnitSphere(int slices, int stacks)
