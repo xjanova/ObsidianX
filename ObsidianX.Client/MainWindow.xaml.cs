@@ -673,7 +673,7 @@ public partial class MainWindow : Window
         // frame. Supports click-to-dive via _pendingDiveBubble.
         if (bubbles.Count > 0)
         {
-            _lastRenderedBubbles = bubbles;  // for hit-test on click
+            var renderedBubbles = new List<(ClusterTree, double)>(bubbles.Count);
 
             var bubbleMeshes = new Dictionary<Color, MeshGeometry3D>();
             var bubbleOutlines = new Dictionary<Color, MeshGeometry3D>();
@@ -696,7 +696,11 @@ public partial class MainWindow : Window
                 AppendSphereToMesh(bm, b.Center, visualR, SharedSphereLOD);
                 // Outer ring — slightly larger, hints at expansion
                 AppendSphereToMesh(om, b.Center, visualR * 1.15, SharedSphereLOD);
+
+                renderedBubbles.Add((b, visualR * 1.15));
             }
+
+            _lastRenderedBubbles = renderedBubbles;
 
             foreach (var (color, mesh) in bubbleMeshes)
             {
@@ -722,8 +726,9 @@ public partial class MainWindow : Window
         parent.Content = group;
     }
 
-    // Last rendered bubbles (for click-to-dive hit-testing)
-    private List<ClusterTree>? _lastRenderedBubbles;
+    // Last rendered bubbles + their visual radii (so clicks map to what the
+    // user actually sees, not the loose geometric bounding sphere).
+    private List<(ClusterTree bubble, double visualR)>? _lastRenderedBubbles;
 
     // ═══════════════════════════════════════
     // SCI-FI VISUAL LAYERS
@@ -1114,53 +1119,82 @@ public partial class MainWindow : Window
             return;
         }
 
+        // Single-click priority: leaf-node hit first (specific data shown
+        // in the info pane), bubble hit second (status-bar cluster info).
         var hit = HitTestNode(FullGraphViewport, GraphCam, _graphPhysics, mouseOnViewport);
         if (hit.HasValue)
         {
             _selectedNodeGraph = hit;
             ShowNodeInfo(GraphNodeInfo, GraphNodeTitle, GraphNodeMeta, GraphNodeDot, GraphNodeContent, _graphPhysics.Nodes[hit.Value]);
         }
+        else
+        {
+            // Fall back to bubble-hit so clicking a cluster isn't silent
+            TrySelectBubble(mouseOnViewport);
+        }
     }
 
-    /// <summary>
-    /// Cast a ray through the mouse point and see which bubble (if any)
-    /// it intersects. If hit, lerp the camera target onto that bubble
-    /// and zoom in — the next render will expand it into sub-clusters.
-    /// </summary>
-    private bool TryDiveIntoBubble(Point mouseOnViewport)
+    /// <summary>Cast a ray and find the bubble under the mouse, if any.</summary>
+    private ClusterTree? HitTestBubble(Point mouseOnViewport)
     {
-        if (_lastRenderedBubbles == null || _lastRenderedBubbles.Count == 0) return false;
-
-        // Build a world-space ray from the camera through the mouse point
+        if (_lastRenderedBubbles == null || _lastRenderedBubbles.Count == 0) return null;
         var ray = BuildPickRay(FullGraphViewport, GraphCam, mouseOnViewport);
-        if (ray == null) return (false);
+        if (ray == null) return null;
 
         ClusterTree? best = null;
         double bestT = double.MaxValue;
 
-        foreach (var b in _lastRenderedBubbles)
+        foreach (var (bubble, hitRadius) in _lastRenderedBubbles)
         {
-            // Ray-sphere intersection
-            var oc = ray.Value.origin - b.Center;
+            // Ray-sphere intersection against the VISIBLE radius (slightly
+            // bigger than the rendered fill so clicks feel forgiving) —
+            // not the loose geometric bounding sphere, which was making
+            // hit zones overlap and swallow the smaller bubbles.
+            var oc = ray.Value.origin - bubble.Center;
             var a = Vector3D.DotProduct(ray.Value.dir, ray.Value.dir);
             var bDot = 2 * Vector3D.DotProduct(ray.Value.dir, oc);
-            var cDot = Vector3D.DotProduct(oc, oc) - b.Radius * b.Radius;
+            var cDot = Vector3D.DotProduct(oc, oc) - hitRadius * hitRadius;
             var disc = bDot * bDot - 4 * a * cDot;
             if (disc < 0) continue;
             var t = (-bDot - Math.Sqrt(disc)) / (2 * a);
             if (t < 0) t = (-bDot + Math.Sqrt(disc)) / (2 * a);
-            if (t > 0 && t < bestT) { bestT = t; best = b; }
+            if (t > 0 && t < bestT) { bestT = t; best = bubble; }
         }
+        return best;
+    }
 
-        if (best == null) return false;
+    /// <summary>Single-click on a bubble: show cluster info, don't dive.</summary>
+    private bool TrySelectBubble(Point mouseOnViewport)
+    {
+        var hit = HitTestBubble(mouseOnViewport);
+        if (hit == null) return false;
 
-        // Dive: aim target at bubble center, shrink distance to fit radius
-        _graphTarget = best.Center;
-        _graphDist = Math.Max(2, best.Radius * 2.4);
-        _cameraMode = CameraMode.Free;  // user took control
-        if (CameraModeCombo != null) CameraModeCombo.SelectedIndex = 0;
-        StatusText.Text = $"🔍 Dived into cluster: {best.Label}";
+        // Summary: title, member count, top leaf titles inside
+        var leafSamples = GatherLeafTitles(hit).Take(3).ToList();
+        var sample = leafSamples.Count > 0 ? $" · notes: {string.Join(", ", leafSamples)}{(hit.LeafCount > 3 ? "…" : "")}" : "";
+        StatusText.Text = $"🫧 Cluster: {hit.Label} · {hit.LeafCount} note(s){sample}  (double-click to dive)";
         return true;
+    }
+
+    /// <summary>Double-click on a bubble: dive into it.</summary>
+    private bool TryDiveIntoBubble(Point mouseOnViewport)
+    {
+        var hit = HitTestBubble(mouseOnViewport);
+        if (hit == null) return false;
+
+        _graphTarget = hit.Center;
+        _graphDist = Math.Max(2, hit.Radius * 2.4);
+        SwitchToFreeCamera();
+        StatusText.Text = $"🔍 Dived into cluster: {hit.Label} ({hit.LeafCount} notes)";
+        return true;
+    }
+
+    private static IEnumerable<string> GatherLeafTitles(ClusterTree t)
+    {
+        if (t.IsLeaf) { yield return t.Leaf!.Title; yield break; }
+        foreach (var c in t.Children)
+            foreach (var title in GatherLeafTitles(c))
+                yield return title;
     }
 
     private static (Point3D origin, Vector3D dir)? BuildPickRay(
