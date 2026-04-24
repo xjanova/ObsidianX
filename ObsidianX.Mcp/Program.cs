@@ -93,10 +93,20 @@ internal static class Program
             ["resources"] = new JObject()
         },
         ["instructions"] =
-            "This is xman's personal brain (ObsidianX). Use brain_search to find notes by keyword, " +
-            "brain_expertise to see what domains the owner knows deeply, and brain_get_note " +
-            "to fetch the full content of a specific note by id. Always prefer citing the owner's " +
-            "notes over generic answers when they are relevant."
+            "This is xman's personal brain (ObsidianX), a living knowledge graph that grows over time.\n\n" +
+            "READING: Use brain_search to find notes by keyword, brain_get_note to fetch full content, " +
+            "brain_expertise to see the owner's knowledge domains, brain_list to browse by category/tag, " +
+            "brain_stats for overview. ALWAYS prefer citing the owner's notes over generic answers when " +
+            "they're relevant — they represent the owner's actual knowledge.\n\n" +
+            "WRITING (IMPORTANT — the brain should grow from every session):\n" +
+            "• When you SOLVE a non-trivial problem, DISCOVER a new fact or technique, or the user says " +
+            "  'remember this' / 'save this' / 'add a note' / 'จำไว้ด้วย' / 'บันทึก' — call brain_create_note " +
+            "  with a concise title and the insight in markdown.\n" +
+            "• When adding to an existing topic, use brain_append_note with the note id from brain_search.\n" +
+            "• For bug fixes, root-cause analyses, new patterns, debugging tricks — these are exactly " +
+            "  what the brain should capture. Don't wait for the user to ask; proactively save.\n" +
+            "• Pick a reasonable folder like 'Notes/Claude-Sessions', 'Programming', 'AI', etc.\n\n" +
+            "This is how the brain gets smarter. Every good answer should leave a trace in the vault."
     });
 
     // ───────────── tools/list ─────────────
@@ -159,6 +169,36 @@ internal static class Program
                         ["mode"] = new JObject { ["type"] = "string", ["enum"] = new JArray { "Reference", "Copy" }, ["default"] = "Reference" }
                     },
                     ["required"] = new JArray { "path" }
+                }),
+            Tool("brain_create_note",
+                "Create a new note in the brain. Writes a .md file under <vault>/<folder>/<title>.md " +
+                "with YAML frontmatter and content. Use this when the user says 'remember that…', " +
+                "'add a note about…', 'save this to my brain'.",
+                new JObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JObject
+                    {
+                        ["title"] = new JObject { ["type"] = "string", ["description"] = "note title (will become file name)" },
+                        ["content"] = new JObject { ["type"] = "string", ["description"] = "full markdown body" },
+                        ["folder"] = new JObject { ["type"] = "string", ["description"] = "optional folder under vault, default 'Notes'" },
+                        ["tags"] = new JObject { ["type"] = "string", ["description"] = "optional comma-separated tags added to frontmatter" }
+                    },
+                    ["required"] = new JArray { "title", "content" }
+                }),
+            Tool("brain_append_note",
+                "Append content to an existing note. Identify by id (from brain_search) OR by path. " +
+                "Use this when the user says 'add to <note>', 'append…', 'also remember…'.",
+                new JObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JObject
+                    {
+                        ["id"] = new JObject { ["type"] = "string", ["description"] = "note id from brain_search/list" },
+                        ["path"] = new JObject { ["type"] = "string", ["description"] = "alternative: relative path under vault" },
+                        ["content"] = new JObject { ["type"] = "string", ["description"] = "markdown to append (preceded by blank line)" }
+                    },
+                    ["required"] = new JArray { "content" }
                 })
         }
     });
@@ -181,12 +221,14 @@ internal static class Program
         {
             JToken result = name switch
             {
-                "brain_search"      => BrainSearch(args),
-                "brain_get_note"    => BrainGetNote(args),
-                "brain_expertise"   => BrainExpertise(),
-                "brain_list"        => BrainList(args),
-                "brain_stats"       => BrainStats(),
-                "brain_import_path" => BrainImportPath(args),
+                "brain_search"       => BrainSearch(args),
+                "brain_get_note"     => BrainGetNote(args),
+                "brain_expertise"    => BrainExpertise(),
+                "brain_list"         => BrainList(args),
+                "brain_stats"        => BrainStats(),
+                "brain_import_path"  => BrainImportPath(args),
+                "brain_create_note"  => BrainCreateNote(args),
+                "brain_append_note"  => BrainAppendNote(args),
                 _ => throw new InvalidOperationException($"unknown tool: {name}")
             };
 
@@ -380,6 +422,116 @@ internal static class Program
             ["nearDuplicates"] = report.NearDuplicatesSkipped,
             ["note"] = "Run 'Export Brain Now' in ObsidianX UI to refresh brain-export.json after import."
         };
+    }
+
+    // ───────────── write tools ─────────────
+
+    private static JToken BrainCreateNote(JObject args)
+    {
+        var title = args["title"]?.ToString() ?? throw new ArgumentException("title is required");
+        var content = args["content"]?.ToString() ?? throw new ArgumentException("content is required");
+        if (string.IsNullOrWhiteSpace(title)) throw new ArgumentException("title is empty");
+
+        var folder = (args["folder"]?.ToString() ?? "Notes").Trim();
+        if (string.IsNullOrEmpty(folder)) folder = "Notes";
+
+        var tagsStr = args["tags"]?.ToString() ?? "";
+        var tags = tagsStr.Split([',', ';'], StringSplitOptions.RemoveEmptyEntries
+                                              | StringSplitOptions.TrimEntries);
+
+        var safeTitle = string.Concat(title.Split(Path.GetInvalidFileNameChars())).Trim();
+        var safeFolder = string.Concat(folder.Split(Path.GetInvalidPathChars())).Trim();
+        var relPath = Path.Combine(safeFolder, safeTitle + ".md");
+        var fullPath = Path.Combine(_vaultPath, relPath);
+
+        Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+
+        if (File.Exists(fullPath))
+            throw new InvalidOperationException($"note already exists at {relPath} — use brain_append_note to add to it");
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("---");
+        sb.AppendLine($"created: {DateTime.UtcNow:O}");
+        sb.AppendLine($"source: claude-mcp");
+        if (tags.Length > 0)
+        {
+            sb.AppendLine("tags:");
+            foreach (var t in tags) sb.AppendLine($"  - {t}");
+        }
+        sb.AppendLine("---");
+        sb.AppendLine();
+        sb.AppendLine($"# {title}");
+        sb.AppendLine();
+        sb.Append(content);
+        File.WriteAllText(fullPath, sb.ToString());
+
+        // Log the write so the client's Real Brain camera can fly here
+        LogAccess(ComputeStableId(fullPath), "write", title);
+
+        return new JObject
+        {
+            ["success"] = true,
+            ["path"] = relPath.Replace("\\", "/"),
+            ["fullPath"] = fullPath,
+            ["id"] = ComputeStableId(fullPath),
+            ["bytes"] = sb.Length,
+            ["hint"] = "ObsidianX client will pick this up on next re-index. Tell user to click Re-index or it auto-refreshes on editor save."
+        };
+    }
+
+    private static JToken BrainAppendNote(JObject args)
+    {
+        var content = args["content"]?.ToString() ?? throw new ArgumentException("content is required");
+        var id = args["id"]?.ToString();
+        var path = args["path"]?.ToString();
+
+        string fullPath;
+        string resolvedId;
+
+        if (!string.IsNullOrEmpty(id))
+        {
+            var export = LoadExport() ?? throw new InvalidOperationException("no brain-export");
+            var node = export.Nodes.FirstOrDefault(n => n.Id == id)
+                ?? throw new InvalidOperationException($"note not found: {id}");
+            fullPath = Path.Combine(export.VaultPath, node.RelativePath);
+            resolvedId = id;
+        }
+        else if (!string.IsNullOrEmpty(path))
+        {
+            fullPath = Path.IsPathRooted(path) ? path : Path.Combine(_vaultPath, path);
+            resolvedId = ComputeStableId(fullPath);
+        }
+        else throw new ArgumentException("id or path is required");
+
+        if (!File.Exists(fullPath))
+            throw new InvalidOperationException($"file not found: {fullPath}");
+
+        // Append with a blank-line separator
+        var existing = File.ReadAllText(fullPath);
+        var separator = existing.EndsWith("\n\n") ? "" : existing.EndsWith("\n") ? "\n" : "\n\n";
+        File.AppendAllText(fullPath, separator + content + "\n");
+
+        LogAccess(resolvedId, "write", Path.GetFileNameWithoutExtension(fullPath));
+
+        return new JObject
+        {
+            ["success"] = true,
+            ["path"] = fullPath,
+            ["id"] = resolvedId,
+            ["appendedBytes"] = content.Length,
+            ["hint"] = "Re-index in ObsidianX to update the graph."
+        };
+    }
+
+    /// <summary>Mirror of KnowledgeNode.IdFromPath so MCP-written notes
+    /// carry the SAME id the client will compute on next re-index.</summary>
+    private static string ComputeStableId(string filePath)
+    {
+        if (string.IsNullOrEmpty(filePath)) return Guid.NewGuid().ToString("N")[..12];
+        var normalized = filePath.Replace('\\', '/').ToLowerInvariant();
+        var bytes = System.Text.Encoding.UTF8.GetBytes(normalized);
+        var hash = System.Security.Cryptography.SHA256.HashData(bytes);
+        return Convert.ToHexString(hash, 0, 6).ToLowerInvariant();
     }
 
     // ───────────── resources ─────────────

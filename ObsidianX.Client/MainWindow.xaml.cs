@@ -99,6 +99,11 @@ public partial class MainWindow : Window
     private DateTime _attentionStartedAt;
     private const double AttentionDwellSeconds = 5.0;
 
+    // Real-brain "home" — the view before Claude started poking around.
+    // Camera returns here when activity stops so the user keeps their
+    // bearings. Captured lazily when the first attention fires.
+    private (Point3D target, double dist)? _realBrainHome;
+
     // Node selection
     private int? _selectedNodeDash;
     private int? _selectedNodeGraph;
@@ -496,43 +501,72 @@ public partial class MainWindow : Window
             }
             case CameraMode.RealBrain:
             {
-                // Camera visits nodes with current activity (read/write)
-                // and DWELLS for at least AttentionDwellSeconds before
-                // moving on. This prevents jitter when several pulses fire
-                // at once — subsequent events wait their turn.
+                // Camera visits active nodes with a "home → dive → home"
+                // pattern:
+                //   • First activity → snapshot current view as home,
+                //     lerp to active node, zoom in. get_note / write →
+                //     deep zoom. search → moderate zoom.
+                //   • New activity that scores higher than current →
+                //     switch target immediately (no waiting for 5s dwell
+                //     to expire). 5s minimum only applies to the same
+                //     target — keeps the camera from bouncing off
+                //     prematurely when a single note just got hit.
+                //   • Activity dries up → lerp back to home so the user
+                //     keeps spatial orientation.
                 var now = DateTime.UtcNow;
+                var newTarget = PickNextAttention();
                 var dwellElapsed = _attentionTarget == null
                     ? double.MaxValue
                     : (now - _attentionStartedAt).TotalSeconds;
 
-                // Did the current target fade away entirely? (e.g. pulse
-                // fully decayed AND nothing new came in during dwell)
-                var currentFaded = _attentionTarget != null
-                    && _attentionTarget.AccessIntensity < 0.03
-                    && dwellElapsed > AttentionDwellSeconds;
-
-                if (_attentionTarget == null || dwellElapsed >= AttentionDwellSeconds || currentFaded)
+                if (_attentionTarget == null && newTarget != null)
                 {
-                    var next = PickNextAttention();
-                    if (next != null && next != _attentionTarget)
-                    {
-                        _attentionTarget = next;
-                        _attentionStartedAt = now;
-                    }
+                    // First attention after idle — remember where we were
+                    _realBrainHome ??= (_graphTarget, _graphDist);
+                    _attentionTarget = newTarget;
+                    _attentionStartedAt = now;
+                }
+                else if (newTarget != null && newTarget != _attentionTarget
+                         && ScoreOfAttention(newTarget) > ScoreOfAttention(_attentionTarget) + 0.1)
+                {
+                    // A clearly hotter target appeared — switch now
+                    _attentionTarget = newTarget;
+                    _attentionStartedAt = now;
+                }
+                else if (_attentionTarget != null
+                         && dwellElapsed >= AttentionDwellSeconds
+                         && _attentionTarget.AccessIntensity < 0.12
+                         && newTarget == null)
+                {
+                    // Current target faded, nothing else active — release
+                    // attention; next frame will fly back home.
+                    _attentionTarget = null;
                 }
 
                 if (_attentionTarget != null)
                 {
-                    LerpGraphTarget(_attentionTarget.Position, 0.06);
-                    // Keep the target framed nicely — zoom adapts to node size
-                    var desired = Math.Max(4.0, _attentionTarget.Radius * 14);
-                    _graphDist += (desired - _graphDist) * 0.03;
+                    LerpGraphTarget(_attentionTarget.Position, 0.08);
+
+                    // Deep-pull (get_note/write within the last 3s) gets
+                    // a tight close-up. search stays wider.
+                    var deep = IsDeepOp(_attentionTarget.LastOp)
+                            && (now - _attentionTarget.LastAccessedAt).TotalSeconds < 3.0;
+                    var desired = deep
+                        ? Math.Max(2.5, _attentionTarget.Radius * 8)
+                        : Math.Max(6.0, _attentionTarget.Radius * 14);
+                    _graphDist += (desired - _graphDist) * 0.05;
                 }
-                else
+                else if (_realBrainHome.HasValue)
                 {
-                    // No activity — drift gently toward the graph centroid
-                    var b = ComputeBounds(_graphPhysics);
-                    LerpGraphTarget(b.center, 0.015);
+                    // Return home — slower lerp so the trip feels intentional
+                    LerpGraphTarget(_realBrainHome.Value.target, 0.04);
+                    _graphDist += (_realBrainHome.Value.dist - _graphDist) * 0.03;
+                    // Once we've arrived, forget the home so a future activity
+                    // can snapshot a new one
+                    var homeDistDelta = Math.Abs(_graphDist - _realBrainHome.Value.dist);
+                    var homeTargetDelta = Distance(_graphTarget, _realBrainHome.Value.target);
+                    if (homeDistDelta < 0.2 && homeTargetDelta < 0.2)
+                        _realBrainHome = null;
                 }
                 break;
             }
@@ -550,21 +584,34 @@ public partial class MainWindow : Window
     {
         PhysicsNode? best = null;
         double bestScore = 0.12;   // minimum — below this nothing qualifies
-        var now = DateTime.UtcNow;
 
         foreach (var n in _graphPhysics.Nodes)
         {
             if (n == _attentionTarget) continue;
             if (n.AccessIntensity < 0.05 && n.LastAccessedAt == DateTime.MinValue) continue;
 
-            var recency = n.LastAccessedAt > DateTime.MinValue
-                ? 1.0 / (1.0 + (now - n.LastAccessedAt).TotalSeconds * 0.3)
-                : 0;
-            var score = n.AccessIntensity * 0.7 + recency * 0.3;
+            var score = ScoreOfAttention(n);
             if (score > bestScore) { bestScore = score; best = n; }
         }
         return best;
     }
+
+    /// <summary>Compute attention score: intensity blended with recency.</summary>
+    private static double ScoreOfAttention(PhysicsNode? n)
+    {
+        if (n == null) return 0;
+        var recency = n.LastAccessedAt > DateTime.MinValue
+            ? 1.0 / (1.0 + (DateTime.UtcNow - n.LastAccessedAt).TotalSeconds * 0.3)
+            : 0;
+        // Deep ops (read full note / write) get a recency bonus so they
+        // win the switch contest against a mere search hit.
+        var opBoost = IsDeepOp(n.LastOp) ? 0.2 : 0;
+        return n.AccessIntensity * 0.7 + recency * 0.3 + opBoost;
+    }
+
+    private static bool IsDeepOp(string op) =>
+        op.Equals("get_note", StringComparison.OrdinalIgnoreCase)
+     || op.Equals("write", StringComparison.OrdinalIgnoreCase);
 
     private void LerpGraphTarget(Point3D to, double t)
     {
@@ -3991,8 +4038,9 @@ public partial class MainWindow : Window
             var nodeId = obj["node_id"]?.ToString();
             if (string.IsNullOrEmpty(nodeId)) return;
 
-            var bumped = BumpPulseForNode(_dashPhysics, nodeId)
-                       | BumpPulseForNode(_graphPhysics, nodeId);
+            var op = obj["op"]?.ToString() ?? "mcp";
+            var bumped = BumpPulseForNode(_dashPhysics, nodeId, op)
+                       | BumpPulseForNode(_graphPhysics, nodeId, op);
 
             // Fallback: if the access-log carries a stale id (e.g. the
             // brain was re-exported with different ids since the log was
@@ -4003,8 +4051,8 @@ public partial class MainWindow : Window
                 var hint = obj["context"]?.ToString();
                 if (!string.IsNullOrEmpty(hint))
                 {
-                    FindAndBumpByTitleOrPath(_dashPhysics, hint);
-                    FindAndBumpByTitleOrPath(_graphPhysics, hint);
+                    FindAndBumpByTitleOrPath(_dashPhysics, hint, op);
+                    FindAndBumpByTitleOrPath(_graphPhysics, hint, op);
                 }
             }
 
@@ -4020,7 +4068,7 @@ public partial class MainWindow : Window
         catch (Newtonsoft.Json.JsonException) { }
     }
 
-    private static void FindAndBumpByTitleOrPath(PhysicsEngine physics, string hint)
+    private static void FindAndBumpByTitleOrPath(PhysicsEngine physics, string hint, string op = "mcp")
     {
         foreach (var n in physics.Nodes)
         {
@@ -4029,6 +4077,7 @@ public partial class MainWindow : Window
                 n.AccessIntensity = Math.Min(1.0, n.AccessIntensity + 0.8);
                 n.AccessCount++;
                 n.LastAccessedAt = DateTime.UtcNow;
+                n.LastOp = op;
                 return;
             }
         }
@@ -4052,13 +4101,14 @@ public partial class MainWindow : Window
         catch { /* best-effort */ }
     }
 
-    private static bool BumpPulseForNode(PhysicsEngine physics, string nodeId)
+    private static bool BumpPulseForNode(PhysicsEngine physics, string nodeId, string op = "mcp")
     {
         var node = physics.Nodes.FirstOrDefault(n => n.Id == nodeId);
         if (node == null) return false;
         node.AccessIntensity = Math.Min(1.0, node.AccessIntensity + 0.8);
         node.AccessCount++;
         node.LastAccessedAt = DateTime.UtcNow;
+        node.LastOp = op;
         return true;
     }
 

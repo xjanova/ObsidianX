@@ -22,6 +22,9 @@ public class PhysicsNode
     public double AccessIntensity { get; set; }
     public int AccessCount { get; set; }
     public DateTime LastAccessedAt { get; set; } = DateTime.MinValue;
+    /// <summary>Last MCP op: "search", "get_note", "write". Real Brain uses this
+    /// to decide how deep to zoom — get_note/write = deep, search = surface.</summary>
+    public string LastOp { get; set; } = "";
 
     // Community / cluster id (from label propagation)
     public int CommunityId { get; set; } = -1;
