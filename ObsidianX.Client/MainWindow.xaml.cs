@@ -171,6 +171,7 @@ public partial class MainWindow : Window
         StartAccessLogWatcher();
         StartMcpStatusWatcher();
         _ = LoadAiBackends();
+        InitRedirectToggle();
 
         // Auto-scan + export on startup, if enabled
         if (_autoScanOnStartup && (_scanPaths.Count > 0 || _scanWholeMachine))
@@ -2677,6 +2678,126 @@ public partial class MainWindow : Window
         }
         if (AiModelCombo.Items.Count > 0) AiModelCombo.SelectedIndex = 0;
     }
+
+    // ═══════════════════════════════════════
+    // REDIRECT CLAUDE DESKTOP → LOCAL AI
+    // ═══════════════════════════════════════
+
+    private DispatcherTimer? _redirectStatsTimer;
+    private const string RedirectEnvBaseUrl = "ANTHROPIC_BASE_URL";
+    private const string RedirectEnvApiKey  = "ANTHROPIC_API_KEY";
+
+    private void InitRedirectToggle()
+    {
+        if (RedirectToggle == null) return;
+        // Reflect current env-var state (User scope)
+        var curBase = Environment.GetEnvironmentVariable(RedirectEnvBaseUrl, EnvironmentVariableTarget.User);
+        var active = !string.IsNullOrEmpty(curBase)
+                  && curBase.Contains("localhost:5142", StringComparison.OrdinalIgnoreCase);
+        RedirectToggle.IsChecked = active;
+        UpdateRedirectStatusText(active);
+
+        // Start live-traffic poll
+        _redirectStatsTimer ??= new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = TimeSpan.FromSeconds(1.5)
+        };
+        _redirectStatsTimer.Tick -= RedirectStatsTimer_Tick;
+        _redirectStatsTimer.Tick += RedirectStatsTimer_Tick;
+        _redirectStatsTimer.Start();
+    }
+
+    private void UpdateRedirectStatusText(bool active)
+    {
+        if (RedirectStatusText == null) return;
+        RedirectStatusText.Text = active
+            ? "✅ ON — Claude Desktop routes to http://localhost:5142 (local Ollama + brain). Restart Claude Desktop after toggling."
+            : "OFF — Claude Desktop talks to api.anthropic.com (cloud)";
+    }
+
+    private void RedirectToggle_Checked(object s, RoutedEventArgs e)
+    {
+        Environment.SetEnvironmentVariable(RedirectEnvBaseUrl, AiServerBase, EnvironmentVariableTarget.User);
+        Environment.SetEnvironmentVariable(RedirectEnvApiKey, "local-ollama", EnvironmentVariableTarget.User);
+        UpdateRedirectStatusText(true);
+        MessageBox.Show(
+            $"Environment variables set at User scope:\n\n" +
+            $"  {RedirectEnvBaseUrl} = {AiServerBase}\n" +
+            $"  {RedirectEnvApiKey} = local-ollama\n\n" +
+            "Restart Claude Desktop to route through this server.\n" +
+            "Claude Desktop will use local Ollama with your brain as context.",
+            "Redirect enabled", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    private void RedirectToggle_Unchecked(object s, RoutedEventArgs e)
+    {
+        Environment.SetEnvironmentVariable(RedirectEnvBaseUrl, null, EnvironmentVariableTarget.User);
+        Environment.SetEnvironmentVariable(RedirectEnvApiKey, null, EnvironmentVariableTarget.User);
+        UpdateRedirectStatusText(false);
+        MessageBox.Show(
+            "Environment variables cleared. Restart Claude Desktop to go back to api.anthropic.com.",
+            "Redirect disabled", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    private void ToggleRedirectTraffic_Click(object s, RoutedEventArgs e)
+    {
+        if (RedirectTrafficPanel == null) return;
+        RedirectTrafficPanel.Visibility =
+            RedirectTrafficPanel.Visibility == Visibility.Visible
+                ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private async void ResetRedirectStats_Click(object s, RoutedEventArgs e)
+    {
+        try
+        {
+            using var http = new HttpClient();
+            using var req = new HttpRequestMessage(HttpMethod.Post, AiServerBase + "/api/ai/stats/router/reset");
+            await http.SendAsync(req);
+            await PollRedirectStats();
+        }
+        catch { }
+    }
+
+    private async void RedirectStatsTimer_Tick(object? sender, EventArgs e) => await PollRedirectStats();
+
+    private async Task PollRedirectStats()
+    {
+        if (RedirectTrafficText == null) return;
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+            var json = await http.GetStringAsync(AiServerBase + "/api/ai/stats/router");
+            var root = Newtonsoft.Json.Linq.JObject.Parse(json);
+            var total = root["totalRequests"]?.ToObject<long>() ?? 0;
+            var bIn = root["bytesIn"]?.ToObject<long>() ?? 0;
+            var bOut = root["bytesOut"]?.ToObject<long>() ?? 0;
+            RedirectTrafficText.Text = $"Traffic: {total:N0} requests  ·  {FormatBytes(bIn)} in  ·  {FormatBytes(bOut)} out";
+
+            if (RedirectTrafficPanel != null && RedirectTrafficPanel.Visibility == Visibility.Visible && RedirectTrafficList != null)
+            {
+                RedirectTrafficList.Items.Clear();
+                foreach (var ev in root["recent"] as Newtonsoft.Json.Linq.JArray ?? [])
+                {
+                    var ts = ev["ts"]?.ToObject<DateTime>() ?? default;
+                    var path = ev["path"]?.ToString() ?? "";
+                    var status = ev["status"]?.ToObject<int>() ?? 0;
+                    var elapsed = ev["elapsedMs"]?.ToObject<long>() ?? 0;
+                    var sIn = ev["bytesIn"]?.ToObject<long>() ?? 0;
+                    var sOut = ev["bytesOut"]?.ToObject<long>() ?? 0;
+                    RedirectTrafficList.Items.Add(
+                        $"{ts.ToLocalTime():HH:mm:ss}  {status,3}  {elapsed,5}ms  {FormatBytes(sIn),7} → {FormatBytes(sOut),-7}  {path}");
+                }
+            }
+        }
+        catch { /* server might be down momentarily */ }
+    }
+
+    private static string FormatBytes(long b) =>
+        b >= 1L << 30 ? $"{b / (double)(1L << 30):F1}GB"
+      : b >= 1L << 20 ? $"{b / (double)(1L << 20):F1}MB"
+      : b >= 1L << 10 ? $"{b / 1024.0:F1}KB"
+      : $"{b}B";
 
     // ═══════════════════════════════════════
     // OLLAMA MODEL MANAGER

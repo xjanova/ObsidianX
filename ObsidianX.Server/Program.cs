@@ -19,6 +19,37 @@ app.UseCors();
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
+// ── Router stats middleware ──
+// Every hit on /v1/* or /api/ai/* is counted so the client can show
+// a live "REDIRECTED N requests · X MB in / Y MB out" readout on the
+// Claude Desktop → local-AI toggle card.
+app.Use(async (ctx, next) =>
+{
+    var path = ctx.Request.Path.Value ?? "";
+    bool track = path.StartsWith("/v1/", StringComparison.Ordinal)
+              || path.StartsWith("/api/ai/", StringComparison.Ordinal);
+    if (!track) { await next(); return; }
+
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    var sizeIn = ctx.Request.ContentLength ?? 0;
+    // Wrap response so we can measure bytes out
+    var origBody = ctx.Response.Body;
+    using var ms = new MemoryStream();
+    ctx.Response.Body = ms;
+    try
+    {
+        await next();
+    }
+    finally
+    {
+        ms.Position = 0;
+        await ms.CopyToAsync(origBody);
+        ctx.Response.Body = origBody;
+        sw.Stop();
+        RouterStats.Record(path, sizeIn, ms.Length, ctx.Response.StatusCode, sw.ElapsedMilliseconds);
+    }
+});
+
 // ASCII art banner
 Console.ForegroundColor = ConsoleColor.Cyan;
 Console.WriteLine(@"
@@ -490,7 +521,84 @@ Console.WriteLine("  [OK] SignalR hub at http://localhost:5142/brain-hub");
 Console.WriteLine("  [OK] Waiting for brains to connect...\n");
 Console.ResetColor();
 
+// Router stats — live counters of traffic through our local AI proxy
+app.MapGet("/api/ai/stats/router", () => Results.Ok(RouterStats.Snapshot()));
+app.MapPost("/api/ai/stats/router/reset", () => { RouterStats.Reset(); return Results.Ok(); });
+
 app.Run("http://0.0.0.0:5142");
+
+/// <summary>
+/// Global in-memory counter for the proxy endpoints. Tracks total
+/// requests, bytes, status distribution, and the last N requests so
+/// the client can show a live "incoming traffic" feed on the
+/// Redirect Claude Desktop toggle.
+/// </summary>
+public static class RouterStats
+{
+    private static readonly object _lock = new();
+    private static long _totalRequests;
+    private static long _bytesIn;
+    private static long _bytesOut;
+    private static readonly Queue<RouterEvent> _recent = new();
+    private const int MaxRecent = 30;
+    private static readonly DateTime _since = DateTime.UtcNow;
+
+    public static void Record(string path, long bytesIn, long bytesOut, int status, long elapsedMs)
+    {
+        lock (_lock)
+        {
+            _totalRequests++;
+            _bytesIn += bytesIn;
+            _bytesOut += bytesOut;
+            _recent.Enqueue(new RouterEvent
+            {
+                Ts = DateTime.UtcNow,
+                Path = path,
+                BytesIn = bytesIn,
+                BytesOut = bytesOut,
+                Status = status,
+                ElapsedMs = elapsedMs
+            });
+            while (_recent.Count > MaxRecent) _recent.Dequeue();
+        }
+    }
+
+    public static object Snapshot()
+    {
+        lock (_lock)
+        {
+            return new
+            {
+                since = _since,
+                totalRequests = _totalRequests,
+                bytesIn = _bytesIn,
+                bytesOut = _bytesOut,
+                recent = _recent.Reverse().ToArray()
+            };
+        }
+    }
+
+    public static void Reset()
+    {
+        lock (_lock)
+        {
+            _totalRequests = 0;
+            _bytesIn = 0;
+            _bytesOut = 0;
+            _recent.Clear();
+        }
+    }
+
+    public class RouterEvent
+    {
+        public DateTime Ts { get; set; }
+        public string Path { get; set; } = "";
+        public long BytesIn { get; set; }
+        public long BytesOut { get; set; }
+        public int Status { get; set; }
+        public long ElapsedMs { get; set; }
+    }
+}
 
 
 public record AiChatRequest(

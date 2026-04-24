@@ -801,6 +801,89 @@
                                                    Foreground="{StaticResource TextMutedBrush}"/>
                                     </StackPanel>
 
+                                    <!-- 🔀 REDIRECT CLAUDE DESKTOP TOGGLE -->
+                                    <Border Background="#330B0B1A" BorderBrush="{StaticResource NeonCyanBrush}"
+                                            BorderThickness="1" CornerRadius="8" Margin="0,12,0,0" Padding="14">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Grid.Column="0">
+                                                <TextBlock Text="🔀 REDIRECT CLAUDE DESKTOP → LOCAL AI" FontSize="12"
+                                                           FontWeight="SemiBold" Foreground="{StaticResource NeonCyanBrush}"/>
+                                                <TextBlock x:Name="RedirectStatusText" FontSize="11"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" Margin="0,3,0,0"
+                                                           TextWrapping="Wrap"
+                                                           Text="OFF — Claude Desktop talks to api.anthropic.com (cloud)"/>
+                                                <TextBlock x:Name="RedirectTrafficText" FontSize="10"
+                                                           Foreground="{StaticResource TextMutedBrush}"
+                                                           FontFamily="{StaticResource MonoFont}" Margin="0,6,0,0"
+                                                           Text="Traffic: 0 requests · 0 B in · 0 B out"/>
+                                            </StackPanel>
+                                            <StackPanel Grid.Column="1" Orientation="Vertical" VerticalAlignment="Center">
+                                                <ToggleButton x:Name="RedirectToggle" Width="90" Height="34"
+                                                              Checked="RedirectToggle_Checked"
+                                                              Unchecked="RedirectToggle_Unchecked"
+                                                              HorizontalAlignment="Right">
+                                                    <ToggleButton.Style>
+                                                        <Style TargetType="ToggleButton">
+                                                            <Setter Property="Background" Value="#1A1A2E"/>
+                                                            <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}"/>
+                                                            <Setter Property="BorderBrush" Value="{StaticResource SurfaceLightBrush}"/>
+                                                            <Setter Property="BorderThickness" Value="1"/>
+                                                            <Setter Property="FontSize" Value="12"/>
+                                                            <Setter Property="FontWeight" Value="Bold"/>
+                                                            <Setter Property="Content" Value="● OFF"/>
+                                                            <Setter Property="Template">
+                                                                <Setter.Value>
+                                                                    <ControlTemplate TargetType="ToggleButton">
+                                                                        <Border Background="{TemplateBinding Background}"
+                                                                                BorderBrush="{TemplateBinding BorderBrush}"
+                                                                                BorderThickness="{TemplateBinding BorderThickness}"
+                                                                                CornerRadius="17">
+                                                                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                                        </Border>
+                                                                    </ControlTemplate>
+                                                                </Setter.Value>
+                                                            </Setter>
+                                                            <Style.Triggers>
+                                                                <Trigger Property="IsChecked" Value="True">
+                                                                    <Setter Property="Background" Value="{StaticResource NeonCyanBrush}"/>
+                                                                    <Setter Property="Foreground" Value="#0B0B1A"/>
+                                                                    <Setter Property="BorderBrush" Value="{StaticResource NeonCyanBrush}"/>
+                                                                    <Setter Property="Content" Value="● ON"/>
+                                                                </Trigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </ToggleButton.Style>
+                                                </ToggleButton>
+                                                <Button x:Name="RedirectShowTrafficBtn" Content="📡 Show live traffic"
+                                                        Style="{StaticResource NeonButton}" Padding="6,3" FontSize="10"
+                                                        Click="ToggleRedirectTraffic_Click" Margin="0,8,0,0"/>
+                                            </StackPanel>
+                                        </Grid>
+                                    </Border>
+
+                                    <!-- Live traffic feed -->
+                                    <Border x:Name="RedirectTrafficPanel" Visibility="Collapsed"
+                                            Background="{StaticResource DarkPanelBrush}"
+                                            BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1"
+                                            CornerRadius="6" Margin="0,6,0,0" Padding="12">
+                                        <StackPanel>
+                                            <TextBlock Text="RECENT REDIRECTED REQUESTS" FontSize="10" FontWeight="SemiBold"
+                                                       Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,6"/>
+                                            <ListBox x:Name="RedirectTrafficList" Height="140"
+                                                     Background="{StaticResource DeepSpaceBrush}"
+                                                     Foreground="{StaticResource TextPrimaryBrush}"
+                                                     BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1"
+                                                     FontFamily="{StaticResource MonoFont}" FontSize="10"/>
+                                            <Button Content="Reset counters" Style="{StaticResource NeonButton}"
+                                                    Click="ResetRedirectStats_Click" Padding="10,3" FontSize="10"
+                                                    HorizontalAlignment="Left" Margin="0,6,0,0"/>
+                                        </StackPanel>
+                                    </Border>
+
                                     <!-- Model Manager (collapsed by default) -->
                                     <Border x:Name="ModelManagerPanel" Visibility="Collapsed"
                                             Background="{StaticResource DarkPanelBrush}"
