@@ -1674,6 +1674,33 @@
                                                     <Button Content="Uninstall" Style="{StaticResource NeonButton}"
                                                             Click="UninstallMcp_Click" Padding="16,8"/>
                                                 </StackPanel>
+
+                                                <Border BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="0,1,0,0"
+                                                        Margin="0,10,0,0" Padding="0,10,0,0">
+                                                    <StackPanel>
+                                                        <TextBlock Text="100% AUTO-LEARN — Claude Code hook" FontSize="11" FontWeight="SemiBold"
+                                                                   Foreground="{StaticResource NeonGreenBrush}" Margin="0,0,0,6"/>
+                                                        <TextBlock FontSize="10" Foreground="{StaticResource TextSecondaryBrush}"
+                                                                   TextWrapping="Wrap" Margin="0,0,0,8">
+                                                            Registers a PostToolUse hook in ~/.claude/settings.json. After Claude reads or edits
+                                                            any .md file, ObsidianX server evaluates it with IngestPolicy and auto-imports if
+                                                            stable. No manual "remember this" needed — every solid note Claude touches gets
+                                                            pulled into the brain.
+                                                        </TextBlock>
+                                                        <StackPanel Orientation="Horizontal">
+                                                            <Button Content="Install hook" Style="{StaticResource NeonButtonFilled}"
+                                                                    Click="InstallClaudeHook_Click" Padding="12,5" FontSize="10" Margin="0,0,6,0"/>
+                                                            <Button Content="Remove hook" Style="{StaticResource NeonButton}"
+                                                                    Click="UninstallClaudeHook_Click" Padding="12,5" FontSize="10" Margin="0,0,6,0"/>
+                                                            <Button Content="Check status" Style="{StaticResource NeonButton}"
+                                                                    Click="CheckClaudeHook_Click" Padding="12,5" FontSize="10"/>
+                                                        </StackPanel>
+                                                        <TextBlock x:Name="ClaudeHookStatus" FontSize="10" Margin="0,6,0,0"
+                                                                   FontFamily="{StaticResource MonoFont}"
+                                                                   Foreground="{StaticResource TextMutedBrush}"
+                                                                   TextWrapping="Wrap"/>
+                                                    </StackPanel>
+                                                </Border>
                                                 <TextBlock x:Name="McpStatusText" FontSize="11"
                                                            Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap" Margin="0,0,0,12"/>
 

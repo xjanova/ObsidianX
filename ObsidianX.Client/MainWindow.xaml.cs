@@ -54,6 +54,9 @@ public partial class MainWindow : Window
     private bool _showAutoEdges = true;
     private double _autoLinkThreshold = 0.35;
 
+    // Filesystem watcher — auto re-index when any .md in the vault changes
+    private VaultWatcher? _vaultWatcher;
+
     // Storage provider (File / Sqlite / MySql)
     private string _storageProvider = "Sqlite";
     private string _mySqlConnString = "";
@@ -173,6 +176,7 @@ public partial class MainWindow : Window
         _ = LoadAiBackends();
         _ = RefreshAiKeyStatus();
         InitRedirectToggle();
+        StartVaultWatcher();
 
         // Auto-scan + export on startup, if enabled
         if (_autoScanOnStartup && (_scanPaths.Count > 0 || _scanWholeMachine))
@@ -2877,6 +2881,39 @@ public partial class MainWindow : Window
       : $"{b}B";
 
     // ═══════════════════════════════════════
+    // VAULT AUTO-WATCH (100% automation)
+    // ═══════════════════════════════════════
+
+    private void StartVaultWatcher()
+    {
+        _vaultWatcher = new VaultWatcher(_vaultPath, TimeSpan.FromSeconds(3));
+        _vaultWatcher.Triggered += OnVaultChanged;
+        _vaultWatcher.Start();
+        _vaultWatcher.Enabled = true;
+    }
+
+    private void OnVaultChanged()
+    {
+        // Runs on UI thread (DispatcherTimer tick). Re-index + diff-load so
+        // any new/edited/deleted note animates in the 3D graph immediately.
+        var changed = _vaultWatcher?.LastChangedPath ?? "vault";
+        StatusText.Text = $"🌱 Auto-ingest: change detected in {Path.GetFileName(changed)} — re-indexing…";
+        try
+        {
+            IndexVault();
+            _dashPhysics.LoadFromGraphDiff(_graph);
+            _graphPhysics.LoadFromGraphDiff(_graph);
+            UpdateUI();
+            RefreshVaultTree();
+            StatusText.Text = $"✅ Auto-ingest done · {_vaultWatcher?.TotalChangesObserved ?? 0} changes observed total · last: {Path.GetFileName(changed)}";
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = $"Auto-ingest error: {ex.Message}";
+        }
+    }
+
+    // ═══════════════════════════════════════
     // OLLAMA MODEL MANAGER
     // ═══════════════════════════════════════
 
@@ -4316,6 +4353,133 @@ public partial class MainWindow : Window
     {
         try { Clipboard.SetText(McpManualConfig.Text); McpStatusText.Text = "JSON config copied to clipboard."; }
         catch (Exception ex) { McpStatusText.Text = $"Copy failed: {ex.Message}"; }
+    }
+
+    // ═══════════════════════════════════════
+    // CLAUDE CODE POST-TOOL-USE HOOK INSTALLER
+    // Registers a hook in ~/.claude/settings.json so every Read/Edit
+    // Claude performs triggers /api/brain/auto-ingest on the target
+    // file — policy-gated, so only stable content lands in the brain.
+    // ═══════════════════════════════════════
+
+    private string ClaudeSettingsPath() =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".claude", "settings.json");
+
+    private const string BrainAutoIngestHookMarker = "obsidianx-auto-ingest";
+
+    private void InstallClaudeHook_Click(object s, RoutedEventArgs e)
+    {
+        try
+        {
+            var path = ClaudeSettingsPath();
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+
+            Newtonsoft.Json.Linq.JObject root;
+            if (File.Exists(path))
+            {
+                try { root = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(path)); }
+                catch { root = new Newtonsoft.Json.Linq.JObject(); }
+            }
+            else root = new Newtonsoft.Json.Linq.JObject();
+
+            var hooks = root["hooks"] as Newtonsoft.Json.Linq.JObject ?? new Newtonsoft.Json.Linq.JObject();
+            var postToolUse = hooks["PostToolUse"] as Newtonsoft.Json.Linq.JArray ?? new Newtonsoft.Json.Linq.JArray();
+
+            // Remove any previous ObsidianX entries so re-install is idempotent
+            for (int i = postToolUse.Count - 1; i >= 0; i--)
+            {
+                var item = postToolUse[i];
+                var cmd = item["hooks"]?[0]?["command"]?.ToString() ?? "";
+                if (cmd.Contains(BrainAutoIngestHookMarker)) postToolUse.RemoveAt(i);
+            }
+
+            // New hook entry — fires after Read/Edit/Write/MultiEdit and
+            // posts the file path back to our server. A small PowerShell
+            // snippet extracts the file_path from the tool input JSON
+            // (passed via $env:CLAUDE_TOOL_INPUT) and curls our endpoint.
+            var command =
+                "powershell -NoProfile -Command \"" +
+                "$j = $env:CLAUDE_TOOL_INPUT | ConvertFrom-Json; " +
+                "$p = $j.file_path; " +
+                "if ($p -and ($p -like '*.md')) { " +
+                $"  $body = @{{ path = $p }} | ConvertTo-Json; " +
+                $"  try {{ Invoke-RestMethod -Uri 'http://localhost:5142/api/brain/auto-ingest' -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 3 | Out-Null }} catch {{ }} " +
+                "}\" # " + BrainAutoIngestHookMarker;
+
+            postToolUse.Add(new Newtonsoft.Json.Linq.JObject
+            {
+                ["matcher"] = "Read|Edit|MultiEdit|Write",
+                ["hooks"] = new Newtonsoft.Json.Linq.JArray
+                {
+                    new Newtonsoft.Json.Linq.JObject
+                    {
+                        ["type"] = "command",
+                        ["command"] = command
+                    }
+                }
+            });
+
+            hooks["PostToolUse"] = postToolUse;
+            root["hooks"] = hooks;
+            File.WriteAllText(path, root.ToString(Newtonsoft.Json.Formatting.Indented));
+
+            ClaudeHookStatus.Text = $"✅ Installed at {path}\n" +
+                "Claude Code will now fire /api/brain/auto-ingest after every Read/Edit/Write on a .md file. " +
+                "Start a new `claude` session to pick it up.";
+        }
+        catch (Exception ex) { ClaudeHookStatus.Text = $"❌ Install failed: {ex.Message}"; }
+    }
+
+    private void UninstallClaudeHook_Click(object s, RoutedEventArgs e)
+    {
+        try
+        {
+            var path = ClaudeSettingsPath();
+            if (!File.Exists(path))
+            {
+                ClaudeHookStatus.Text = "(no settings.json to modify)";
+                return;
+            }
+
+            var root = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(path));
+            var postToolUse = root["hooks"]?["PostToolUse"] as Newtonsoft.Json.Linq.JArray;
+            if (postToolUse == null)
+            {
+                ClaudeHookStatus.Text = "(no PostToolUse hooks registered)";
+                return;
+            }
+
+            int removed = 0;
+            for (int i = postToolUse.Count - 1; i >= 0; i--)
+            {
+                var cmd = postToolUse[i]["hooks"]?[0]?["command"]?.ToString() ?? "";
+                if (cmd.Contains(BrainAutoIngestHookMarker)) { postToolUse.RemoveAt(i); removed++; }
+            }
+
+            if (removed > 0)
+            {
+                File.WriteAllText(path, root.ToString(Newtonsoft.Json.Formatting.Indented));
+                ClaudeHookStatus.Text = $"✓ Removed {removed} ObsidianX hook(s) from {path}";
+            }
+            else ClaudeHookStatus.Text = "(nothing to remove — ObsidianX hook not found)";
+        }
+        catch (Exception ex) { ClaudeHookStatus.Text = $"❌ Remove failed: {ex.Message}"; }
+    }
+
+    private void CheckClaudeHook_Click(object s, RoutedEventArgs e)
+    {
+        try
+        {
+            var path = ClaudeSettingsPath();
+            if (!File.Exists(path)) { ClaudeHookStatus.Text = $"❌ {path} does not exist yet"; return; }
+            var text = File.ReadAllText(path);
+            var installed = text.Contains(BrainAutoIngestHookMarker);
+            ClaudeHookStatus.Text = installed
+                ? $"✅ Hook INSTALLED in {path}"
+                : $"❌ Hook NOT installed (settings.json has no '{BrainAutoIngestHookMarker}' marker)";
+        }
+        catch (Exception ex) { ClaudeHookStatus.Text = $"Check failed: {ex.Message}"; }
     }
 
     // ═══════════════════════════════════════

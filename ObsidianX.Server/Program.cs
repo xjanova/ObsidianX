@@ -108,6 +108,59 @@ static BrainExport? LoadExport()
     catch { return null; }
 }
 
+// ─────────────── Auto-ingest ───────────────
+// Called by external triggers — VaultWatcher, Claude Code hooks, cron.
+// If the file exists and IngestPolicy.Evaluate says it's stable,
+// imports it as a Reference in the vault so it joins the graph. Else
+// replies with the policy's reason so the caller knows why it waited.
+
+app.MapPost("/api/brain/auto-ingest", async (HttpContext ctx) =>
+{
+    using var sr = new StreamReader(ctx.Request.Body);
+    var body = Newtonsoft.Json.Linq.JObject.Parse(await sr.ReadToEndAsync());
+    var filePath = body["path"]?.ToString();
+    if (string.IsNullOrWhiteSpace(filePath))
+        return Results.BadRequest(new { error = "path required" });
+    if (!File.Exists(filePath))
+        return Results.BadRequest(new { error = $"file not found: {filePath}" });
+
+    var policy = new IngestPolicy();
+    var verdict = policy.Evaluate(filePath);
+    if (!verdict.ShouldIngest)
+        return Results.Ok(new { ingested = false, reason = verdict.Reason, category = verdict.Category });
+
+    // File is stable — import as Reference into the vault, then let the
+    // client's FileSystemWatcher pick it up and reindex.
+    try
+    {
+        var importer = new VaultImporter();
+        var opts = new ImportOptions
+        {
+            VaultPath = ResolveVaultPath(),
+            ScanPaths = [Path.GetDirectoryName(filePath)!],
+            Patterns = Path.GetFileName(filePath),
+            Mode = VaultImporter.ImportMode.Reference
+        };
+        var report = importer.Scan(opts);
+        var only = report.Hits.FirstOrDefault(h =>
+            string.Equals(h.SourcePath, filePath, StringComparison.OrdinalIgnoreCase));
+        if (only == null) return Results.Ok(new { ingested = false, reason = "matched 0 hits (deduped or already imported)" });
+
+        var result = importer.Import([only], opts);
+        return Results.Ok(new
+        {
+            ingested = result.Imported.Count > 0,
+            imported = result.Imported,
+            skipped = result.Skipped,
+            reason = verdict.Reason
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
+});
+
 app.MapGet("/api/brain/export", () =>
 {
     var export = LoadExport();
