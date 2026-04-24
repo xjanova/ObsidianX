@@ -284,32 +284,29 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Find the deepest cluster whose bounding sphere contains the camera
-    /// target, then render the path from root to that cluster as a
-    /// breadcrumb and show the current depth.
+    /// Breadcrumb reflects what the camera is ACTUALLY rendering — the
+    /// current scope — not just the deepest cluster that geometrically
+    /// contains the target. FindCurrentScope checks both (focus inside
+    /// radius) AND (camDist < Radius × 3), matching the renderer. So
+    /// at overview zoom the breadcrumb reads "Brain" even if the target
+    /// point happens to sit inside several nested spheres.
     /// </summary>
     private void UpdateDepthBreadcrumb()
     {
         var tree = _graphPhysics.ClusterTree;
         if (tree == null || DepthIndicator == null) return;
 
-        ClusterTree? deepest = tree;
         int maxDepth = FindMaxDepth(tree);
-        WalkAllClusters(tree, c =>
-        {
-            if (c == tree) return;
-            var dx = c.Center.X - _graphTarget.X;
-            var dy = c.Center.Y - _graphTarget.Y;
-            var dz = c.Center.Z - _graphTarget.Z;
-            var d = Math.Sqrt(dx * dx + dy * dy + dz * dz);
-            if (d < c.Radius && c.Depth > deepest!.Depth) deepest = c;
-        });
 
-        DepthIndicator.Text = $"Depth {deepest!.Depth} / {maxDepth}";
+        // Use the same scope logic the renderer uses — breadcrumb and
+        // visuals stay in sync.
+        var scope = FindCurrentScope(tree, _graphTarget, _graphDist) ?? tree;
 
-        // Build breadcrumb from root → deepest
+        DepthIndicator.Text = $"Depth {scope.Depth} / {maxDepth}  ·  zoom {_graphDist:F1}";
+
+        // Build breadcrumb from root → scope
         var path = new List<string>();
-        var cur = deepest;
+        var cur = scope;
         while (cur != null)
         {
             path.Insert(0, cur.Depth == 0 ? "Brain" : ShortLabel(cur.Label));
