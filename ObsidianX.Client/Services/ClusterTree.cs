@@ -298,6 +298,8 @@ public class ClusterTree
     /// Find the deepest cluster we're effectively "inside". A cluster
     /// counts as active when focus is within its radius AND camera is
     /// close enough that we're not still in overview mode for it.
+    /// Thresholds (1.8× / 2.5×) match MainWindow.FindCurrentScope so
+    /// render scope and breadcrumb always agree.
     /// </summary>
     private ClusterTree FindScope(Point3D focus, double camDist)
     {
@@ -305,7 +307,7 @@ public class ClusterTree
 
         // Camera is far enough out that we're looking at the root as a
         // whole — scope = root so all top-level bubbles remain visible.
-        if (Depth == 0 && camDist > Radius * 2.4)
+        if (Depth == 0 && camDist > Radius * 1.8)
             return this;
 
         // Find deepest child that contains focus AND is close enough
@@ -319,7 +321,7 @@ public class ClusterTree
             var dz = child.Center.Z - focus.Z;
             var distSq = dx * dx + dy * dy + dz * dz;
             if (distSq >= child.Radius * child.Radius) continue;    // focus outside child
-            if (camDist > child.Radius * 3.0) continue;             // still in overview of child
+            if (camDist > child.Radius * 2.5) continue;             // still in overview of child
 
             var childScope = child.FindScope(focus, camDist);
             if (childScope.Depth > deepest.Depth) deepest = childScope;

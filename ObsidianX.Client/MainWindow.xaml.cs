@@ -361,10 +361,14 @@ public partial class MainWindow : Window
             }
             case CameraMode.Overview:
             {
-                // Pull camera out to frame all visible clusters
+                // One-shot: fit the whole graph, then drop to Free so the
+                // user's subsequent scroll doesn't get fought by per-frame
+                // lerp pulling the camera back in.
                 var b = ComputeBounds(_graphPhysics);
-                _graphDist += (Math.Max(14, b.radius * 2.5) - _graphDist) * 0.04;
-                LerpGraphTarget(b.center, 0.04);
+                _graphTarget = b.center;
+                _graphDist = Math.Clamp(b.radius * 2.5, 6, 120);
+                _cameraMode = CameraMode.Free;
+                if (CameraModeCombo != null) CameraModeCombo.SelectedIndex = 0;
                 break;
             }
             case CameraMode.RandomWalk:
@@ -832,10 +836,18 @@ public partial class MainWindow : Window
         }
     }
 
-    /// <summary>Which cluster is the camera currently "inside"?</summary>
+    /// <summary>
+    /// Which cluster is the camera currently "inside"? Requires BOTH
+    /// the focus to be inside the cluster's sphere AND the camera to
+    /// be close enough (distance &lt; radius × 3) that we're not just
+    /// looking at the cluster from far away. Returns null when the
+    /// camera is in overview mode for the whole graph.
+    /// </summary>
     private static ClusterTree? FindCurrentScope(ClusterTree root, Point3D focus, double camDist)
     {
-        if (root.Depth == 0 && camDist > root.Radius * 2.4) return null;
+        // If camera is well outside the root's bounding sphere, we're
+        // in pure overview — no scope.
+        if (root.Depth == 0 && camDist > root.Radius * 1.8) return null;
 
         ClusterTree? deepest = null;
         void Visit(ClusterTree t)
@@ -845,7 +857,8 @@ public partial class MainWindow : Window
             var dy = t.Center.Y - focus.Y;
             var dz = t.Center.Z - focus.Z;
             var distSq = dx * dx + dy * dy + dz * dz;
-            if (distSq < t.Radius * t.Radius && camDist < t.Radius * 3.0
+            // Inside the sphere AND close enough that we're committed to this cluster
+            if (distSq < t.Radius * t.Radius && camDist < t.Radius * 2.5
                 && (deepest == null || t.Depth > deepest.Depth))
                 deepest = t;
             foreach (var c in t.Children) Visit(c);
@@ -1188,14 +1201,31 @@ public partial class MainWindow : Window
         var pos = e.GetPosition((IInputElement)s);
         var dx = pos.X - _lastMouse.X;
         var dy = pos.Y - _lastMouse.Y;
+        if (Math.Abs(dx) > 0.5 || Math.Abs(dy) > 0.5)
+            SwitchToFreeCamera();   // user took manual control
         _graphYaw += dx * 0.5;
         _graphPitch = Math.Clamp(_graphPitch + dy * 0.3, -80, 80);
         _lastMouse = pos;
     }
 
+    /// <summary>
+    /// Drop the auto camera mode and sync the ComboBox. Called from any
+    /// manual camera interaction (wheel, drag, click-to-dive, search
+    /// fly-to) so the user's input isn't fought by a per-frame lerp.
+    /// </summary>
+    private void SwitchToFreeCamera()
+    {
+        if (_cameraMode == CameraMode.Free) return;
+        _cameraMode = CameraMode.Free;
+        if (CameraModeCombo != null) CameraModeCombo.SelectedIndex = 0;
+    }
+
     private void FullGraph_MouseWheel(object s, MouseWheelEventArgs e)
     {
         // Wide zoom range: 2 (close-up inside a cluster) → 120 (full overview as dots)
+        // User scrolled → take manual control (auto modes keep lerping
+        // the camera back otherwise, which feels like the zoom "bounces").
+        SwitchToFreeCamera();
         _graphDist = Math.Clamp(_graphDist - e.Delta * 0.012, 2, 120);
     }
 
