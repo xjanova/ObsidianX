@@ -81,7 +81,7 @@ public class VaultImporter
 
     public ScanReport Scan(ImportOptions options)
     {
-        var report = new ScanReport();
+        var report = new ScanReport { Policy = options.Policy };
         var patterns = ParsePatterns(options.Patterns);
         var seenHashes = new HashSet<string>(StringComparer.Ordinal);
         var seenSimHashes = new List<ulong>();
@@ -198,6 +198,25 @@ public class VaultImporter
 
             if (fi.Length > MaxFileSizeBytes) continue;
             if (fi.Length == 0) continue;
+
+            // Smart ingest gate — defer drafts / freshly-modified / dirty
+            // git files until they look stable. Policy-less callers get
+            // the old behaviour (everything passes).
+            var policy = report.Policy;
+            if (policy != null)
+            {
+                var verdict = policy.Evaluate(file);
+                if (!verdict.ShouldIngest)
+                {
+                    report.Pending.Add(new PendingFile
+                    {
+                        Path = file,
+                        Reason = verdict.Reason,
+                        Category = verdict.Category
+                    });
+                    continue;
+                }
+            }
 
             // SimHash over first 4 KB — near-dup check BEFORE full content hash
             ulong simHash;
@@ -559,6 +578,11 @@ public class ImportOptions
     public bool ScanWholeMachine { get; set; }
     public string Patterns { get; set; } = "CLAUDE.md;README.md;*.md";
     public VaultImporter.ImportMode Mode { get; set; } = VaultImporter.ImportMode.Reference;
+
+    /// <summary>If set, each candidate is evaluated by the policy; files
+    /// that aren't "stable" are excluded from this scan. The caller can
+    /// queue them for retry later.</summary>
+    public IngestPolicy? Policy { get; set; }
 }
 
 public class ScanHit
@@ -584,6 +608,19 @@ public class ScanReport
     public int NearDuplicatesSkipped { get; set; }
     public int ExactDuplicatesSkipped { get; set; }
     public int ThresholdAdjustments { get; set; }
+
+    /// <summary>Files the IngestPolicy deferred — caller can retry later.</summary>
+    public List<PendingFile> Pending { get; set; } = [];
+
+    /// <summary>Passed through from ImportOptions so the scan loop can consult it.</summary>
+    public IngestPolicy? Policy { get; set; }
+}
+
+public class PendingFile
+{
+    public string Path { get; set; } = "";
+    public string Reason { get; set; } = "";
+    public string Category { get; set; } = "";
 }
 
 public class ImportResult

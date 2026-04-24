@@ -5,6 +5,37 @@ using Newtonsoft.Json.Linq;
 
 namespace ObsidianX.Core.Services;
 
+public class OllamaModelInfo
+{
+    public string Name { get; set; } = "";
+    public long SizeBytes { get; set; }
+    public DateTime ModifiedAt { get; set; }
+    public string Family { get; set; } = "";
+    public string ParameterSize { get; set; } = "";
+    public string Quantization { get; set; } = "";
+    public string SizeHuman => FormatBytes(SizeBytes);
+    private static string FormatBytes(long b) =>
+        b >= 1L << 30 ? $"{b / (double)(1L << 30):F1} GB"
+      : b >= 1L << 20 ? $"{b / (double)(1L << 20):F0} MB"
+      : $"{b / 1024.0:F0} KB";
+}
+
+public class OllamaRunningModel
+{
+    public string Name { get; set; } = "";
+    public long SizeBytes { get; set; }
+    public DateTime ExpiresAt { get; set; }
+}
+
+public class OllamaPullProgress
+{
+    public string Status { get; set; } = "";
+    public string Digest { get; set; } = "";
+    public long Total { get; set; }
+    public long Completed { get; set; }
+    public double Percent => Total > 0 ? 100.0 * Completed / Total : 0;
+}
+
 /// <summary>
 /// Talks to a local Ollama server (typically <c>http://localhost:11434</c>).
 /// Ollama exposes an OpenAI-compatible chat endpoint, but its native
@@ -51,6 +82,108 @@ public class OllamaBackend : IAiBackend
                       .Where(n => !string.IsNullOrEmpty(n)).ToList();
         }
         catch { return []; }
+    }
+
+    /// <summary>
+    /// Installed models with their size + last-modified time so the
+    /// client can show a proper list.
+    /// </summary>
+    public async Task<List<OllamaModelInfo>> ListModelDetailsAsync(CancellationToken ct = default)
+    {
+        var list = new List<OllamaModelInfo>();
+        try
+        {
+            using var resp = await _http.GetAsync($"{_baseUrl}/api/tags", ct);
+            if (!resp.IsSuccessStatusCode) return list;
+            var json = await resp.Content.ReadAsStringAsync(ct);
+            var root = JObject.Parse(json);
+            foreach (var m in root["models"] as JArray ?? [])
+            {
+                list.Add(new OllamaModelInfo
+                {
+                    Name = m["name"]?.ToString() ?? "",
+                    SizeBytes = m["size"]?.ToObject<long>() ?? 0,
+                    ModifiedAt = DateTime.TryParse(m["modified_at"]?.ToString(), out var t) ? t : default,
+                    Family = m["details"]?["family"]?.ToString() ?? "",
+                    ParameterSize = m["details"]?["parameter_size"]?.ToString() ?? "",
+                    Quantization = m["details"]?["quantization_level"]?.ToString() ?? ""
+                });
+            }
+        }
+        catch { }
+        return list;
+    }
+
+    /// <summary>
+    /// Models currently loaded in Ollama's memory (warm). A model
+    /// loaded here responds instantly; one installed but not loaded
+    /// takes a few seconds to warm up on first call.
+    /// </summary>
+    public async Task<List<OllamaRunningModel>> ListRunningAsync(CancellationToken ct = default)
+    {
+        var list = new List<OllamaRunningModel>();
+        try
+        {
+            using var resp = await _http.GetAsync($"{_baseUrl}/api/ps", ct);
+            if (!resp.IsSuccessStatusCode) return list;
+            var json = await resp.Content.ReadAsStringAsync(ct);
+            var root = JObject.Parse(json);
+            foreach (var m in root["models"] as JArray ?? [])
+            {
+                list.Add(new OllamaRunningModel
+                {
+                    Name = m["name"]?.ToString() ?? "",
+                    SizeBytes = m["size"]?.ToObject<long>() ?? 0,
+                    ExpiresAt = DateTime.TryParse(m["expires_at"]?.ToString(), out var t) ? t : default
+                });
+            }
+        }
+        catch { }
+        return list;
+    }
+
+    /// <summary>
+    /// Pull a model from the Ollama library with streaming progress.
+    /// Yields status lines as Ollama downloads + verifies layers.
+    /// </summary>
+    public async IAsyncEnumerable<OllamaPullProgress> PullAsync(string modelName,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var payload = new JObject { ["name"] = modelName, ["stream"] = true };
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/api/pull")
+        {
+            Content = new StringContent(payload.ToString(), Encoding.UTF8, "application/json")
+        };
+        using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+        resp.EnsureSuccessStatusCode();
+        using var stream = await resp.Content.ReadAsStreamAsync(ct);
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        string? line;
+        while ((line = await reader.ReadLineAsync(ct)) != null)
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            JObject obj;
+            try { obj = JObject.Parse(line); } catch { continue; }
+            yield return new OllamaPullProgress
+            {
+                Status = obj["status"]?.ToString() ?? "",
+                Digest = obj["digest"]?.ToString() ?? "",
+                Total = obj["total"]?.ToObject<long>() ?? 0,
+                Completed = obj["completed"]?.ToObject<long>() ?? 0
+            };
+        }
+    }
+
+    /// <summary>Remove an installed model to reclaim disk space.</summary>
+    public async Task<bool> DeleteAsync(string modelName, CancellationToken ct = default)
+    {
+        var payload = new JObject { ["name"] = modelName };
+        using var req = new HttpRequestMessage(HttpMethod.Delete, $"{_baseUrl}/api/delete")
+        {
+            Content = new StringContent(payload.ToString(), Encoding.UTF8, "application/json")
+        };
+        using var resp = await _http.SendAsync(req, ct);
+        return resp.IsSuccessStatusCode;
     }
 
     public async IAsyncEnumerable<string> StreamAsync(ChatRequest request,

@@ -175,6 +175,61 @@ static AiHubService BuildHub()
     return hub;
 }
 
+// ─────────────── Ollama model manager ───────────────
+
+app.MapGet("/api/ai/models", async () =>
+{
+    var ollama = new OllamaBackend(
+        Environment.GetEnvironmentVariable("OBSIDIANX_OLLAMA_URL") ?? "http://localhost:11434");
+    if (!await ollama.IsAvailableAsync()) return Results.NotFound(new { error = "Ollama not reachable" });
+    var installed = await ollama.ListModelDetailsAsync();
+    var running = await ollama.ListRunningAsync();
+    return Results.Ok(new { installed, running });
+});
+
+app.MapPost("/api/ai/models/pull", async (HttpContext ctx) =>
+{
+    using var sr = new StreamReader(ctx.Request.Body);
+    var body = Newtonsoft.Json.Linq.JObject.Parse(await sr.ReadToEndAsync());
+    var modelName = body["name"]?.ToString();
+    if (string.IsNullOrWhiteSpace(modelName))
+    {
+        ctx.Response.StatusCode = 400;
+        await ctx.Response.WriteAsync("{\"error\":\"name required\"}");
+        return;
+    }
+
+    ctx.Response.Headers.ContentType = "text/event-stream";
+    ctx.Response.Headers.CacheControl = "no-cache";
+
+    var ollama = new OllamaBackend(
+        Environment.GetEnvironmentVariable("OBSIDIANX_OLLAMA_URL") ?? "http://localhost:11434");
+    try
+    {
+        await foreach (var p in ollama.PullAsync(modelName, ctx.RequestAborted))
+        {
+            var payload = Newtonsoft.Json.JsonConvert.SerializeObject(p);
+            await ctx.Response.WriteAsync("data: " + payload + "\n\n");
+            await ctx.Response.Body.FlushAsync();
+        }
+        await ctx.Response.WriteAsync("data: {\"status\":\"done\"}\n\n");
+    }
+    catch (Exception ex)
+    {
+        var err = Newtonsoft.Json.JsonConvert.SerializeObject(new { error = ex.Message });
+        await ctx.Response.WriteAsync("data: " + err + "\n\n");
+    }
+});
+
+app.MapDelete("/api/ai/models/{name}", async (string name) =>
+{
+    var ollama = new OllamaBackend(
+        Environment.GetEnvironmentVariable("OBSIDIANX_OLLAMA_URL") ?? "http://localhost:11434");
+    var ok = await ollama.DeleteAsync(name);
+    return ok ? Results.Ok(new { deleted = name })
+              : Results.BadRequest(new { error = $"could not delete {name}" });
+});
+
 app.MapGet("/api/ai/backends", async () =>
 {
     var hub = BuildHub();

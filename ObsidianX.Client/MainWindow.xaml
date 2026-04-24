@@ -793,11 +793,64 @@
                                                    Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,6,0"/>
                                         <ComboBox x:Name="AiModelCombo" Width="180" FontSize="11" Margin="0,0,10,0"/>
                                         <Button Content="↻ Refresh" Style="{StaticResource NeonButton}" Padding="10,3" FontSize="10"
-                                                Click="RefreshAiBackends_Click"/>
+                                                Click="RefreshAiBackends_Click" Margin="0,0,6,0"/>
+                                        <Button Content="⚙ Models" Style="{StaticResource NeonButton}" Padding="10,3" FontSize="10"
+                                                Click="ToggleModelManager_Click" Margin="0,0,0,0"/>
                                         <TextBlock x:Name="AiLatencyText" FontSize="10" Margin="14,0,0,0"
                                                    FontFamily="{StaticResource MonoFont}" VerticalAlignment="Center"
                                                    Foreground="{StaticResource TextMutedBrush}"/>
                                     </StackPanel>
+
+                                    <!-- Model Manager (collapsed by default) -->
+                                    <Border x:Name="ModelManagerPanel" Visibility="Collapsed"
+                                            Background="{StaticResource DarkPanelBrush}"
+                                            BorderBrush="{StaticResource NeonCyanBrush}" BorderThickness="1"
+                                            CornerRadius="6" Margin="0,10,0,0" Padding="14">
+                                        <StackPanel>
+                                            <TextBlock Text="OLLAMA MODEL MANAGER" FontSize="11" FontWeight="SemiBold"
+                                                       Foreground="{StaticResource NeonCyanBrush}" Margin="0,0,0,8"/>
+                                            <TextBlock Text="Installed models" FontSize="11"
+                                                       Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                            <ListBox x:Name="InstalledModelsList" Height="100"
+                                                     Background="{StaticResource DeepSpaceBrush}"
+                                                     Foreground="{StaticResource TextPrimaryBrush}"
+                                                     BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1"
+                                                     FontFamily="{StaticResource MonoFont}" FontSize="11"
+                                                     Margin="0,0,0,6"/>
+                                            <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                                                <Button Content="Use as default" Style="{StaticResource NeonButton}"
+                                                        Click="UseSelectedModel_Click" Padding="10,4" FontSize="10" Margin="0,0,6,0"/>
+                                                <Button Content="Remove" Style="{StaticResource NeonButton}"
+                                                        Click="RemoveModel_Click" Padding="10,4" FontSize="10"/>
+                                            </StackPanel>
+
+                                            <TextBlock Text="Pull new model (e.g. qwen2.5:7b, mistral, phi3, typhoon)" FontSize="11"
+                                                       Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                            <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                                                <TextBox x:Name="ModelPullBox" Width="260" FontSize="11" Padding="6,3"
+                                                         Background="{StaticResource DeepSpaceBrush}"
+                                                         Foreground="{StaticResource TextPrimaryBrush}"
+                                                         BorderBrush="{StaticResource SurfaceLightBrush}"
+                                                         CaretBrush="{StaticResource NeonCyanBrush}"
+                                                         FontFamily="{StaticResource MonoFont}" Margin="0,0,6,0"/>
+                                                <Button x:Name="PullModelBtn" Content="↓ Pull" Style="{StaticResource NeonButtonFilled}"
+                                                        Click="PullModel_Click" Padding="10,4" FontSize="10"/>
+                                            </StackPanel>
+                                            <ProgressBar x:Name="ModelPullProgress" Height="6" Minimum="0" Maximum="100"
+                                                         Foreground="{StaticResource NeonCyanBrush}"
+                                                         Background="{StaticResource SurfaceLightBrush}"
+                                                         BorderThickness="0" Visibility="Collapsed"/>
+                                            <TextBlock x:Name="ModelPullStatus" FontSize="10" FontFamily="{StaticResource MonoFont}"
+                                                       Foreground="{StaticResource TextMutedBrush}" Margin="0,4,0,0"
+                                                       TextWrapping="Wrap"/>
+
+                                            <TextBlock Text="Currently loaded in RAM (warm)" FontSize="11" Margin="0,12,0,4"
+                                                       Foreground="{StaticResource TextSecondaryBrush}"/>
+                                            <TextBlock x:Name="RunningModelsText" FontSize="11"
+                                                       Foreground="{StaticResource TextPrimaryBrush}"
+                                                       FontFamily="{StaticResource MonoFont}"/>
+                                        </StackPanel>
+                                    </Border>
                                 </StackPanel>
                                 <Border Grid.Row="1" Style="{StaticResource CardPanel}" Margin="0,0,0,12">
                                     <ScrollViewer VerticalScrollBarVisibility="Auto">
@@ -1558,6 +1611,11 @@
                             <Ellipse x:Name="McpActivityDot" Width="6" Height="6" Fill="#555577" Margin="0,0,4,0"
                                      ToolTip="Recent MCP activity (access-log tail)"/>
                             <TextBlock x:Name="McpActivityStatus" Text="idle" FontSize="10"
+                                       FontFamily="{StaticResource MonoFont}"
+                                       Foreground="{StaticResource TextMutedBrush}" Margin="0,0,14,0"/>
+                            <Ellipse x:Name="AiBackendDot" Width="6" Height="6" Fill="#555577" Margin="0,0,4,0"
+                                     ToolTip="Active AI backend + model"/>
+                            <TextBlock x:Name="AiBackendStatus" Text="AI: off" FontSize="10"
                                        FontFamily="{StaticResource MonoFont}"
                                        Foreground="{StaticResource TextMutedBrush}"/>
                         </StackPanel>

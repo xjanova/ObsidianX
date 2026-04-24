@@ -2678,6 +2678,153 @@ public partial class MainWindow : Window
         if (AiModelCombo.Items.Count > 0) AiModelCombo.SelectedIndex = 0;
     }
 
+    // ═══════════════════════════════════════
+    // OLLAMA MODEL MANAGER
+    // ═══════════════════════════════════════
+
+    private string AiServerBase => _serverUrl.Replace("/brain-hub", "");
+
+    private async void ToggleModelManager_Click(object s, RoutedEventArgs e)
+    {
+        if (ModelManagerPanel == null) return;
+        ModelManagerPanel.Visibility =
+            ModelManagerPanel.Visibility == Visibility.Visible
+                ? Visibility.Collapsed : Visibility.Visible;
+        if (ModelManagerPanel.Visibility == Visibility.Visible)
+            await RefreshModelManager();
+    }
+
+    private async Task RefreshModelManager()
+    {
+        if (InstalledModelsList == null) return;
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            var json = await http.GetStringAsync(AiServerBase + "/api/ai/models");
+            var root = Newtonsoft.Json.Linq.JObject.Parse(json);
+
+            InstalledModelsList.Items.Clear();
+            foreach (var m in root["installed"] as Newtonsoft.Json.Linq.JArray ?? [])
+            {
+                var name = m["Name"]?.ToString() ?? m["name"]?.ToString();
+                var size = m["SizeHuman"]?.ToString() ?? m["sizeHuman"]?.ToString();
+                var param = m["ParameterSize"]?.ToString() ?? m["parameterSize"]?.ToString();
+                var fam = m["Family"]?.ToString() ?? m["family"]?.ToString();
+                InstalledModelsList.Items.Add($"{name,-32}  {param,-6}  {fam,-10}  {size}");
+            }
+
+            var running = root["running"] as Newtonsoft.Json.Linq.JArray ?? [];
+            RunningModelsText.Text = running.Count == 0
+                ? "(no models warm — first call will load from disk)"
+                : string.Join(", ", running.Select(r => r["Name"]?.ToString() ?? r["name"]?.ToString()));
+        }
+        catch (Exception ex)
+        {
+            ModelPullStatus.Text = $"Failed to load models: {ex.Message}";
+        }
+    }
+
+    private async void UseSelectedModel_Click(object s, RoutedEventArgs e)
+    {
+        if (InstalledModelsList?.SelectedItem is not string line) return;
+        var name = line.Split(' ')[0];
+        // Find it in the combo and select
+        for (int i = 0; i < AiModelCombo.Items.Count; i++)
+        {
+            if (AiModelCombo.Items[i] is ComboBoxItem item && item.Content?.ToString() == name)
+            {
+                AiModelCombo.SelectedIndex = i;
+                StatusText.Text = $"Default model set to {name}";
+                return;
+            }
+        }
+        // Not in combo — add and select
+        AiModelCombo.Items.Add(new ComboBoxItem { Content = name });
+        AiModelCombo.SelectedIndex = AiModelCombo.Items.Count - 1;
+        await Task.CompletedTask;
+    }
+
+    private async void RemoveModel_Click(object s, RoutedEventArgs e)
+    {
+        if (InstalledModelsList?.SelectedItem is not string line) return;
+        var name = line.Split(' ')[0];
+        var ok = MessageBox.Show($"Remove model '{name}' from disk?",
+            "Confirm delete", MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+        if (ok != MessageBoxResult.OK) return;
+
+        try
+        {
+            using var http = new HttpClient();
+            using var req = new HttpRequestMessage(HttpMethod.Delete,
+                AiServerBase + $"/api/ai/models/{Uri.EscapeDataString(name)}");
+            var resp = await http.SendAsync(req);
+            if (resp.IsSuccessStatusCode)
+            {
+                ModelPullStatus.Text = $"Removed {name}";
+                await RefreshModelManager();
+                await LoadAiBackends();
+            }
+            else ModelPullStatus.Text = $"Delete failed: {await resp.Content.ReadAsStringAsync()}";
+        }
+        catch (Exception ex) { ModelPullStatus.Text = $"Delete error: {ex.Message}"; }
+    }
+
+    private async void PullModel_Click(object s, RoutedEventArgs e)
+    {
+        var name = ModelPullBox.Text.Trim();
+        if (string.IsNullOrEmpty(name)) return;
+
+        ModelPullProgress.Visibility = Visibility.Visible;
+        ModelPullProgress.Value = 0;
+        ModelPullStatus.Text = $"Pulling {name}…";
+        PullModelBtn.IsEnabled = false;
+
+        try
+        {
+            using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+            var payload = Newtonsoft.Json.JsonConvert.SerializeObject(new { name });
+            using var req = new HttpRequestMessage(HttpMethod.Post,
+                AiServerBase + "/api/ai/models/pull")
+            {
+                Content = new StringContent(payload, System.Text.Encoding.UTF8, "application/json")
+            };
+            using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
+            resp.EnsureSuccessStatusCode();
+            using var stream = await resp.Content.ReadAsStreamAsync();
+            using var sr = new StreamReader(stream);
+            string? line;
+            while ((line = await sr.ReadLineAsync()) != null)
+            {
+                if (!line.StartsWith("data: ")) continue;
+                try
+                {
+                    var obj = Newtonsoft.Json.Linq.JObject.Parse(line[6..]);
+                    var status = obj["Status"]?.ToString() ?? obj["status"]?.ToString() ?? "";
+                    var total = obj["Total"]?.ToObject<long>() ?? obj["total"]?.ToObject<long>() ?? 0;
+                    var done = obj["Completed"]?.ToObject<long>() ?? obj["completed"]?.ToObject<long>() ?? 0;
+                    if (total > 0) ModelPullProgress.Value = 100.0 * done / total;
+                    ModelPullStatus.Text = total > 0
+                        ? $"{status} · {done / (1024.0 * 1024):F0} / {total / (1024.0 * 1024):F0} MB"
+                        : status;
+                    if (status == "done" || status.Contains("success")) break;
+                }
+                catch { }
+            }
+            ModelPullStatus.Text = $"✅ Pulled {name}";
+            await RefreshModelManager();
+            await LoadAiBackends();
+        }
+        catch (Exception ex)
+        {
+            ModelPullStatus.Text = $"Pull failed: {ex.Message}";
+        }
+        finally
+        {
+            ModelPullProgress.Visibility = Visibility.Collapsed;
+            PullModelBtn.IsEnabled = true;
+        }
+    }
+
     private void PopulateVaultTree()
     {
         VaultTree.Items.Clear();
@@ -3777,9 +3924,51 @@ public partial class MainWindow : Window
         {
             Interval = TimeSpan.FromSeconds(3)
         };
-        _mcpStatusTimer.Tick += (_, _) => RefreshMcpStatusBar();
+        _mcpStatusTimer.Tick += (_, _) =>
+        {
+            RefreshMcpStatusBar();
+            RefreshAiBackendStatusBar();
+        };
         _mcpStatusTimer.Start();
         RefreshMcpStatusBar();
+        RefreshAiBackendStatusBar();
+    }
+
+    /// <summary>Poll the AI Hub and reflect current backend + loaded
+    /// model in the status bar every 3s together with the MCP LEDs.</summary>
+    private async void RefreshAiBackendStatusBar()
+    {
+        if (AiBackendDot == null) return;
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+            var json = await http.GetStringAsync(AiServerBase + "/api/ai/models");
+            var root = Newtonsoft.Json.Linq.JObject.Parse(json);
+            var running = root["running"] as Newtonsoft.Json.Linq.JArray ?? [];
+            var installed = root["installed"] as Newtonsoft.Json.Linq.JArray ?? [];
+
+            if (running.Count > 0)
+            {
+                var name = running[0]["Name"]?.ToString() ?? running[0]["name"]?.ToString() ?? "?";
+                AiBackendDot.Fill = (SolidColorBrush)FindResource("NeonGreenBrush");
+                AiBackendStatus.Text = $"AI: {name} (warm)";
+            }
+            else if (installed.Count > 0)
+            {
+                AiBackendDot.Fill = (SolidColorBrush)FindResource("NeonCyanBrush");
+                AiBackendStatus.Text = $"AI: {installed.Count} models · idle";
+            }
+            else
+            {
+                AiBackendDot.Fill = new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x77));
+                AiBackendStatus.Text = "AI: no models";
+            }
+        }
+        catch
+        {
+            AiBackendDot.Fill = new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x77));
+            AiBackendStatus.Text = "AI: offline";
+        }
     }
 
     private void RefreshMcpStatusBar()
