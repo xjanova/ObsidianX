@@ -3329,117 +3329,202 @@ public partial class MainWindow : Window
             return;
         }
 
+        var summary = new System.Text.StringBuilder();
+
+        // ── Claude Code CLI (terminal) ──
         var cli = FindClaudeCli();
         if (cli == null)
         {
-            McpStatusText.Text = "❌ Couldn't find `claude` CLI on PATH or %APPDATA%\\npm.\n" +
-                                 "Install Claude Code CLI (npm i -g @anthropic-ai/claude-code) or use the manual JSON below.";
-            return;
+            summary.AppendLine("⚠ Claude Code CLI not detected (skipping).");
+            summary.AppendLine("   Install via: npm i -g @anthropic-ai/claude-code");
+        }
+        else
+        {
+            try
+            {
+                McpStatusText.Text = "⏳ Installing to Claude Code CLI (user scope)…";
+                await RunClaudeCliAsync("mcp", "remove", "obsidianx-brain", "-s", "local");
+                await RunClaudeCliAsync("mcp", "remove", "obsidianx-brain", "-s", "user");
+
+                var (code, _, stderr) = await RunClaudeCliAsync(
+                    "mcp", "add", "obsidianx-brain",
+                    "-s", "user",
+                    "-e", $"OBSIDIANX_VAULT={_vaultPath}",
+                    "--", exe);
+
+                var (_, listOut, _) = await RunClaudeCliAsync("mcp", "list");
+                if (listOut.Contains("obsidianx-brain") && listOut.Contains("Connected"))
+                    summary.AppendLine("✅ Claude Code CLI — connected (user scope)");
+                else if (code == 0)
+                    summary.AppendLine("⚠ Claude Code CLI — registered but can't verify");
+                else
+                    summary.AppendLine($"❌ Claude Code CLI — failed: {stderr}");
+            }
+            catch (Exception ex)
+            {
+                summary.AppendLine($"❌ Claude Code CLI — error: {ex.Message}");
+            }
         }
 
+        // ── Claude Desktop ──
         try
         {
-            McpStatusText.Text = $"⏳ Found claude at: {cli}\n⏳ Unregistering old entries and adding at user scope…";
-
-            // Clean up any stale registrations — ignore results, these fail
-            // silently when nothing's registered or multiple scopes exist.
-            await RunClaudeCliAsync("mcp", "remove", "obsidianx-brain", "-s", "local");
-            await RunClaudeCliAsync("mcp", "remove", "obsidianx-brain", "-s", "user");
-
-            // Install at USER scope so every terminal sees it, not just this project
-            var (code, stdout, stderr) = await RunClaudeCliAsync(
-                "mcp", "add", "obsidianx-brain",
-                "-s", "user",
-                "-e", $"OBSIDIANX_VAULT={_vaultPath}",
-                "--", exe);
-
-            // Verify by listing — the list output is the real ground truth
-            var (listCode, listOut, _) = await RunClaudeCliAsync("mcp", "list");
-            var connected = listOut.Contains("obsidianx-brain") && listOut.Contains("Connected");
-
-            if (connected)
-            {
-                McpStatusText.Text =
-                    $"✅ INSTALLED & CONNECTED\n" +
-                    $"Server registered at user scope. Run `claude` in any terminal\n" +
-                    $"and it will have brain_search / brain_get_note / brain_expertise tools.\n\n" +
-                    $"Path: {exe}";
-            }
-            else if (code == 0)
-            {
-                McpStatusText.Text =
-                    $"⚠ Installed but can't verify connection.\n" +
-                    $"`claude mcp list` output:\n{listOut}";
-            }
-            else
-            {
-                McpStatusText.Text =
-                    $"❌ Install failed (exit {code})\n" +
-                    $"stderr: {stderr}\n" +
-                    $"stdout: {stdout}";
-            }
-        }
-        catch (FileNotFoundException ex)
-        {
-            McpStatusText.Text = $"❌ claude CLI not found: {ex.Message}";
+            var desktopResult = InstallToClaudeDesktop(exe);
+            summary.AppendLine(desktopResult);
         }
         catch (Exception ex)
         {
-            McpStatusText.Text = $"❌ Install error: {ex.Message}\n{ex.StackTrace}";
+            summary.AppendLine($"❌ Claude Desktop — error: {ex.Message}");
         }
+
+        McpStatusText.Text = summary.ToString();
+    }
+
+    /// <summary>
+    /// Merge the obsidianx-brain server entry into Claude Desktop's
+    /// claude_desktop_config.json at %APPDATA%\Claude. Preserves any
+    /// other mcpServers the user has configured. Creates the file /
+    /// directory if Claude Desktop is installed but has never been
+    /// configured before. Claude Desktop must be restarted to pick up
+    /// the change — config is read at app launch.
+    /// </summary>
+    private string InstallToClaudeDesktop(string exe)
+    {
+        var cfgPath = ClaudeDesktopConfigPath();
+        var cfgDir = Path.GetDirectoryName(cfgPath)!;
+
+        // If the Claude folder doesn't exist, Claude Desktop probably isn't
+        // installed. We still write it — harmless if the app is installed
+        // later — but flag it in the status.
+        bool wasInstalled = Directory.Exists(cfgDir);
+
+        Newtonsoft.Json.Linq.JObject config;
+        if (File.Exists(cfgPath))
+        {
+            try { config = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(cfgPath)); }
+            catch { config = new Newtonsoft.Json.Linq.JObject(); }
+        }
+        else config = new Newtonsoft.Json.Linq.JObject();
+
+        var servers = config["mcpServers"] as Newtonsoft.Json.Linq.JObject;
+        if (servers == null)
+        {
+            servers = new Newtonsoft.Json.Linq.JObject();
+            config["mcpServers"] = servers;
+        }
+
+        servers["obsidianx-brain"] = new Newtonsoft.Json.Linq.JObject
+        {
+            ["command"] = exe,
+            ["args"] = new Newtonsoft.Json.Linq.JArray(),
+            ["env"] = new Newtonsoft.Json.Linq.JObject
+            {
+                ["OBSIDIANX_VAULT"] = _vaultPath
+            }
+        };
+
+        Directory.CreateDirectory(cfgDir);
+        File.WriteAllText(cfgPath,
+            config.ToString(Newtonsoft.Json.Formatting.Indented));
+
+        return wasInstalled
+            ? $"✅ Claude Desktop — merged into {cfgPath}\n   (restart Claude Desktop to activate)"
+            : $"⚠ Claude Desktop — config written at {cfgPath}\n   (Claude Desktop not detected — install & restart it to use)";
+    }
+
+    private string UninstallFromClaudeDesktop()
+    {
+        var cfgPath = ClaudeDesktopConfigPath();
+        if (!File.Exists(cfgPath)) return "(Claude Desktop config not found)";
+
+        try
+        {
+            var config = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(cfgPath));
+            var servers = config["mcpServers"] as Newtonsoft.Json.Linq.JObject;
+            if (servers != null && servers.Remove("obsidianx-brain"))
+            {
+                File.WriteAllText(cfgPath,
+                    config.ToString(Newtonsoft.Json.Formatting.Indented));
+                return "Removed from Claude Desktop config";
+            }
+            return "(obsidianx-brain not registered in Claude Desktop)";
+        }
+        catch (Exception ex)
+        {
+            return $"Claude Desktop uninstall failed: {ex.Message}";
+        }
+    }
+
+    private static string ClaudeDesktopConfigPath()
+    {
+        var appdata = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        return Path.Combine(appdata, "Claude", "claude_desktop_config.json");
     }
 
     private async void TestMcp_Click(object s, RoutedEventArgs e)
     {
+        var sb = new System.Text.StringBuilder();
+        var exe = McpServerExePath();
+        sb.AppendLine($"▸ MCP exe: {exe}  {(File.Exists(exe) ? "(exists)" : "(MISSING — build it)")}");
+        sb.AppendLine($"▸ Vault:   {_vaultPath}");
+        sb.AppendLine();
+
+        // Claude Code CLI
         try
         {
-            McpStatusText.Text = "⏳ Checking Claude Code CLI + MCP registration…";
-
             var cli = FindClaudeCli();
             if (cli == null)
             {
-                McpStatusText.Text = "❌ claude CLI not found. Install via: npm i -g @anthropic-ai/claude-code";
-                return;
+                sb.AppendLine("▸ Claude Code CLI: ❌ not found (install: npm i -g @anthropic-ai/claude-code)");
             }
-
-            var (code, stdout, stderr) = await RunClaudeCliAsync("mcp", "list");
-            var exe = McpServerExePath();
-
-            var sb = new System.Text.StringBuilder();
-            sb.AppendLine($"▸ claude CLI: {cli}");
-            sb.AppendLine($"▸ MCP exe: {exe}  {(File.Exists(exe) ? "(exists)" : "(MISSING — build it)")}");
-            sb.AppendLine($"▸ Vault: {_vaultPath}");
-            sb.AppendLine($"▸ exit: {code}");
-            sb.AppendLine();
-            if (stdout.Contains("obsidianx-brain") && stdout.Contains("Connected"))
-                sb.AppendLine("✅ obsidianx-brain is registered AND connected");
-            else if (stdout.Contains("obsidianx-brain"))
-                sb.AppendLine("⚠ obsidianx-brain is registered but not connected");
             else
-                sb.AppendLine("❌ obsidianx-brain is NOT registered — click Install");
-            sb.AppendLine();
-            sb.Append("Raw output:\n" + stdout);
-            if (!string.IsNullOrWhiteSpace(stderr)) sb.Append("\nstderr: " + stderr);
+            {
+                var (_, stdout, _) = await RunClaudeCliAsync("mcp", "list");
+                if (stdout.Contains("obsidianx-brain") && stdout.Contains("Connected"))
+                    sb.AppendLine($"▸ Claude Code CLI: ✅ registered AND connected ({cli})");
+                else if (stdout.Contains("obsidianx-brain"))
+                    sb.AppendLine("▸ Claude Code CLI: ⚠ registered but not connected");
+                else
+                    sb.AppendLine("▸ Claude Code CLI: ❌ NOT registered");
+            }
+        }
+        catch (Exception ex) { sb.AppendLine($"▸ Claude Code CLI: ❌ error: {ex.Message}"); }
 
-            McpStatusText.Text = sb.ToString();
-        }
-        catch (Exception ex)
+        // Claude Desktop
+        try
         {
-            McpStatusText.Text = $"❌ Test failed: {ex.Message}";
+            var cfgPath = ClaudeDesktopConfigPath();
+            if (!File.Exists(cfgPath))
+                sb.AppendLine($"▸ Claude Desktop:  ❌ config not found at {cfgPath}");
+            else
+            {
+                var cfg = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(cfgPath));
+                var servers = cfg["mcpServers"] as Newtonsoft.Json.Linq.JObject;
+                if (servers?["obsidianx-brain"] != null)
+                    sb.AppendLine($"▸ Claude Desktop:  ✅ registered in {cfgPath}");
+                else
+                    sb.AppendLine($"▸ Claude Desktop:  ❌ NOT registered (config exists but no obsidianx-brain)");
+            }
         }
+        catch (Exception ex) { sb.AppendLine($"▸ Claude Desktop: ❌ error: {ex.Message}"); }
+
+        McpStatusText.Text = sb.ToString();
     }
 
     private async void UninstallMcp_Click(object s, RoutedEventArgs e)
     {
+        var sb = new System.Text.StringBuilder();
         try
         {
-            // Remove from both scopes
-            await RunClaudeCliAsync("mcp", "remove", "obsidianx-brain");
-            var (code, stdout, _) = await RunClaudeCliAsync("mcp", "remove", "obsidianx-brain", "-s", "user");
-            McpStatusText.Text = code == 0 || stdout.Contains("not found", StringComparison.OrdinalIgnoreCase)
-                ? "Uninstalled (all scopes)." : "Uninstall result:\n" + stdout;
+            await RunClaudeCliAsync("mcp", "remove", "obsidianx-brain", "-s", "local");
+            await RunClaudeCliAsync("mcp", "remove", "obsidianx-brain", "-s", "user");
+            sb.AppendLine("✓ Removed from Claude Code CLI (both scopes)");
         }
-        catch (Exception ex) { McpStatusText.Text = $"Uninstall error: {ex.Message}"; }
+        catch (Exception ex) { sb.AppendLine($"✗ Claude Code CLI uninstall: {ex.Message}"); }
+
+        sb.AppendLine("✓ " + UninstallFromClaudeDesktop());
+
+        McpStatusText.Text = sb.ToString();
     }
 
     private void CopyMcpCommand_Click(object s, RoutedEventArgs e)

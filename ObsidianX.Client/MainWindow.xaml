@@ -1423,12 +1423,13 @@
                                         <!-- Claude Code CLI Integration -->
                                         <Border Style="{StaticResource CardPanel}" Margin="0,0,0,12">
                                             <StackPanel>
-                                                <TextBlock Text="CLAUDE CODE CLI INTEGRATION (MCP)" FontSize="11" FontWeight="SemiBold"
+                                                <TextBlock Text="CLAUDE INTEGRATION (CLI + DESKTOP)" FontSize="11" FontWeight="SemiBold"
                                                            Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,8"/>
                                                 <TextBlock FontSize="11" Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap" Margin="0,0,0,12">
-                                                    Exposes your brain as MCP tools (brain_search, brain_get_note, brain_expertise, brain_list,
-                                                    brain_stats, brain_import_path) so any Claude Code CLI session — anywhere on your machine —
-                                                    can query this brain directly. No manual JSON editing.
+                                                    One click installs into BOTH Claude Code CLI (every `claude` terminal session) AND Claude Desktop
+                                                    (claude_desktop_config.json — restart the app to pick up). Your brain shows up as 6 tools —
+                                                    brain_search, brain_get_note, brain_expertise, brain_list, brain_stats, brain_import_path —
+                                                    with no manual JSON editing.
                                                 </TextBlock>
 
                                                 <TextBlock Text="Install command" FontSize="11"
