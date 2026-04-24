@@ -85,11 +85,19 @@ public partial class MainWindow : Window
     private Point3D _graphTarget = new(0, 0, 0);
 
     // Camera modes
-    private enum CameraMode { Free, FollowPulse, Orbit, Overview, RandomWalk }
+    private enum CameraMode { Free, FollowPulse, Orbit, Overview, RandomWalk, RealBrain }
     private CameraMode _cameraMode = CameraMode.Free;
     private DateTime _lastRandomTargetChange = DateTime.UtcNow;
     private int _randomTargetIdx = -1;
     private readonly Random _cameraRng = new();
+
+    // Real-brain attention state: camera dwells ≥5s per active node,
+    // queueing simultaneous events so the camera doesn't jitter between
+    // many concurrent pulses. PickNextAttention chooses the next target
+    // by max(AccessIntensity × recency) when the current dwell expires.
+    private PhysicsNode? _attentionTarget;
+    private DateTime _attentionStartedAt;
+    private const double AttentionDwellSeconds = 5.0;
 
     // Node selection
     private int? _selectedNodeDash;
@@ -203,6 +211,9 @@ public partial class MainWindow : Window
             _dashPhysics.LoadFromGraph(_graph);
             _graphPhysics.LoadFromGraph(_graph);
             UpdateUI();
+            // Mark this file's node as active so Real Brain mode glides
+            // the camera over to it (and the pulse/aura render fires).
+            BumpNodeActivityByPath(f, "write");
         };
         _mdEditor.DirtyStateChanged += dirty => EditorDirtyIndicator.Text = dirty ? " *" : "";
         MarkdownEditorControl.TextArea.Caret.PositionChanged += (_, _) =>
@@ -262,7 +273,103 @@ public partial class MainWindow : Window
             RebuildScene(FullGraphModel, _graphPhysics, _selectedNodeGraph);
             UpdateDepthBreadcrumb();
             UpdateScanline();
+            UpdateActivityLabels();
         }
+    }
+
+    /// <summary>
+    /// Float a small mono-font HUD tag next to every node that's currently
+    /// being read or written (AccessIntensity > threshold). Labels project
+    /// the node's 3D position to screen coords and fade with the pulse —
+    /// "READ · CLAUDE.md" tags like a sci-fi tactical display.
+    /// </summary>
+    private readonly List<TextBlock> _activityLabelPool = [];
+    private void UpdateActivityLabels()
+    {
+        if (ActivityLabels == null) return;
+        var w = FullGraphViewport.ActualWidth;
+        var h = FullGraphViewport.ActualHeight;
+        if (w <= 0 || h <= 0) return;
+
+        int used = 0;
+        foreach (var n in _graphPhysics.Nodes)
+        {
+            if (n.AccessIntensity < 0.12) continue;
+
+            if (!TryProjectToScreen(GraphCam, n.Position, w, h, out var sx, out var sy)) continue;
+
+            var label = GetOrCreateActivityLabel(used++);
+            var op = (DateTime.UtcNow - n.LastAccessedAt).TotalSeconds < 1.5 ? "▶ READ" : "◉ PULSE";
+            label.Text = $"{op}  {TruncateTitle(n.Title, 28)}\n{n.Category}  ·  {n.WordCount:N0} w";
+            label.Opacity = Math.Min(0.95, 0.3 + n.AccessIntensity * 0.7);
+            Canvas.SetLeft(label, sx + 14);
+            Canvas.SetTop(label, sy - 8);
+            label.Visibility = Visibility.Visible;
+        }
+
+        // Hide unused labels
+        for (int i = used; i < _activityLabelPool.Count; i++)
+            _activityLabelPool[i].Visibility = Visibility.Collapsed;
+    }
+
+    private TextBlock GetOrCreateActivityLabel(int index)
+    {
+        while (_activityLabelPool.Count <= index)
+        {
+            var tb = new TextBlock
+            {
+                FontFamily = (FontFamily)FindResource("MonoFont"),
+                FontSize = 10,
+                Foreground = (SolidColorBrush)FindResource("NeonCyanBrush"),
+                Padding = new Thickness(6, 2, 6, 2),
+                Background = new SolidColorBrush(Color.FromArgb(140, 11, 11, 26)),
+                Effect = new System.Windows.Media.Effects.DropShadowEffect
+                {
+                    Color = (Color)FindResource("NeonCyanColor"),
+                    BlurRadius = 10, ShadowDepth = 0, Opacity = 0.6
+                }
+            };
+            ActivityLabels.Children.Add(tb);
+            _activityLabelPool.Add(tb);
+        }
+        return _activityLabelPool[index];
+    }
+
+    private static string TruncateTitle(string s, int n)
+    {
+        if (string.IsNullOrEmpty(s)) return "?";
+        return s.Length > n ? s[..n] + "…" : s;
+    }
+
+    /// <summary>Project a world-space point to viewport screen coords.</summary>
+    private static bool TryProjectToScreen(PerspectiveCamera cam, Point3D world,
+        double viewportW, double viewportH, out double sx, out double sy)
+    {
+        sx = sy = -1;
+        var forward = cam.LookDirection; forward.Normalize();
+        var upIn = cam.UpDirection; upIn.Normalize();
+        var right = Vector3D.CrossProduct(forward, upIn); right.Normalize();
+        var up = Vector3D.CrossProduct(right, forward); up.Normalize();
+
+        var toWorld = world - cam.Position;
+        var cz = Vector3D.DotProduct(toWorld, forward);
+        if (cz <= 0.2) return false;   // behind or too close to camera plane
+
+        var cx = Vector3D.DotProduct(toWorld, right);
+        var cy = Vector3D.DotProduct(toWorld, up);
+
+        var fovY = cam.FieldOfView * Math.PI / 180;
+        var tanHalfY = Math.Tan(fovY / 2);
+        var aspect = viewportW / viewportH;
+        var tanHalfX = tanHalfY * aspect;
+
+        var ndcX = cx / (cz * tanHalfX);
+        var ndcY = cy / (cz * tanHalfY);
+        if (Math.Abs(ndcX) > 1.4 || Math.Abs(ndcY) > 1.4) return false;
+
+        sx = (ndcX + 1) * 0.5 * viewportW;
+        sy = (1 - (ndcY + 1) * 0.5) * viewportH;
+        return true;
     }
 
     /// <summary>
@@ -386,7 +493,76 @@ public partial class MainWindow : Window
                 }
                 break;
             }
+            case CameraMode.RealBrain:
+            {
+                // Camera visits nodes with current activity (read/write)
+                // and DWELLS for at least AttentionDwellSeconds before
+                // moving on. This prevents jitter when several pulses fire
+                // at once — subsequent events wait their turn.
+                var now = DateTime.UtcNow;
+                var dwellElapsed = _attentionTarget == null
+                    ? double.MaxValue
+                    : (now - _attentionStartedAt).TotalSeconds;
+
+                // Did the current target fade away entirely? (e.g. pulse
+                // fully decayed AND nothing new came in during dwell)
+                var currentFaded = _attentionTarget != null
+                    && _attentionTarget.AccessIntensity < 0.03
+                    && dwellElapsed > AttentionDwellSeconds;
+
+                if (_attentionTarget == null || dwellElapsed >= AttentionDwellSeconds || currentFaded)
+                {
+                    var next = PickNextAttention();
+                    if (next != null && next != _attentionTarget)
+                    {
+                        _attentionTarget = next;
+                        _attentionStartedAt = now;
+                    }
+                }
+
+                if (_attentionTarget != null)
+                {
+                    LerpGraphTarget(_attentionTarget.Position, 0.06);
+                    // Keep the target framed nicely — zoom adapts to node size
+                    var desired = Math.Max(4.0, _attentionTarget.Radius * 14);
+                    _graphDist += (desired - _graphDist) * 0.03;
+                }
+                else
+                {
+                    // No activity — drift gently toward the graph centroid
+                    var b = ComputeBounds(_graphPhysics);
+                    LerpGraphTarget(b.center, 0.015);
+                }
+                break;
+            }
         }
+    }
+
+    /// <summary>
+    /// Pick the next node deserving of camera attention. Scoring blends
+    /// current access intensity (70%) with recency of the hit (30%) so
+    /// a node that went active five seconds ago still ranks above one
+    /// that was cold for a minute. Skips the current target to force a
+    /// move when dwell expires.
+    /// </summary>
+    private PhysicsNode? PickNextAttention()
+    {
+        PhysicsNode? best = null;
+        double bestScore = 0.12;   // minimum — below this nothing qualifies
+        var now = DateTime.UtcNow;
+
+        foreach (var n in _graphPhysics.Nodes)
+        {
+            if (n == _attentionTarget) continue;
+            if (n.AccessIntensity < 0.05 && n.LastAccessedAt == DateTime.MinValue) continue;
+
+            var recency = n.LastAccessedAt > DateTime.MinValue
+                ? 1.0 / (1.0 + (now - n.LastAccessedAt).TotalSeconds * 0.3)
+                : 0;
+            var score = n.AccessIntensity * 0.7 + recency * 0.3;
+            if (score > bestScore) { bestScore = score; best = n; }
+        }
+        return best;
     }
 
     private void LerpGraphTarget(Point3D to, double t)
@@ -455,8 +631,13 @@ public partial class MainWindow : Window
         }
         else
         {
-            // Dashboard view / fallback — no fractal, everything's a leaf
-            for (int i = 0; i < visible.Length; i++) visible[i] = true;
+            // Dashboard view / fallback — no fractal, render every node
+            // that has actual content. Empty/stale nodes stay invisible.
+            for (int i = 0; i < visible.Length; i++)
+            {
+                var n = physics.Nodes[i];
+                visible[i] = n.WordCount > 0 || !string.IsNullOrWhiteSpace(n.Title);
+            }
         }
 
         // Apply MaxVisibleNodes cap only to the leaves that survived fractal walk
@@ -1405,8 +1586,17 @@ public partial class MainWindow : Window
             2 => CameraMode.Orbit,
             3 => CameraMode.Overview,
             4 => CameraMode.RandomWalk,
+            5 => CameraMode.RealBrain,
             _ => CameraMode.Free
         };
+
+        // Reset attention state so mode starts fresh
+        if (_cameraMode == CameraMode.RealBrain)
+        {
+            _attentionTarget = null;
+            _attentionStartedAt = DateTime.UtcNow;
+        }
+
         if (StatusText != null)
             StatusText.Text = $"Camera: {_cameraMode}";
     }
@@ -3538,6 +3728,24 @@ public partial class MainWindow : Window
             catch { /* storage is best-effort */ }
         }
         catch (Newtonsoft.Json.JsonException) { }
+    }
+
+    /// <summary>
+    /// Bump AccessIntensity on the node whose KnowledgeGraph file path
+    /// matches. Used for write events (editor save) and selection events
+    /// so Real Brain camera follows user activity in addition to MCP.
+    /// </summary>
+    private void BumpNodeActivityByPath(string filePath, string op)
+    {
+        if (string.IsNullOrEmpty(filePath)) return;
+        var gnode = _graph.Nodes.FirstOrDefault(
+            n => n.FilePath.Equals(filePath, StringComparison.OrdinalIgnoreCase));
+        if (gnode == null) return;
+
+        BumpPulseForNode(_dashPhysics, gnode.Id);
+        BumpPulseForNode(_graphPhysics, gnode.Id);
+        try { _storage?.LogAccess(gnode.Id, op, Path.GetFileName(filePath)); }
+        catch { /* best-effort */ }
     }
 
     private static void BumpPulseForNode(PhysicsEngine physics, string nodeId)

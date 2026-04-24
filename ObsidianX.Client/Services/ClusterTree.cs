@@ -31,6 +31,24 @@ public class ClusterTree
     public bool IsLeaf => Leaf != null;
 
     /// <summary>
+    /// True if the leaf has real content, or any descendant leaf does.
+    /// Lets the renderer drop ghost bubbles that are composed entirely
+    /// of empty/stale notes — cluster needs ≥1 leaf with actual words
+    /// OR tags to stay visible.
+    /// </summary>
+    public bool HasContent
+    {
+        get
+        {
+            if (IsLeaf)
+                return (Leaf!.WordCount > 0)
+                    || !string.IsNullOrWhiteSpace(Leaf!.Title);
+            foreach (var c in Children) if (c.HasContent) return true;
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Build a hierarchical cluster tree by recursively running label
     /// propagation on subgraphs. Stops at MinSize leaves or MaxDepth.
     /// </summary>
@@ -337,10 +355,17 @@ public class ClusterTree
         Action<PhysicsNode> onLeaf,
         Action<ClusterTree> onBubble)
     {
-        if (scope.IsLeaf) { onLeaf(scope.Leaf!); return; }
+        if (scope.IsLeaf)
+        {
+            if (scope.HasContent) onLeaf(scope.Leaf!);
+            return;
+        }
 
         foreach (var child in scope.Children)
         {
+            // Ghost bubble / stale leaf — don't render it
+            if (!child.HasContent) continue;
+
             if (child.IsLeaf) { onLeaf(child.Leaf!); continue; }
 
             // Expand this child further, or stop here and draw a bubble

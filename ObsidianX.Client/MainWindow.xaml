@@ -458,6 +458,7 @@
                                                 <ComboBoxItem Content="Orbit"/>
                                                 <ComboBoxItem Content="Overview"/>
                                                 <ComboBoxItem Content="Random Walk"/>
+                                                <ComboBoxItem Content="Real Brain (5s dwell)"/>
                                             </ComboBox>
                                             <Button Content="&#x2B06; Up" Style="{StaticResource NeonButton}"
                                                     Padding="10,3" FontSize="10" Click="ZoomOutLevel_Click" Margin="0,0,6,0"
@@ -498,6 +499,9 @@
                                         </ModelVisual3D>
                                         <ModelVisual3D x:Name="FullGraphModel"/>
                                     </Viewport3D>
+
+                                    <!-- Activity labels — HUD tags that float next to nodes being read/written -->
+                                    <Canvas x:Name="ActivityLabels" IsHitTestVisible="False" Panel.ZIndex="8"/>
 
                                     <!-- HUD CORNER BRACKETS (sci-fi frame) -->
                                     <Canvas IsHitTestVisible="False" Panel.ZIndex="9">
