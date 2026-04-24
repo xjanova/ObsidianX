@@ -594,6 +594,35 @@ public class PhysicsEngine
         }
     }
 
+    /// <summary>
+    /// Hit test that uses each node's own radius (× slack) as the tolerance.
+    /// Tight nodes get tight hit zones — empty-space hovers no longer
+    /// accidentally light up distant tiny nodes.
+    /// </summary>
+    public int? HitTestPerRadius(Point3D rayOrigin, Vector3D rayDir, double slack = 1.3)
+    {
+        rayDir.Normalize();
+        int? closest = null;
+        double bestRatio = 1.0;   // we pick the most "inside" node
+
+        for (int i = 0; i < Nodes.Count; i++)
+        {
+            var toNode = Nodes[i].Position - rayOrigin;
+            var proj = Vector3D.DotProduct(toNode, rayDir);
+            if (proj < 0) continue;
+
+            var closestPoint = rayOrigin + rayDir * proj;
+            var dist = (Nodes[i].Position - closestPoint).Length;
+            var tolerance = Math.Max(0.06, Nodes[i].Radius * slack);
+            if (dist <= tolerance)
+            {
+                var ratio = dist / tolerance;   // 0 = dead center, 1 = edge
+                if (ratio < bestRatio) { bestRatio = ratio; closest = i; }
+            }
+        }
+        return closest;
+    }
+
     public int? HitTest(Point3D rayOrigin, Vector3D rayDir, double threshold = 0.4)
     {
         rayDir.Normalize();

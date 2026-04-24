@@ -163,6 +163,7 @@ public partial class MainWindow : Window
         PopulateGraphPerfSettings();
         PopulateCustomCategories();
         StartAccessLogWatcher();
+        StartMcpStatusWatcher();
 
         // Auto-scan + export on startup, if enabled
         if (_autoScanOnStartup && (_scanPaths.Count > 0 || _scanWholeMachine))
@@ -1553,7 +1554,10 @@ public partial class MainWindow : Window
         var rayDir = lookDir + right * (ndcX * tanFov) + up * (ndcY * tanFov);
         rayDir.Normalize();
 
-        return physics.HitTest(rayOrigin, rayDir, 0.5);
+        // Tight hit — per-node radius (× 1.3 for forgiveness), not a fixed
+        // threshold. Stops the hover tooltip from popping up when the cursor
+        // is floating over empty space that just happens to be near a node.
+        return physics.HitTestPerRadius(rayOrigin, rayDir, slack: 1.3);
     }
 
     private void ShowNodeInfo(Border panel, TextBlock titleBlock, TextBlock detailBlock,
@@ -3461,6 +3465,96 @@ public partial class MainWindow : Window
         return Path.Combine(appdata, "Claude", "claude_desktop_config.json");
     }
 
+    // ═══════════════════════════════════════
+    // MCP CONNECTION STATUS BAR INDICATORS
+    // ═══════════════════════════════════════
+
+    private DispatcherTimer? _mcpStatusTimer;
+    private DateTime _lastMcpActivity = DateTime.MinValue;
+
+    private void StartMcpStatusWatcher()
+    {
+        // Read Claude config files directly — no need to spawn `claude` every tick.
+        _mcpStatusTimer = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = TimeSpan.FromSeconds(3)
+        };
+        _mcpStatusTimer.Tick += (_, _) => RefreshMcpStatusBar();
+        _mcpStatusTimer.Start();
+        RefreshMcpStatusBar();
+    }
+
+    private void RefreshMcpStatusBar()
+    {
+        if (McpCliDot == null) return;
+
+        // Claude Code CLI — check user-scope entry in ~/.claude.json
+        var cliOk = IsRegisteredInClaudeCli();
+        McpCliDot.Fill = cliOk
+            ? (SolidColorBrush)FindResource("NeonGreenBrush")
+            : new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x77));
+        McpCliStatus.Text = cliOk ? "CLI: ✓ live" : "CLI: off";
+
+        // Claude Desktop — check claude_desktop_config.json
+        var desktopOk = IsRegisteredInClaudeDesktop();
+        McpDesktopDot.Fill = desktopOk
+            ? (SolidColorBrush)FindResource("NeonGreenBrush")
+            : new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x77));
+        McpDesktopStatus.Text = desktopOk ? "Desktop: ✓ live" : "Desktop: off";
+
+        // Recent activity — seconds since last access-log event
+        var sinceLast = _lastMcpActivity == DateTime.MinValue
+            ? double.MaxValue
+            : (DateTime.UtcNow - _lastMcpActivity).TotalSeconds;
+
+        if (sinceLast < 3)
+        {
+            McpActivityDot.Fill = (SolidColorBrush)FindResource("NeonCyanBrush");
+            McpActivityStatus.Text = "ACTIVE";
+            McpActivityStatus.Foreground = (SolidColorBrush)FindResource("NeonCyanBrush");
+        }
+        else if (sinceLast < 30)
+        {
+            McpActivityDot.Fill = (SolidColorBrush)FindResource("NeonGreenBrush");
+            McpActivityStatus.Text = $"{(int)sinceLast}s ago";
+            McpActivityStatus.Foreground = (SolidColorBrush)FindResource("TextSecondaryBrush");
+        }
+        else
+        {
+            McpActivityDot.Fill = new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x77));
+            McpActivityStatus.Text = "idle";
+            McpActivityStatus.Foreground = (SolidColorBrush)FindResource("TextMutedBrush");
+        }
+    }
+
+    private static bool IsRegisteredInClaudeCli()
+    {
+        try
+        {
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var path = Path.Combine(home, ".claude.json");
+            if (!File.Exists(path)) return false;
+            var json = File.ReadAllText(path);
+            // Quick contains — way cheaper than full JSON parse every 3s
+            return json.Contains("\"obsidianx-brain\"", StringComparison.Ordinal);
+        }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
+    }
+
+    private static bool IsRegisteredInClaudeDesktop()
+    {
+        try
+        {
+            var cfg = ClaudeDesktopConfigPath();
+            if (!File.Exists(cfg)) return false;
+            return File.ReadAllText(cfg)
+                .Contains("\"obsidianx-brain\"", StringComparison.Ordinal);
+        }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
+    }
+
     private async void TestMcp_Click(object s, RoutedEventArgs e)
     {
         var sb = new System.Text.StringBuilder();
@@ -3853,6 +3947,7 @@ public partial class MainWindow : Window
             if (newEvents > 0)
             {
                 _recentAccessCount += newEvents;
+                _lastMcpActivity = DateTime.UtcNow;    // status-bar activity LED
                 StatusText.Text = $"🧠 Claude pulled knowledge · {newEvents} node(s) pulsed · total session: {_recentAccessCount}";
             }
         }

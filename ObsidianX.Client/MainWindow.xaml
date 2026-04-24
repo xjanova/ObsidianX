@@ -1528,6 +1528,26 @@
                             <Ellipse x:Name="StatusDot" Width="6" Height="6" Fill="{StaticResource NeonGreenBrush}" Margin="0,0,6,0"/>
                             <TextBlock x:Name="StatusText" Text="Ready" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
                         </StackPanel>
+
+                        <!-- MCP / Claude connection indicators in the middle -->
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
+                            <Ellipse x:Name="McpCliDot" Width="6" Height="6" Fill="#555577" Margin="0,0,4,0"
+                                     ToolTip="Claude Code CLI registration status"/>
+                            <TextBlock x:Name="McpCliStatus" Text="CLI: ?" FontSize="10"
+                                       FontFamily="{StaticResource MonoFont}"
+                                       Foreground="{StaticResource TextMutedBrush}" Margin="0,0,14,0"/>
+                            <Ellipse x:Name="McpDesktopDot" Width="6" Height="6" Fill="#555577" Margin="0,0,4,0"
+                                     ToolTip="Claude Desktop registration status"/>
+                            <TextBlock x:Name="McpDesktopStatus" Text="Desktop: ?" FontSize="10"
+                                       FontFamily="{StaticResource MonoFont}"
+                                       Foreground="{StaticResource TextMutedBrush}" Margin="0,0,14,0"/>
+                            <Ellipse x:Name="McpActivityDot" Width="6" Height="6" Fill="#555577" Margin="0,0,4,0"
+                                     ToolTip="Recent MCP activity (access-log tail)"/>
+                            <TextBlock x:Name="McpActivityStatus" Text="idle" FontSize="10"
+                                       FontFamily="{StaticResource MonoFont}"
+                                       Foreground="{StaticResource TextMutedBrush}"/>
+                        </StackPanel>
+
                         <TextBlock x:Name="VersionText" Text="ObsidianX v2.0.0" FontSize="10"
                                    Foreground="{StaticResource TextMutedBrush}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
                     </Grid>
