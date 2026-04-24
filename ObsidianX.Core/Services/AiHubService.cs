@@ -38,12 +38,13 @@ public class AiHubService
 
     public IReadOnlyDictionary<string, IAiBackend> Backends => _backends;
 
-    public async Task<ChatReply> ChatAsync(
-        string userMessage,
-        string? backendName = null,
-        string? model = null,
-        List<ChatMessage>? history = null,
-        CancellationToken ct = default)
+    /// <summary>
+    /// Build a full prompt (system + history + user) and the list of
+    /// brain note ids used as context. Shared between Chat and Stream
+    /// so both paths inject the same brain grounding.
+    /// </summary>
+    public (ChatRequest request, List<string> noteIds, IAiBackend backend) PrepareRequest(
+        string userMessage, string? backendName, string? model, List<ChatMessage>? history)
     {
         backendName ??= DefaultBackend;
         model ??= DefaultModel;
@@ -53,25 +54,68 @@ public class AiHubService
 
         var (contextText, noteIds) = BuildBrainContext(userMessage);
 
-        var messages = new List<ChatMessage>();
-        messages.Add(new ChatMessage
+        var messages = new List<ChatMessage>
         {
-            Role = "system",
-            Content = BuildSystemPrompt(contextText)
-        });
+            new() { Role = "system", Content = BuildSystemPrompt(contextText) }
+        };
         if (history != null) messages.AddRange(history);
         messages.Add(new ChatMessage { Role = "user", Content = userMessage });
 
-        var reply = await backend.ChatAsync(new ChatRequest
+        foreach (var id in noteIds) AppendAccessLog(id, "ai_context", $"{backend.Name}:{model}");
+
+        return (new ChatRequest
         {
             Model = model,
             Messages = messages,
             Temperature = 0.7,
             MaxTokens = 2048
-        }, ct);
+        }, noteIds, backend);
+    }
 
+    public async IAsyncEnumerable<string> StreamAsync(
+        string userMessage,
+        string? backendName = null,
+        string? model = null,
+        List<ChatMessage>? history = null,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var (request, _, backend) = PrepareRequest(userMessage, backendName, model, history);
+        await foreach (var delta in backend.StreamAsync(request, ct))
+            yield return delta;
+    }
+
+    public async Task<ChatReply> ChatAsync(
+        string userMessage,
+        string? backendName = null,
+        string? model = null,
+        List<ChatMessage>? history = null,
+        CancellationToken ct = default)
+    {
+        var (request, noteIds, backend) = PrepareRequest(userMessage, backendName, model, history);
+        var reply = await backend.ChatAsync(request, ct);
         reply.ContextNoteIds = noteIds;
         return reply;
+    }
+
+    private void AppendAccessLog(string nodeId, string op, string context)
+    {
+        try
+        {
+            var logPath = Path.Combine(_vaultPath, ".obsidianx", "access-log.ndjson");
+            Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+            var line = new
+            {
+                ts = DateTime.UtcNow.ToString("O"),
+                node_id = nodeId,
+                op,
+                client = "aihub",
+                context
+            };
+            File.AppendAllText(logPath,
+                JsonConvert.SerializeObject(line) + "\n");
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 
     private string BuildSystemPrompt(string brainContext)

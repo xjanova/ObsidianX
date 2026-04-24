@@ -1,3 +1,4 @@
+using System.Text;
 using ObsidianX.Server.Hubs;
 using ObsidianX.Core.Services;
 
@@ -217,6 +218,213 @@ app.MapPost("/api/ai/chat", async (AiChatRequest req) =>
         return Results.BadRequest(new { error = ex.Message, type = ex.GetType().Name });
     }
 });
+
+// SSE streaming chat — shows tokens as the model produces them. Used by
+// the client's chat widget and any dashboard that wants live output.
+app.MapPost("/api/ai/stream", async (HttpContext ctx, AiChatRequest req) =>
+{
+    var hub = BuildHub();
+    ctx.Response.Headers.ContentType = "text/event-stream";
+    ctx.Response.Headers.CacheControl = "no-cache";
+    await ctx.Response.Body.FlushAsync();
+
+    try
+    {
+        await foreach (var piece in hub.StreamAsync(
+            req.Message, req.Backend, req.Model, req.History, ctx.RequestAborted))
+        {
+            var payload = Newtonsoft.Json.JsonConvert.SerializeObject(new { delta = piece });
+            await ctx.Response.WriteAsync($"data: {payload}\n\n");
+            await ctx.Response.Body.FlushAsync();
+        }
+        await ctx.Response.WriteAsync("data: {\"done\":true}\n\n");
+    }
+    catch (Exception ex)
+    {
+        var err = Newtonsoft.Json.JsonConvert.SerializeObject(new { error = ex.Message });
+        await ctx.Response.WriteAsync($"data: {err}\n\n");
+    }
+});
+
+// ─────────────── OpenAI-compatible chat completions ───────────────
+// Any tool that speaks OpenAI (Cursor, Continue.dev, Aider, Open WebUI,
+// LibreChat, custom scripts) can set OPENAI_BASE_URL to
+// http://localhost:5142/v1 and transparently get brain-grounded
+// responses from the local backend.
+app.MapPost("/v1/chat/completions", async (HttpContext ctx) =>
+{
+    using var sr = new StreamReader(ctx.Request.Body);
+    var rawBody = await sr.ReadToEndAsync();
+    var body = Newtonsoft.Json.Linq.JObject.Parse(rawBody);
+
+    var messages = (body["messages"] as Newtonsoft.Json.Linq.JArray ?? [])
+        .Select(m => new ChatMessage
+        {
+            Role = m["role"]?.ToString() ?? "user",
+            Content = m["content"]?.ToString() ?? ""
+        }).ToList();
+    var last = messages.LastOrDefault(m => m.Role == "user");
+    var userMsg = last?.Content ?? "";
+    var history = messages.Where(m => m != last).ToList();
+
+    var model = body["model"]?.ToString();
+    var stream = body["stream"]?.ToObject<bool>() ?? false;
+    var hub = BuildHub();
+
+    if (!stream)
+    {
+        var reply = await hub.ChatAsync(userMsg, model: model, history: history);
+        return Results.Ok(new
+        {
+            id = "chatcmpl-" + Guid.NewGuid().ToString("N")[..12],
+            @object = "chat.completion",
+            created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            model = reply.Model,
+            choices = new[] { new
+            {
+                index = 0,
+                message = new { role = "assistant", content = reply.Content },
+                finish_reason = "stop"
+            }},
+            usage = new
+            {
+                prompt_tokens = reply.PromptTokens,
+                completion_tokens = reply.CompletionTokens,
+                total_tokens = reply.PromptTokens + reply.CompletionTokens
+            },
+            context_notes = reply.ContextNoteIds
+        });
+    }
+
+    // Streamed variant — SSE chunks in OpenAI delta format
+    ctx.Response.Headers.ContentType = "text/event-stream";
+    ctx.Response.Headers.CacheControl = "no-cache";
+    var completionId = "chatcmpl-" + Guid.NewGuid().ToString("N")[..12];
+    var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+    await foreach (var delta in hub.StreamAsync(userMsg, model: model, history: history, ct: ctx.RequestAborted))
+    {
+        var chunk = new
+        {
+            id = completionId,
+            @object = "chat.completion.chunk",
+            created,
+            model = model ?? "local",
+            choices = new[] { new { index = 0, delta = new { content = delta }, finish_reason = (string?)null } }
+        };
+        await ctx.Response.WriteAsync("data: " + Newtonsoft.Json.JsonConvert.SerializeObject(chunk) + "\n\n");
+        await ctx.Response.Body.FlushAsync();
+    }
+    await ctx.Response.WriteAsync("data: [DONE]\n\n");
+    return Results.Empty;
+});
+
+// ─────────────── Anthropic-compatible messages ───────────────
+// Lets Claude Code / Claude SDK clients set ANTHROPIC_BASE_URL to
+// http://localhost:5142 and get responses from a LOCAL model (Ollama)
+// with the brain auto-attached as context. Nothing leaves the
+// machine. Minimal shape — supports /v1/messages one-shot and SSE.
+app.MapPost("/v1/messages", async (HttpContext ctx) =>
+{
+    using var sr = new StreamReader(ctx.Request.Body);
+    var body = Newtonsoft.Json.Linq.JObject.Parse(await sr.ReadToEndAsync());
+
+    // Anthropic request: { model, messages: [{role, content}], system?, stream? }
+    var systemPrompt = body["system"]?.ToString();
+    var messagesArr = body["messages"] as Newtonsoft.Json.Linq.JArray ?? [];
+    var messages = messagesArr.Select(m => new ChatMessage
+    {
+        Role = m["role"]?.ToString() ?? "user",
+        Content = FlattenAnthropicContent(m["content"])
+    }).ToList();
+
+    var last = messages.LastOrDefault(m => m.Role == "user");
+    var userMsg = last?.Content ?? "";
+    var history = messages.Where(m => m != last).ToList();
+    if (!string.IsNullOrEmpty(systemPrompt))
+        history.Insert(0, new ChatMessage { Role = "system", Content = systemPrompt });
+
+    var model = body["model"]?.ToString();
+    var stream = body["stream"]?.ToObject<bool>() ?? false;
+    var hub = BuildHub();
+
+    if (!stream)
+    {
+        var reply = await hub.ChatAsync(userMsg, model: model, history: history);
+        return Results.Ok(new
+        {
+            id = "msg_" + Guid.NewGuid().ToString("N")[..16],
+            type = "message",
+            role = "assistant",
+            content = new[] { new { type = "text", text = reply.Content } },
+            model = reply.Model,
+            stop_reason = "end_turn",
+            usage = new
+            {
+                input_tokens = reply.PromptTokens,
+                output_tokens = reply.CompletionTokens
+            }
+        });
+    }
+
+    // SSE stream in Anthropic's event format
+    ctx.Response.Headers.ContentType = "text/event-stream";
+    ctx.Response.Headers.CacheControl = "no-cache";
+    var msgId = "msg_" + Guid.NewGuid().ToString("N")[..16];
+
+    await WriteSse(ctx, "message_start", new
+    {
+        type = "message_start",
+        message = new { id = msgId, type = "message", role = "assistant",
+            content = Array.Empty<object>(), model, stop_reason = (string?)null,
+            usage = new { input_tokens = 0, output_tokens = 0 } }
+    });
+    await WriteSse(ctx, "content_block_start", new
+    {
+        type = "content_block_start",
+        index = 0,
+        content_block = new { type = "text", text = "" }
+    });
+
+    await foreach (var delta in hub.StreamAsync(userMsg, model: model, history: history, ct: ctx.RequestAborted))
+    {
+        await WriteSse(ctx, "content_block_delta", new
+        {
+            type = "content_block_delta",
+            index = 0,
+            delta = new { type = "text_delta", text = delta }
+        });
+    }
+
+    await WriteSse(ctx, "content_block_stop", new { type = "content_block_stop", index = 0 });
+    await WriteSse(ctx, "message_stop", new { type = "message_stop" });
+    return Results.Empty;
+});
+
+static async Task WriteSse(HttpContext ctx, string evt, object data)
+{
+    var json = Newtonsoft.Json.JsonConvert.SerializeObject(data);
+    await ctx.Response.WriteAsync($"event: {evt}\ndata: {json}\n\n");
+    await ctx.Response.Body.FlushAsync();
+}
+
+/// <summary>Anthropic content is either a string or an array of blocks
+/// ({type:text, text:...}). Flatten both to a plain string for our Hub.</summary>
+static string FlattenAnthropicContent(Newtonsoft.Json.Linq.JToken? content)
+{
+    if (content == null) return "";
+    if (content is Newtonsoft.Json.Linq.JValue v) return v.ToString() ?? "";
+    if (content is Newtonsoft.Json.Linq.JArray arr)
+    {
+        var sb = new StringBuilder();
+        foreach (var block in arr)
+        {
+            var type = block["type"]?.ToString();
+            if (type == "text") sb.AppendLine(block["text"]?.ToString());
+        }
+        return sb.ToString().TrimEnd();
+    }
+    return content.ToString();
+}
 
 // SignalR hub for real-time brain connections
 app.MapHub<BrainHub>("/brain-hub");

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Net.Http;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -169,6 +170,7 @@ public partial class MainWindow : Window
         PopulateCustomCategories();
         StartAccessLogWatcher();
         StartMcpStatusWatcher();
+        _ = LoadAiBackends();
 
         // Auto-scan + export on startup, if enabled
         if (_autoScanOnStartup && (_scanPaths.Count > 0 || _scanWholeMachine))
@@ -2440,20 +2442,120 @@ public partial class MainWindow : Window
     {
         var q = ClaudeInput.Text.Trim();
         if (string.IsNullOrEmpty(q)) return;
-        ClaudeOutput.Text += $"\n\n> YOU: {q}\n\nClaude is thinking...";
+
+        var backend = (AiBackendCombo?.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "ollama";
+        var model = (AiModelCombo?.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "llama3.2:3b";
+
+        ClaudeOutput.Text += $"\n\n> YOU: {q}\n\n{backend}/{model}: ";
         ClaudeInput.Text = "";
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var startLen = ClaudeOutput.Text.Length;
         try
         {
-            var r = await _claude.QueryClaude(q);
-            ClaudeOutput.Text = ClaudeOutput.Text.Replace("Claude is thinking...", $"CLAUDE: {r}");
+            using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
+            var payload = Newtonsoft.Json.JsonConvert.SerializeObject(new
+            {
+                message = q, backend, model, stream = true
+            });
+            using var req = new HttpRequestMessage(HttpMethod.Post, _serverUrl.Replace("/brain-hub", "") + "/api/ai/stream")
+            {
+                Content = new StringContent(payload, System.Text.Encoding.UTF8, "application/json")
+            };
+            using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
+            resp.EnsureSuccessStatusCode();
+            using var stream = await resp.Content.ReadAsStreamAsync();
+            using var sr = new StreamReader(stream);
+            string? line;
+            while ((line = await sr.ReadLineAsync()) != null)
+            {
+                if (!line.StartsWith("data: ")) continue;
+                var json = line[6..];
+                try
+                {
+                    var obj = Newtonsoft.Json.Linq.JObject.Parse(json);
+                    var delta = obj["delta"]?.ToString();
+                    if (!string.IsNullOrEmpty(delta))
+                    {
+                        ClaudeOutput.Text += delta;
+                    }
+                    if (obj["done"]?.ToObject<bool>() == true) break;
+                    var err = obj["error"]?.ToString();
+                    if (!string.IsNullOrEmpty(err))
+                    {
+                        ClaudeOutput.Text += $"\n[error: {err}]";
+                        break;
+                    }
+                }
+                catch { }
+            }
         }
         catch (Exception ex)
         {
-            ClaudeOutput.Text = ClaudeOutput.Text.Replace("Claude is thinking...", $"[Error: {ex.Message}]");
+            ClaudeOutput.Text += $"\n[Error: {ex.Message}]";
         }
+        sw.Stop();
+        if (AiLatencyText != null)
+            AiLatencyText.Text = $"{sw.ElapsedMilliseconds}ms · {ClaudeOutput.Text.Length - startLen}c";
     }
 
     private void ClaudeInput_KeyDown(object s, KeyEventArgs e) { if (e.Key == Key.Enter) AskClaude_Click(s, e); }
+
+    // ═══════════════════════════════════════
+    // AI HUB — backend + model selector
+    // ═══════════════════════════════════════
+
+    private async void RefreshAiBackends_Click(object s, RoutedEventArgs e) => await LoadAiBackends();
+
+    private async Task LoadAiBackends()
+    {
+        if (AiBackendCombo == null) return;
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            var url = _serverUrl.Replace("/brain-hub", "") + "/api/ai/backends";
+            var json = await http.GetStringAsync(url);
+            var root = Newtonsoft.Json.Linq.JObject.Parse(json);
+
+            AiBackendCombo.Items.Clear();
+            AiModelCombo.Items.Clear();
+            var backends = root["backends"] as Newtonsoft.Json.Linq.JArray ?? [];
+            foreach (var be in backends)
+            {
+                var name = be["name"]?.ToString() ?? "";
+                var avail = be["available"]?.ToObject<bool>() ?? false;
+                AiBackendCombo.Items.Add(new ComboBoxItem
+                {
+                    Content = name,
+                    Tag = be["models"],
+                    Foreground = avail
+                        ? (SolidColorBrush)FindResource("TextPrimaryBrush")
+                        : (SolidColorBrush)FindResource("TextMutedBrush")
+                });
+            }
+            if (AiBackendCombo.Items.Count > 0) AiBackendCombo.SelectedIndex = 0;
+
+            if (ClaudeViewStatus != null)
+                ClaudeViewStatus.Text = $"{backends.Count} backend(s) available · default model: {root["defaultModel"]}";
+        }
+        catch (Exception ex)
+        {
+            if (ClaudeViewStatus != null)
+                ClaudeViewStatus.Text = $"AI Hub unreachable: {ex.Message}. Start the server.";
+        }
+    }
+
+    private void AiBackend_Changed(object s, SelectionChangedEventArgs e)
+    {
+        if (AiBackendCombo?.SelectedItem is not ComboBoxItem item) return;
+        if (item.Tag is not Newtonsoft.Json.Linq.JArray models) return;
+        AiModelCombo.Items.Clear();
+        foreach (var m in models)
+        {
+            AiModelCombo.Items.Add(new ComboBoxItem { Content = m.ToString() });
+        }
+        if (AiModelCombo.Items.Count > 0) AiModelCombo.SelectedIndex = 0;
+    }
 
     private void PopulateVaultTree()
     {

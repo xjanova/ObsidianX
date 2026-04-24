@@ -20,9 +20,15 @@ public interface IAiBackend
     /// <summary>
     /// One-shot chat: send the full conversation (including any system
     /// prompt the Hub injected), return the assistant's complete text.
-    /// Streaming comes in a later pass.
     /// </summary>
     Task<ChatReply> ChatAsync(ChatRequest request, CancellationToken ct = default);
+
+    /// <summary>
+    /// Streaming chat — yields text deltas as the model produces them.
+    /// Used by SSE endpoints so clients can show tokens as they arrive
+    /// instead of waiting 30s for a 200-word reply.
+    /// </summary>
+    IAsyncEnumerable<string> StreamAsync(ChatRequest request, CancellationToken ct = default);
 }
 
 public class ChatRequest

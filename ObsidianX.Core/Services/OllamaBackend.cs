@@ -53,6 +53,46 @@ public class OllamaBackend : IAiBackend
         catch { return []; }
     }
 
+    public async IAsyncEnumerable<string> StreamAsync(ChatRequest request,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var payload = new JObject
+        {
+            ["model"] = request.Model,
+            ["stream"] = true,
+            ["messages"] = new JArray(request.Messages.Select(m => new JObject
+            {
+                ["role"] = m.Role,
+                ["content"] = m.Content
+            })),
+            ["options"] = new JObject
+            {
+                ["temperature"] = request.Temperature,
+                ["num_predict"] = request.MaxTokens
+            }
+        };
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/api/chat")
+        {
+            Content = new StringContent(payload.ToString(), Encoding.UTF8, "application/json")
+        };
+        using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+        resp.EnsureSuccessStatusCode();
+
+        using var stream = await resp.Content.ReadAsStreamAsync(ct);
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        string? line;
+        while ((line = await reader.ReadLineAsync(ct)) != null)
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            JObject obj;
+            try { obj = JObject.Parse(line); } catch { continue; }
+            var piece = obj["message"]?["content"]?.ToString();
+            if (!string.IsNullOrEmpty(piece)) yield return piece;
+            if (obj["done"]?.ToObject<bool>() == true) break;
+        }
+    }
+
     public async Task<ChatReply> ChatAsync(ChatRequest request, CancellationToken ct = default)
     {
         var sw = Stopwatch.StartNew();
