@@ -13,6 +13,13 @@
     <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.11" />
     <PackageReference Include="MySqlConnector" Version="2.4.0" />
+    <!-- Full YAML frontmatter parsing — replaces the regex tag-only
+         extractor so users can put any structured data in the note
+         header (Obsidian-compatible Properties). -->
+    <PackageReference Include="YamlDotNet" Version="16.2.1" />
+    <!-- PDF text extraction. Pure-managed (no native deps), Apache 2.0,
+         handles password-free PDFs which is what the indexer needs. -->
+    <PackageReference Include="PdfPig" Version="0.1.10" />
   </ItemGroup>
 
 </Project>

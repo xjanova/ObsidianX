@@ -223,6 +223,75 @@ internal static class Program
                         ["text"] = new JObject { ["type"] = "string", ["description"] = "the thought to remember (markdown ok)" }
                     },
                     ["required"] = new JArray { "text" }
+                }),
+            Tool("brain_get_backlinks",
+                "Return every note that links INTO the given note id (incoming links). " +
+                "Use when the user asks 'what references this?', 'what mentions X?', or " +
+                "to find context for a note before editing it.",
+                new JObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JObject
+                    {
+                        ["id"] = new JObject { ["type"] = "string", ["description"] = "note id from brain_search/list" },
+                        ["limit"] = new JObject { ["type"] = "integer", ["default"] = 50 }
+                    },
+                    ["required"] = new JArray { "id" }
+                }),
+            Tool("brain_semantic_search",
+                "Embedding-based semantic search — finds notes whose meaning is close to the query, " +
+                "even when no keywords overlap. Falls back to keyword search if Ollama is unreachable. " +
+                "Use this when the user asks an open-ended question or you need topical neighbors " +
+                "rather than exact-match hits.",
+                new JObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JObject
+                    {
+                        ["query"] = new JObject { ["type"] = "string", ["description"] = "natural-language query" },
+                        ["limit"] = new JObject { ["type"] = "integer", ["default"] = 10 }
+                    },
+                    ["required"] = new JArray { "query" }
+                }),
+            Tool("brain_synthesize",
+                "Pull the top-K most relevant notes (semantic + keyword), pack their content into a " +
+                "single context bundle, and return for the caller LLM to summarize. Use when the user " +
+                "asks 'what do I know about X', 'summarize my notes on Y', 'is there evidence for Z'.",
+                new JObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JObject
+                    {
+                        ["question"] = new JObject { ["type"] = "string", ["description"] = "the question to research" },
+                        ["limit"] = new JObject { ["type"] = "integer", ["default"] = 8, ["description"] = "max notes to bundle" }
+                    },
+                    ["required"] = new JArray { "question" }
+                }),
+            Tool("brain_suggest_links",
+                "Recommend new wiki-links to add to a note based on semantic similarity to other notes " +
+                "in the brain. Returns top candidates with similarity score so the user can decide " +
+                "which to author. Use when the user says 'what should this link to', 'find related notes'.",
+                new JObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JObject
+                    {
+                        ["id"] = new JObject { ["type"] = "string", ["description"] = "source note id" },
+                        ["limit"] = new JObject { ["type"] = "integer", ["default"] = 8 }
+                    },
+                    ["required"] = new JArray { "id" }
+                }),
+            Tool("brain_find_contradictions",
+                "Scan the brain for note pairs that share keywords/topic but disagree (different " +
+                "categories, contradictory tags, or opposite framing). Returns suspicious pairs so " +
+                "the user can reconcile them. Best used periodically as a knowledge-hygiene check.",
+                new JObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JObject
+                    {
+                        ["limit"] = new JObject { ["type"] = "integer", ["default"] = 20 }
+                    }
                 })
         }
     });
@@ -245,15 +314,20 @@ internal static class Program
         {
             JToken result = name switch
             {
-                "brain_search"       => BrainSearch(args),
-                "brain_get_note"     => BrainGetNote(args),
-                "brain_expertise"    => BrainExpertise(),
-                "brain_list"         => BrainList(args),
-                "brain_stats"        => BrainStats(),
-                "brain_import_path"  => BrainImportPath(args),
-                "brain_create_note"  => BrainCreateNote(args),
-                "brain_append_note"  => BrainAppendNote(args),
-                "brain_remember"     => BrainRemember(args),
+                "brain_search"              => BrainSearch(args),
+                "brain_get_note"            => BrainGetNote(args),
+                "brain_expertise"           => BrainExpertise(),
+                "brain_list"                => BrainList(args),
+                "brain_stats"               => BrainStats(),
+                "brain_import_path"         => BrainImportPath(args),
+                "brain_create_note"         => BrainCreateNote(args),
+                "brain_append_note"         => BrainAppendNote(args),
+                "brain_remember"            => BrainRemember(args),
+                "brain_get_backlinks"       => BrainGetBacklinks(args),
+                "brain_semantic_search"     => BrainSemanticSearch(args),
+                "brain_synthesize"          => BrainSynthesize(args),
+                "brain_suggest_links"       => BrainSuggestLinks(args),
+                "brain_find_contradictions" => BrainFindContradictions(args),
                 _ => throw new InvalidOperationException($"unknown tool: {name}")
             };
 
@@ -650,6 +724,380 @@ internal static class Program
                 ["text"] = File.ReadAllText(file)
             }}
         });
+    }
+
+    // ───────────── L2/L3 reasoning tools ─────────────
+
+    /// <summary>
+    /// Reverse links — every note that points INTO the given id. Reads
+    /// the precomputed BacklinkIds populated by KnowledgeIndexer's
+    /// post-edge pass, so this is O(1) lookup + O(B) projection.
+    /// </summary>
+    private static JToken BrainGetBacklinks(JObject args)
+    {
+        var nodeId = args["id"]?.ToString() ?? throw new ArgumentException("id is required");
+        var limit = args["limit"]?.ToObject<int>() ?? 50;
+        var export = LoadExport() ?? throw new InvalidOperationException("no brain-export");
+        var node = export.Nodes.FirstOrDefault(n => n.Id == nodeId)
+            ?? throw new InvalidOperationException($"note not found: {nodeId}");
+
+        var byId = export.Nodes.ToDictionary(n => n.Id, n => n);
+        var backlinks = node.BacklinkIds
+            .Where(byId.ContainsKey)
+            .Select(id => byId[id])
+            .OrderByDescending(n => n.Importance)
+            .Take(limit)
+            .Select(n => new JObject
+            {
+                ["id"] = n.Id,
+                ["title"] = n.Title,
+                ["category"] = n.PrimaryCategory,
+                ["tags"] = new JArray(n.Tags),
+                ["path"] = n.RelativePath,
+                ["preview"] = n.Preview
+            });
+        LogAccess(node.Id, "get_backlinks", node.Title);
+        return new JObject
+        {
+            ["target"] = new JObject
+            {
+                ["id"] = node.Id,
+                ["title"] = node.Title
+            },
+            ["count"] = node.BacklinkIds.Count,
+            ["backlinks"] = new JArray(backlinks)
+        };
+    }
+
+    /// <summary>
+    /// Semantic search. Tries Ollama nomic-embed-text first to embed the
+    /// query and rank notes by cosine similarity over precomputed
+    /// embeddings. If Ollama is unreachable or no embeddings have been
+    /// computed yet, falls through to the keyword scorer so callers
+    /// always get an answer. The fallback path is what makes "semantic"
+    /// search safe to ship before embeddings are universally indexed.
+    /// </summary>
+    private static JToken BrainSemanticSearch(JObject args)
+    {
+        var query = args["query"]?.ToString() ?? "";
+        var limit = args["limit"]?.ToObject<int>() ?? 10;
+        if (string.IsNullOrWhiteSpace(query)) throw new ArgumentException("query is required");
+        var export = LoadExport() ?? throw new InvalidOperationException("no brain-export");
+
+        // Try Ollama embedding — non-blocking, swallow any error
+        // (network, model not pulled, daemon not running) and fall
+        // back to keyword search so the tool always answers.
+        var queryVec = OllamaEmbed(query);
+        List<(NodeSummary node, double score)> ranked;
+        string mode;
+        if (queryVec != null)
+        {
+            ranked = new List<(NodeSummary, double)>(export.Nodes.Count);
+            foreach (var n in export.Nodes)
+            {
+                var stored = LoadEmbedding(n.Id);
+                if (stored == null) continue;
+                ranked.Add((n, Cosine(queryVec, stored)));
+            }
+            ranked = ranked
+                .OrderByDescending(x => x.score)
+                .Take(limit)
+                .ToList();
+            mode = ranked.Count > 0 ? "semantic" : "keyword-fallback";
+        }
+        else
+        {
+            mode = "keyword-fallback";
+            ranked = new();
+        }
+
+        if (ranked.Count == 0)
+        {
+            // Either Ollama is offline or no embeddings exist yet.
+            // Keyword fallback so callers always get useful output.
+            var ql = query.ToLowerInvariant();
+            ranked = export.Nodes
+                .Select(n => (n, ScoreNode(n, ql)))
+                .Where(x => x.Item2 > 0)
+                .OrderByDescending(x => x.Item2)
+                .Take(limit)
+                .ToList();
+        }
+
+        foreach (var (n, _) in ranked) LogAccess(n.Id, "semantic_search", query);
+        return new JObject
+        {
+            ["query"] = query,
+            ["mode"] = mode,
+            ["count"] = ranked.Count,
+            ["results"] = new JArray(ranked.Select(x => new JObject
+            {
+                ["id"] = x.node.Id,
+                ["title"] = x.node.Title,
+                ["score"] = Math.Round(x.score, 4),
+                ["category"] = x.node.PrimaryCategory,
+                ["tags"] = new JArray(x.node.Tags),
+                ["path"] = x.node.RelativePath,
+                ["preview"] = x.node.Preview
+            }))
+        };
+    }
+
+    /// <summary>
+    /// "What do I know about X" — pulls top-K semantic+keyword matches,
+    /// loads their full content, and returns the bundle as a single
+    /// context blob the caller LLM can summarise. Saves the user a
+    /// round-trip through search → get_note → manual concat.
+    /// </summary>
+    private static JToken BrainSynthesize(JObject args)
+    {
+        var question = args["question"]?.ToString() ?? "";
+        var limit = args["limit"]?.ToObject<int>() ?? 8;
+        if (string.IsNullOrWhiteSpace(question)) throw new ArgumentException("question is required");
+        var export = LoadExport() ?? throw new InvalidOperationException("no brain-export");
+
+        // Reuse semantic search to pick candidates
+        var hits = ((JObject)BrainSemanticSearch(new JObject
+        {
+            ["query"] = question, ["limit"] = limit
+        }))["results"] as JArray ?? new JArray();
+
+        var bundle = new JArray();
+        foreach (var h in hits)
+        {
+            var id = h["id"]?.ToString();
+            if (string.IsNullOrEmpty(id)) continue;
+            var node = export.Nodes.FirstOrDefault(n => n.Id == id);
+            if (node == null) continue;
+            var fullPath = Path.Combine(export.VaultPath, node.RelativePath);
+            var body = File.Exists(fullPath) ? File.ReadAllText(fullPath) : node.Preview;
+            // Cap each note at 4 KB so a "summarize my brain" call doesn't
+            // pack 200K of context for the caller LLM. The summariser can
+            // come back for more detail via brain_get_note.
+            if (body.Length > 4000) body = body[..4000] + "\n\n[…truncated…]";
+            bundle.Add(new JObject
+            {
+                ["id"] = node.Id,
+                ["title"] = node.Title,
+                ["path"] = node.RelativePath,
+                ["category"] = node.PrimaryCategory,
+                ["tags"] = new JArray(node.Tags),
+                ["content"] = body
+            });
+            LogAccess(node.Id, "synthesize", question);
+        }
+
+        return new JObject
+        {
+            ["question"] = question,
+            ["sourceCount"] = bundle.Count,
+            ["instruction"] = "Summarise the following notes to answer the question. " +
+                              "Cite each source by title when you use it.",
+            ["sources"] = bundle
+        };
+    }
+
+    /// <summary>
+    /// Suggest new wiki-links for a given note: finds high-similarity
+    /// neighbours that aren't already linked. Score is semantic when
+    /// embeddings are available, keyword otherwise — same fallback chain
+    /// as <see cref="BrainSemanticSearch"/>.
+    /// </summary>
+    private static JToken BrainSuggestLinks(JObject args)
+    {
+        var nodeId = args["id"]?.ToString() ?? throw new ArgumentException("id is required");
+        var limit = args["limit"]?.ToObject<int>() ?? 8;
+        var export = LoadExport() ?? throw new InvalidOperationException("no brain-export");
+        var node = export.Nodes.FirstOrDefault(n => n.Id == nodeId)
+            ?? throw new InvalidOperationException($"note not found: {nodeId}");
+
+        var alreadyLinked = new HashSet<string>(node.LinkedNodeIds) { node.Id };
+        var sourceVec = LoadEmbedding(node.Id);
+
+        List<(NodeSummary n, double s)> ranked;
+        if (sourceVec != null)
+        {
+            ranked = export.Nodes
+                .Where(o => !alreadyLinked.Contains(o.Id))
+                .Select(o =>
+                {
+                    var v = LoadEmbedding(o.Id);
+                    return (o, v == null ? 0 : Cosine(sourceVec, v));
+                })
+                .Where(x => x.Item2 > 0.5)
+                .OrderByDescending(x => x.Item2)
+                .Take(limit)
+                .ToList();
+        }
+        else
+        {
+            // Keyword-overlap heuristic: shared tags + same category + title token overlap.
+            ranked = export.Nodes
+                .Where(o => !alreadyLinked.Contains(o.Id))
+                .Select(o => (o, KeywordOverlap(node, o)))
+                .Where(x => x.Item2 > 0)
+                .OrderByDescending(x => x.Item2)
+                .Take(limit)
+                .ToList();
+        }
+
+        return new JObject
+        {
+            ["source"] = new JObject
+            {
+                ["id"] = node.Id,
+                ["title"] = node.Title
+            },
+            ["suggestions"] = new JArray(ranked.Select(x => new JObject
+            {
+                ["id"] = x.n.Id,
+                ["title"] = x.n.Title,
+                ["similarity"] = Math.Round(x.s, 4),
+                ["category"] = x.n.PrimaryCategory,
+                ["sharedTags"] = new JArray(node.Tags.Intersect(x.n.Tags, StringComparer.OrdinalIgnoreCase)),
+                ["preview"] = x.n.Preview
+            }))
+        };
+    }
+
+    /// <summary>
+    /// Knowledge-hygiene check. Heuristic: notes whose tags overlap
+    /// significantly but whose primary categories disagree → probably
+    /// either a miscategorisation or a topic that's drifted in two
+    /// directions. Pure keyword/tag for now; embeddings will refine
+    /// this once Batch 4's index is dense enough.
+    /// </summary>
+    private static JToken BrainFindContradictions(JObject args)
+    {
+        var limit = args["limit"]?.ToObject<int>() ?? 20;
+        var export = LoadExport() ?? throw new InvalidOperationException("no brain-export");
+
+        var pairs = new List<(NodeSummary a, NodeSummary b, double overlap, string reason)>();
+        for (int i = 0; i < export.Nodes.Count; i++)
+        {
+            for (int j = i + 1; j < export.Nodes.Count; j++)
+            {
+                var a = export.Nodes[i];
+                var b = export.Nodes[j];
+                if (a.PrimaryCategory == b.PrimaryCategory) continue;
+                var sharedTags = a.Tags.Intersect(b.Tags, StringComparer.OrdinalIgnoreCase).Count();
+                if (sharedTags < 2) continue;
+                // Intent: at least 2 tags AND a meaningful title-token
+                // overlap so we don't flag every "programming" pair.
+                var titleOverlap = TitleTokenOverlap(a, b);
+                if (titleOverlap < 1) continue;
+                var score = sharedTags * 0.6 + titleOverlap * 0.4;
+                pairs.Add((a, b, score,
+                    $"{sharedTags} shared tags but {a.PrimaryCategory} ↔ {b.PrimaryCategory}"));
+            }
+        }
+
+        var top = pairs
+            .OrderByDescending(p => p.overlap)
+            .Take(limit)
+            .Select(p => new JObject
+            {
+                ["a"] = new JObject { ["id"] = p.a.Id, ["title"] = p.a.Title, ["category"] = p.a.PrimaryCategory },
+                ["b"] = new JObject { ["id"] = p.b.Id, ["title"] = p.b.Title, ["category"] = p.b.PrimaryCategory },
+                ["overlap"] = Math.Round(p.overlap, 3),
+                ["reason"] = p.reason
+            });
+
+        return new JObject
+        {
+            ["checked"] = export.Nodes.Count,
+            ["found"] = pairs.Count,
+            ["pairs"] = new JArray(top)
+        };
+    }
+
+    // ───────────── embedding helpers ─────────────
+
+    /// <summary>
+    /// Best-effort: POST /api/embed to a local Ollama daemon. Returns
+    /// null on any failure — caller falls back to keyword search.
+    /// </summary>
+    private static float[]? OllamaEmbed(string text)
+    {
+        try
+        {
+            using var http = new System.Net.Http.HttpClient
+            {
+                Timeout = TimeSpan.FromSeconds(8)
+            };
+            var body = new JObject
+            {
+                ["model"] = "nomic-embed-text",
+                ["input"] = text
+            }.ToString();
+            var resp = http.PostAsync("http://localhost:11434/api/embed",
+                new System.Net.Http.StringContent(body, System.Text.Encoding.UTF8, "application/json"))
+                .GetAwaiter().GetResult();
+            if (!resp.IsSuccessStatusCode) return null;
+            var json = JObject.Parse(resp.Content.ReadAsStringAsync().GetAwaiter().GetResult());
+            // Ollama returns "embeddings": [[float, float, ...]]
+            var arr = (json["embeddings"] as JArray)?[0] as JArray;
+            if (arr == null) return null;
+            return arr.Select(t => t.ToObject<float>()).ToArray();
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Read a stored embedding from .obsidianx/embeddings/&lt;id&gt;.bin.
+    /// Sidecar files instead of SQLite columns so the brain remains
+    /// fully inspectable from the filesystem and a missing/corrupt
+    /// embedding doesn't break the whole storage layer.
+    /// </summary>
+    private static float[]? LoadEmbedding(string nodeId)
+    {
+        try
+        {
+            var path = Path.Combine(_vaultPath, ".obsidianx", "embeddings", nodeId + ".bin");
+            if (!File.Exists(path)) return null;
+            var bytes = File.ReadAllBytes(path);
+            if (bytes.Length % 4 != 0) return null;
+            var floats = new float[bytes.Length / 4];
+            Buffer.BlockCopy(bytes, 0, floats, 0, bytes.Length);
+            return floats;
+        }
+        catch { return null; }
+    }
+
+    private static double Cosine(float[] a, float[] b)
+    {
+        if (a.Length != b.Length) return 0;
+        double dot = 0, na = 0, nb = 0;
+        for (int i = 0; i < a.Length; i++)
+        {
+            dot += a[i] * b[i];
+            na += a[i] * a[i];
+            nb += b[i] * b[i];
+        }
+        if (na == 0 || nb == 0) return 0;
+        return dot / (Math.Sqrt(na) * Math.Sqrt(nb));
+    }
+
+    private static double KeywordOverlap(NodeSummary a, NodeSummary b)
+    {
+        double s = 0;
+        s += a.Tags.Intersect(b.Tags, StringComparer.OrdinalIgnoreCase).Count() * 1.0;
+        if (a.PrimaryCategory == b.PrimaryCategory) s += 1.0;
+        s += TitleTokenOverlap(a, b) * 0.5;
+        return s;
+    }
+
+    private static int TitleTokenOverlap(NodeSummary a, NodeSummary b)
+    {
+        var ta = new HashSet<string>(
+            a.Title.Split(new[] { ' ', '_', '-', '.', '/', '\\' }, StringSplitOptions.RemoveEmptyEntries)
+                   .Select(t => t.ToLowerInvariant())
+                   .Where(t => t.Length > 2),
+            StringComparer.OrdinalIgnoreCase);
+        var tb = b.Title.Split(new[] { ' ', '_', '-', '.', '/', '\\' }, StringSplitOptions.RemoveEmptyEntries)
+                        .Select(t => t.ToLowerInvariant())
+                        .Where(t => t.Length > 2);
+        return tb.Count(t => ta.Contains(t));
     }
 
     // ───────────── helpers ─────────────

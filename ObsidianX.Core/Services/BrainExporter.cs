@@ -107,6 +107,14 @@ public class BrainExporter
                 ModifiedAt = node.ModifiedAt,
                 Importance = Math.Round(node.Importance, 3),
                 LinkedNodeIds = node.LinkedNodeIds,
+                BacklinkIds = node.BacklinkIds,
+                Headings = node.Headings.Select(h => new HeadingSummary
+                {
+                    Level = h.Level, Text = h.Text, Anchor = h.Anchor
+                }).ToList(),
+                BlockIds = node.BlockIds,
+                Properties = node.Properties,
+                Embeds = node.Embeds,
                 Preview = ReadPreview(node.FilePath, 280)
             });
         }
@@ -337,7 +345,29 @@ public class NodeSummary
     public DateTime ModifiedAt { get; set; }
     public double Importance { get; set; }
     public List<string> LinkedNodeIds { get; set; } = [];
+    /// <summary>
+    /// Reverse links — every other note that links INTO this one.
+    /// Computed in <see cref="KnowledgeIndexer.IndexVault"/> after edges
+    /// are built. Populated here so the MCP server can answer
+    /// <c>brain_get_backlinks</c> without re-walking the edge list.
+    /// </summary>
+    public List<string> BacklinkIds { get; set; } = [];
     public string Preview { get; set; } = string.Empty;
+    /// <summary>Headings parsed from the note body — supports <c>[[Note#section]]</c> resolution.</summary>
+    public List<HeadingSummary> Headings { get; set; } = [];
+    /// <summary>Block IDs declared via Obsidian's trailing <c>^block-id</c> syntax.</summary>
+    public List<string> BlockIds { get; set; } = [];
+    /// <summary>Full YAML frontmatter (anything beyond tags).</summary>
+    public Dictionary<string, object?> Properties { get; set; } = new();
+    /// <summary>External assets referenced by transclusion <c>![[image.png]]</c>.</summary>
+    public List<string> Embeds { get; set; } = [];
+}
+
+public class HeadingSummary
+{
+    public int Level { get; set; }
+    public string Text { get; set; } = string.Empty;
+    public string Anchor { get; set; } = string.Empty;
 }
 
 public class TagCount
