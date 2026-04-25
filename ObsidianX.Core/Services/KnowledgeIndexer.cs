@@ -78,22 +78,44 @@ public partial class KnowledgeIndexer
         if (AutoLinker is { Options.Enabled: true })
             AutoLinker.AddAutoEdges(graph);
 
-        // Build expertise map
+        // Build expertise map.
+        //
+        // Old formula was `Math.Min(1.0, sum / 10.0)` — `sum` of per-note
+        // Importance (log-scaled words × tag boost) hits ~10 with just two
+        // moderately-sized notes, so every populated category clamped to
+        // 100% and the bars stopped saying anything. Even Mathematics
+        // (2 notes) and Programming (292 notes) tied at full bar.
+        //
+        // New approach: rank relative to the user's strongest category.
+        //   - Top category = 1.0 (their deepest area)
+        //   - Others = their raw sum / top's raw sum, honestly scaled
+        // Programming with 292 notes will dwarf Mathematics with 2 notes,
+        // producing the long bar / thin bar contrast the UI is designed
+        // to show.
+        var byCategory = new Dictionary<KnowledgeCategory, List<KnowledgeNode>>();
         foreach (var category in Enum.GetValues<KnowledgeCategory>())
         {
-            var categoryNodes = graph.Nodes.Where(n =>
+            var nodes = graph.Nodes.Where(n =>
                 n.PrimaryCategory == category || n.SecondaryCategories.Contains(category)).ToList();
+            if (nodes.Count > 0) byCategory[category] = nodes;
+        }
 
-            if (categoryNodes.Count == 0) continue;
+        double maxRaw = byCategory.Values
+            .Select(ns => ns.Sum(n => n.Importance))
+            .DefaultIfEmpty(0.0)
+            .Max();
 
+        foreach (var (category, nodes) in byCategory)
+        {
+            var raw = nodes.Sum(n => n.Importance);
             graph.ExpertiseMap[category] = new ExpertiseScore
             {
                 Category = category,
-                Score = Math.Min(1.0, categoryNodes.Sum(n => n.Importance) / 10.0),
-                NoteCount = categoryNodes.Count,
-                TotalWords = categoryNodes.Sum(n => n.WordCount),
-                LastUpdated = categoryNodes.Max(n => n.ModifiedAt),
-                GrowthRate = CalculateGrowthRate(categoryNodes)
+                Score = maxRaw > 0 ? Math.Round(raw / maxRaw, 4) : 0,
+                NoteCount = nodes.Count,
+                TotalWords = nodes.Sum(n => n.WordCount),
+                LastUpdated = nodes.Max(n => n.ModifiedAt),
+                GrowthRate = CalculateGrowthRate(nodes)
             };
         }
 

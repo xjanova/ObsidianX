@@ -831,27 +831,38 @@ internal static class Program
             var solnRoot = FindSolutionRoot(Path.GetDirectoryName(mcpExe) ?? "");
             if (solnRoot == null) { Log("client launch: solution root not found"); return; }
 
+            // Candidate build outputs. We deliberately do NOT prefer Release
+            // over Debug — when the developer has been iterating on Debug,
+            // Release goes stale within hours and we'd auto-launch a
+            // weeks-old binary. Pick the freshest by LastWriteTime instead.
             string[] candidates =
             [
                 Path.Combine(solnRoot, "ObsidianX.Client", "bin", "Release", "net10.0-windows", "ObsidianX.Client.exe"),
                 Path.Combine(solnRoot, "ObsidianX.Client", "bin", "Debug",   "net10.0-windows", "ObsidianX.Client.exe")
             ];
 
-            foreach (var c in candidates)
+            var existing = candidates
+                .Where(File.Exists)
+                .Select(p => (path: p, mtime: File.GetLastWriteTimeUtc(p)))
+                .OrderByDescending(t => t.mtime)
+                .ToList();
+
+            if (existing.Count == 0)
             {
-                if (!File.Exists(c)) continue;
-                var psi = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = c,
-                    WorkingDirectory = Path.GetDirectoryName(c)!,
-                    UseShellExecute = true,    // detach from our stdin/stdout
-                    CreateNoWindow = false
-                };
-                System.Diagnostics.Process.Start(psi);
-                Log($"launched client: {c}");
+                Log("client launch: exe not found under " + solnRoot);
                 return;
             }
-            Log("client launch: exe not found under " + solnRoot);
+
+            var pick = existing[0].path;
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = pick,
+                WorkingDirectory = Path.GetDirectoryName(pick)!,
+                UseShellExecute = true,    // detach from our stdin/stdout
+                CreateNoWindow = false
+            };
+            System.Diagnostics.Process.Start(psi);
+            Log($"launched client (newest of {existing.Count}): {pick} @ {existing[0].mtime:O}");
         }
         catch (Exception ex) { Log($"client launch failed: {ex.Message}"); }
     }

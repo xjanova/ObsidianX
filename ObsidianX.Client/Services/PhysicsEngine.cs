@@ -40,6 +40,27 @@ public class PhysicsNode
     public DateTime? BirthAt { get; set; }
     /// <summary>When this node was marked for removal. Still rendered while the death animation plays.</summary>
     public DateTime? DyingAt { get; set; }
+    /// <summary>Last time the node's content (title/word count/links/importance) changed on disk.
+    /// Used by Real Brain mode to focus the camera on edit activity in addition to MCP access.</summary>
+    public DateTime? EditedAt { get; set; }
+
+    /// <summary>Total duration of the birth animation in seconds.</summary>
+    public const double BirthDurationSec = 1.8;
+    /// <summary>Total duration of the death animation in seconds.</summary>
+    public const double DeathDurationSec = 1.8;
+    /// <summary>How long an edit stays "fresh" for Real Brain attention scoring.</summary>
+    public const double EditFreshnessSec = 4.0;
+
+    /// <summary>0 = just edited, 1 = edit fully faded. Controls the edit-pulse visual.</summary>
+    public double EditProgress
+    {
+        get
+        {
+            if (EditedAt == null) return 1.0;
+            var age = (DateTime.UtcNow - EditedAt.Value).TotalSeconds;
+            return Math.Min(1.0, age / EditFreshnessSec);
+        }
+    }
 
     /// <summary>0 = just born, 1 = fully alive. Controls scale/glow.</summary>
     public double BirthProgress
@@ -48,7 +69,7 @@ public class PhysicsNode
         {
             if (BirthAt == null) return 1.0;
             var age = (DateTime.UtcNow - BirthAt.Value).TotalSeconds;
-            return Math.Min(1.0, age / 0.8);
+            return Math.Min(1.0, age / BirthDurationSec);
         }
     }
 
@@ -59,7 +80,7 @@ public class PhysicsNode
         {
             if (DyingAt == null) return 1.0;
             var age = (DateTime.UtcNow - DyingAt.Value).TotalSeconds;
-            return Math.Max(0.0, 1.0 - age / 1.0);
+            return Math.Max(0.0, 1.0 - age / DeathDurationSec);
         }
     }
 }
@@ -76,6 +97,12 @@ public class PhysicsEdge
     /// <summary>Edge formation animation — null = pre-existing.</summary>
     public DateTime? BirthAt { get; set; }
 
+    /// <summary>Edge removal animation — null = alive.</summary>
+    public DateTime? DyingAt { get; set; }
+
+    public const double FormDurationSec = 1.2;
+    public const double DeathDurationSec = 1.2;
+
     /// <summary>0 = just formed, 1 = fully drawn. Controls how far the edge is drawn along the line.</summary>
     public double FormProgress
     {
@@ -83,7 +110,18 @@ public class PhysicsEdge
         {
             if (BirthAt == null) return 1.0;
             var age = (DateTime.UtcNow - BirthAt.Value).TotalSeconds;
-            return Math.Min(1.0, age / 0.9);
+            return Math.Min(1.0, age / FormDurationSec);
+        }
+    }
+
+    /// <summary>1 = alive, 0 = fully gone. Controls fade-out + shrink-toward-midpoint.</summary>
+    public double DeathProgress
+    {
+        get
+        {
+            if (DyingAt == null) return 1.0;
+            var age = (DateTime.UtcNow - DyingAt.Value).TotalSeconds;
+            return Math.Max(0.0, 1.0 - age / DeathDurationSec);
         }
     }
 }
@@ -160,6 +198,33 @@ public class PhysicsEngine
         ClusterTree = ClusterTree.Build([.. Nodes], [.. Edges]);
     }
 
+    // ── Cached ID → index map ──
+    // Rebuilding this Dictionary every frame (at 60fps × 500 nodes × 2 views)
+    // was a top GC-pressure hotspot causing periodic stutter. We now bump
+    // NodeGeneration whenever the Nodes list mutates and lazily rebuild
+    // the map only when stale.
+    public int NodeGeneration { get; private set; }
+    private void BumpNodeGeneration() => NodeGeneration++;
+
+    private Dictionary<string, int>? _idToIndex;
+    private int _cachedIdxGen = -1;
+
+    /// <summary>ID → list-index map. Rebuilt only when the Nodes list changes.</summary>
+    public Dictionary<string, int> IdToIndex
+    {
+        get
+        {
+            if (_idToIndex == null || _cachedIdxGen != NodeGeneration)
+            {
+                _idToIndex ??= new Dictionary<string, int>(Math.Max(16, Nodes.Count));
+                _idToIndex.Clear();
+                for (int i = 0; i < Nodes.Count; i++) _idToIndex[Nodes[i].Id] = i;
+                _cachedIdxGen = NodeGeneration;
+            }
+            return _idToIndex;
+        }
+    }
+
     /// <summary>
     /// Diff-aware reload: keeps existing nodes' positions, marks new
     /// ones with BirthAt, marks missing ones with DyingAt (they'll still
@@ -178,9 +243,12 @@ public class PhysicsEngine
         {
             n.DyingAt ??= now;
         }
-        // Drop fully-dead after animation
+        // Keep dying nodes alive long enough that Real Brain can fly the
+        // camera over and the user sees the death animation play out fully.
+        // The renderer already fades to 0 opacity, so the extra retention
+        // just holds the "ghost" slot in the graph for a few seconds.
         Nodes.RemoveAll(n => n.DyingAt.HasValue &&
-            (now - n.DyingAt.Value).TotalSeconds > 1.2);
+            (now - n.DyingAt.Value).TotalSeconds > PhysicsNode.DeathDurationSec + 3.0);
 
         // Update existing + add births
         int total = Math.Max(1, graph.Nodes.Count);
@@ -189,6 +257,17 @@ public class PhysicsEngine
         {
             if (byId.TryGetValue(gn.Id, out var existing))
             {
+                // Detect a content edit by comparing the fields that actually
+                // change when a user saves the .md file. If anything moved,
+                // stamp EditedAt so Real Brain can fly the camera over.
+                bool edited =
+                    existing.Title != gn.Title
+                    || existing.WordCount != gn.WordCount
+                    || existing.Category != gn.PrimaryCategory
+                    || existing.CustomCategoryId != gn.CustomCategoryId
+                    || Math.Abs(existing.Importance - gn.Importance) > 0.001
+                    || existing.LinkedIds.Count != gn.LinkedNodeIds.Count;
+
                 // Preserve position + velocity; refresh metadata
                 existing.Title = gn.Title;
                 existing.Category = gn.PrimaryCategory;
@@ -197,6 +276,7 @@ public class PhysicsEngine
                 existing.LinkedIds = gn.LinkedNodeIds;
                 existing.CustomCategoryId = gn.CustomCategoryId;
                 existing.DyingAt = null;   // cancel pending death if it re-appeared
+                if (edited) existing.EditedAt = now;
             }
             else
             {
@@ -241,8 +321,16 @@ public class PhysicsEngine
         foreach (var ge in graph.Edges)
             graphKeys.Add((ge.SourceId, ge.TargetId, ge.RelationType));
 
-        // Remove edges not present in new graph (edges have no death animation — instant)
-        Edges.RemoveAll(e => !graphKeys.Contains((e.SourceId, e.TargetId, e.RelationType)));
+        // Mark edges not present in new graph as dying — they keep rendering
+        // until the fade-out animation finishes, then get dropped below.
+        foreach (var e in Edges)
+        {
+            var key = (e.SourceId, e.TargetId, e.RelationType);
+            if (!graphKeys.Contains(key)) e.DyingAt ??= now;
+            else if (existingEdges.ContainsKey(key)) e.DyingAt = null; // edge re-added — cancel death
+        }
+        Edges.RemoveAll(e => e.DyingAt.HasValue &&
+            (now - e.DyingAt.Value).TotalSeconds > PhysicsEdge.DeathDurationSec + 0.15);
 
         // Add new edges with birth timestamp
         foreach (var ge in graph.Edges)
@@ -262,6 +350,7 @@ public class PhysicsEngine
             }
         }
 
+        BumpNodeGeneration();
         DetectCommunities();
         AutoTune();
         RebuildClusterTree();
@@ -321,6 +410,7 @@ public class PhysicsEngine
             });
         }
 
+        BumpNodeGeneration();
         DetectCommunities();
         AutoTune();
         Warmup(80);

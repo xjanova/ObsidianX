@@ -67,6 +67,25 @@ public partial class MainWindow : Window
     private double _cullDistance = 12.0;         // camera-space; 0 = disabled
     private bool _useClusterColors = true;       // tint nodes by community
 
+    // UI color theme — applied at load time + on user pick
+    private string _uiTheme = "MagentaNebula";
+
+    // Live theme colors — read by 3D graph renderer every frame. ApplyUiTheme
+    // mutates these so the brain-graph edges/rings/halos retint without a
+    // rebuild. Defaults match the MagentaNebula preset.
+    private Color _themeAccent = Color.FromRgb(0xFF, 0x2E, 0x94);
+    private Color _themeSecondary = Color.FromRgb(0xB0, 0x44, 0xFF);
+    private Color _themeTertiary = Color.FromRgb(0xFF, 0x6B, 0xB0);
+
+    // Background image dim levels (0..1). Live-editable in theme popup.
+    private double _graphBgDim = 0.55;
+    private double _dashBgDim = 0.55;
+    private double _windowBgDim = 0.09;
+
+    // Per-frame scratch buffer for the max-visible cap — reused across
+    // frames so the ranking step produces zero GC pressure.
+    private readonly List<(int idx, double score)> _visibilityScoreBuf = new(512);
+
     // Custom category registry (user-defined knowledge domains)
     private CategoryRegistry? _categories;
 
@@ -143,6 +162,11 @@ public partial class MainWindow : Window
         if (Environment.GetCommandLineArgs().Length > 1)
             _vaultPath = Environment.GetCommandLineArgs()[1];
         _identityPath = Path.Combine(_vaultPath, ".obsidianx", "identity.json");
+
+        // First-run / version-bump install of brain-save policy into the
+        // user's Claude Code memory dir. Idempotent — silently skips if
+        // the on-disk version is already current.
+        ClaudeBrainRulesInstaller.EnsureInstalled(_vaultPath);
     }
 
     private void Window_Loaded(object sender, RoutedEventArgs e)
@@ -150,8 +174,12 @@ public partial class MainWindow : Window
         var pulse = (Storyboard)FindResource("PulseAnimation");
         pulse.Begin();
 
+        UpdateAboutCard();
         InitializeIdentity();
         LoadSettingsFromFile();
+        ApplyUiTheme(_uiTheme);
+        ApplyBgDim();
+        PopulateThemeList();
         IndexVault();
         CheckClaudeConnection();
 
@@ -160,6 +188,23 @@ public partial class MainWindow : Window
         _dashPhysics.Disturb(_graph.TotalNodes > 20 ? 0.05 : 0.3);
         _graphPhysics.LoadFromGraph(_graph);
         _graphPhysics.Disturb(_graph.TotalNodes > 20 ? 0.08 : 0.4);
+
+        // Frame all nodes in the dashboard map by default so users see the
+        // whole brain on first load instead of a zoomed-into-the-middle slice.
+        // Re-run after the first physics tick has actually placed nodes.
+        FitDashCamera();
+        Dispatcher.BeginInvoke(new Action(FitDashCamera),
+            System.Windows.Threading.DispatcherPriority.ContextIdle);
+
+        // Wire 2D renderers to the same physics state so toggling is instant.
+        // Nothing renders yet — the toggle button flips visibility, and only
+        // then does OnRenderFrame call InvalidateVisual on the 2D element.
+        DashGraph2D.Physics = _dashPhysics;
+        DashGraph2D.CategoryColorFn = GetCategoryColor;
+        DashGraph2D.SetTheme(_themeAccent, _themeSecondary);
+        FullGraph2D.Physics = _graphPhysics;
+        FullGraph2D.CategoryColorFn = GetCategoryColor;
+        FullGraph2D.SetTheme(_themeAccent, _themeSecondary);
 
         // Populate UI
         UpdateUI();
@@ -265,30 +310,232 @@ public partial class MainWindow : Window
             _lastFpsTime = now;
         }
 
-        // Step physics
-        _dashPhysics.Step();
-        _graphPhysics.Step();
+        // Only simulate the physics engine for the view the user is actually
+        // looking at — running both at 60fps while one is hidden was pure
+        // waste (Barnes-Hut O(N log N) on 500 nodes twice per frame).
+        // Pulse decay still runs on the hidden engine so access-log pulses
+        // don't accumulate invisibly.
+        bool dashVisible = DashboardView.Visibility == Visibility.Visible;
+        bool graphVisible = BrainGraphView.Visibility == Visibility.Visible;
+
+        if (dashVisible) _dashPhysics.Step();
+        if (graphVisible) _graphPhysics.Step();
 
         // Decay knowledge-pulse intensity each frame (~16ms)
         DecayPulses(_dashPhysics, 0.016);
         DecayPulses(_graphPhysics, 0.016);
 
-        // Rebuild 3D meshes (optimized: single batched geometry)
-        if (DashboardView.Visibility == Visibility.Visible)
+        // Rebuild 3D meshes OR invalidate the 2D renderer for the active
+        // view. We pick exactly one path per map — running both is pure
+        // waste. _dashView2D / _graphView2D are flipped by the toolbar
+        // toggle buttons; default is 3D to match the prior look.
+        if (dashVisible)
         {
-            UpdateCamera(DashCam, _camYaw, _camPitch, _camDist);
-            RebuildScene(BrainModel, _dashPhysics, _selectedNodeDash);
+            if (_dashView2D)
+            {
+                DashGraph2D.SelectedIndex = _selectedNodeDash;
+                DashGraph2D.InvalidateVisual();
+            }
+            else
+            {
+                UpdateCamera(DashCam, _camYaw, _camPitch, _camDist);
+                RebuildScene(BrainModel, _dashPhysics, _selectedNodeDash);
+            }
         }
 
-        if (BrainGraphView.Visibility == Visibility.Visible)
+        if (graphVisible)
         {
-            UpdateGraphCameraAuto();
-            UpdateCamera(GraphCam, _graphYaw, _graphPitch, _graphDist, _graphTarget);
-            RebuildScene(FullGraphModel, _graphPhysics, _selectedNodeGraph);
-            UpdateDepthBreadcrumb();
-            UpdateScanline();
-            UpdateActivityLabels();
+            if (_graphView2D)
+            {
+                FullGraph2D.SelectedIndex = _selectedNodeGraph;
+                FullGraph2D.InvalidateVisual();
+            }
+            else
+            {
+                UpdateGraphCameraAuto();
+                UpdateCamera(GraphCam, _graphYaw, _graphPitch, _graphDist, _graphTarget);
+                RebuildScene(FullGraphModel, _graphPhysics, _selectedNodeGraph);
+                UpdateDepthBreadcrumb();
+                UpdateScanline();
+                UpdateActivityLabels();
+            }
         }
+    }
+
+    // ═══════════════════════════════════════
+    // 2D / 3D VIEW MODE TOGGLE
+    // ═══════════════════════════════════════
+
+    private bool _dashView2D = false;
+    private bool _graphView2D = false;
+    private bool _dash2DDragging = false;
+    private bool _graph2DDragging = false;
+    private Point _dash2DLastMouse;
+    private Point _graph2DLastMouse;
+
+    private void DashViewMode_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button b) return;
+        var mode2D = b.Tag as string == "2D";
+        if (_dashView2D == mode2D) return;
+        SetDashView2D(mode2D);
+    }
+
+    private void SetDashView2D(bool on)
+    {
+        _dashView2D = on;
+        DashView2DBorder.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        DashView3DBorder.Visibility = on ? Visibility.Collapsed : Visibility.Visible;
+        DashView2DBtn.Style = (Style)FindResource(on ? "NeonButtonFilled" : "NeonButton");
+        DashView3DBtn.Style = (Style)FindResource(on ? "NeonButton" : "NeonButtonFilled");
+        if (on)
+        {
+            DashGraph2D.Physics = _dashPhysics;
+            DashGraph2D.SetTheme(_themeAccent, _themeSecondary);
+            // Wait one frame for ActualWidth/Height to settle before fitting.
+            Dispatcher.BeginInvoke(new Action(() => DashGraph2D.FitToContent()),
+                System.Windows.Threading.DispatcherPriority.ContextIdle);
+        }
+        DashHintText.Text = on
+            ? "Drag=pan | Hover map + scroll=zoom | Click=info | Right-click=kick"
+            : "Drag=rotate | Hover map + scroll=zoom | Click=info | Right-click=kick";
+    }
+
+    private void GraphViewMode_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button b) return;
+        var mode2D = b.Tag as string == "2D";
+        if (_graphView2D == mode2D) return;
+        SetGraphView2D(mode2D);
+    }
+
+    private void SetGraphView2D(bool on)
+    {
+        _graphView2D = on;
+        GraphView2DBorder.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        GraphView3DBorder.Visibility = on ? Visibility.Collapsed : Visibility.Visible;
+        GraphView2DBtn.Style = (Style)FindResource(on ? "NeonButtonFilled" : "NeonButton");
+        GraphView3DBtn.Style = (Style)FindResource(on ? "NeonButton" : "NeonButtonFilled");
+        if (on)
+        {
+            FullGraph2D.Physics = _graphPhysics;
+            FullGraph2D.SetTheme(_themeAccent, _themeSecondary);
+            Dispatcher.BeginInvoke(new Action(() => FullGraph2D.FitToContent()),
+                System.Windows.Threading.DispatcherPriority.ContextIdle);
+        }
+    }
+
+    // ── Dashboard 2D mouse handlers ─────────────────────────────────
+
+    private void Dash2D_MouseDown(object s, MouseButtonEventArgs e)
+    {
+        var p = e.GetPosition(DashGraph2D);
+        var hit = DashGraph2D.HitTest(p);
+        if (hit.HasValue)
+        {
+            _selectedNodeDash = hit;
+            ShowNodeInfo(NodeInfoPanel, NodeInfoTitle, NodeInfoDetail, NodeInfoDot,
+                NodeInfoContent, _dashPhysics.Nodes[hit.Value]);
+        }
+        _dash2DDragging = true;
+        _dash2DLastMouse = e.GetPosition((IInputElement)s);
+        ((UIElement)s).CaptureMouse();
+    }
+
+    private void Dash2D_MouseUp(object s, MouseButtonEventArgs e)
+    {
+        _dash2DDragging = false;
+        ((UIElement)s).ReleaseMouseCapture();
+    }
+
+    private void Dash2D_MouseMove(object s, MouseEventArgs e)
+    {
+        if (!_dash2DDragging) return;
+        var pos = e.GetPosition((IInputElement)s);
+        var dx = pos.X - _dash2DLastMouse.X;
+        var dy = pos.Y - _dash2DLastMouse.Y;
+        DashGraph2D.ViewCenter = new Point(
+            DashGraph2D.ViewCenter.X - dx / DashGraph2D.Scale,
+            DashGraph2D.ViewCenter.Y + dy / DashGraph2D.Scale);
+        _dash2DLastMouse = pos;
+    }
+
+    private void Dash2D_MouseWheel(object s, MouseWheelEventArgs e)
+    {
+        // Point-fixed zoom: keep the world point under the cursor stationary.
+        var screenPos = e.GetPosition(DashGraph2D);
+        var worldBefore = DashGraph2D.ScreenToWorld(screenPos);
+        var factor = e.Delta > 0 ? 1.1 : 1.0 / 1.1;
+        DashGraph2D.Scale = Math.Clamp(DashGraph2D.Scale * factor, 4, 200);
+        var worldAfter = DashGraph2D.ScreenToWorld(screenPos);
+        DashGraph2D.ViewCenter = new Point(
+            DashGraph2D.ViewCenter.X + (worldBefore.X - worldAfter.X),
+            DashGraph2D.ViewCenter.Y + (worldBefore.Y - worldAfter.Y));
+        e.Handled = true;
+    }
+
+    private void Dash2D_RightClick(object s, MouseButtonEventArgs e)
+    {
+        var p = e.GetPosition(DashGraph2D);
+        var hit = DashGraph2D.HitTest(p);
+        if (hit.HasValue) _dashPhysics.KickNode(hit.Value);
+        else _dashPhysics.Disturb(0.8);
+    }
+
+    // ── Brain Graph 2D mouse handlers ───────────────────────────────
+
+    private void Graph2D_MouseDown(object s, MouseButtonEventArgs e)
+    {
+        var p = e.GetPosition(FullGraph2D);
+        var hit = FullGraph2D.HitTest(p);
+        if (hit.HasValue)
+        {
+            _selectedNodeGraph = hit;
+            ShowNodeInfo(GraphNodeInfo, GraphNodeTitle, GraphNodeMeta, GraphNodeDot,
+                GraphNodeContent, _graphPhysics.Nodes[hit.Value]);
+        }
+        _graph2DDragging = true;
+        _graph2DLastMouse = e.GetPosition((IInputElement)s);
+        ((UIElement)s).CaptureMouse();
+    }
+
+    private void Graph2D_MouseUp(object s, MouseButtonEventArgs e)
+    {
+        _graph2DDragging = false;
+        ((UIElement)s).ReleaseMouseCapture();
+    }
+
+    private void Graph2D_MouseMove(object s, MouseEventArgs e)
+    {
+        if (!_graph2DDragging) return;
+        var pos = e.GetPosition((IInputElement)s);
+        var dx = pos.X - _graph2DLastMouse.X;
+        var dy = pos.Y - _graph2DLastMouse.Y;
+        FullGraph2D.ViewCenter = new Point(
+            FullGraph2D.ViewCenter.X - dx / FullGraph2D.Scale,
+            FullGraph2D.ViewCenter.Y + dy / FullGraph2D.Scale);
+        _graph2DLastMouse = pos;
+    }
+
+    private void Graph2D_MouseWheel(object s, MouseWheelEventArgs e)
+    {
+        var screenPos = e.GetPosition(FullGraph2D);
+        var worldBefore = FullGraph2D.ScreenToWorld(screenPos);
+        var factor = e.Delta > 0 ? 1.1 : 1.0 / 1.1;
+        FullGraph2D.Scale = Math.Clamp(FullGraph2D.Scale * factor, 4, 200);
+        var worldAfter = FullGraph2D.ScreenToWorld(screenPos);
+        FullGraph2D.ViewCenter = new Point(
+            FullGraph2D.ViewCenter.X + (worldBefore.X - worldAfter.X),
+            FullGraph2D.ViewCenter.Y + (worldBefore.Y - worldAfter.Y));
+        e.Handled = true;
+    }
+
+    private void Graph2D_RightClick(object s, MouseButtonEventArgs e)
+    {
+        var p = e.GetPosition(FullGraph2D);
+        var hit = FullGraph2D.HitTest(p);
+        if (hit.HasValue) _graphPhysics.KickNode(hit.Value);
+        else _graphPhysics.Disturb(0.8);
     }
 
     /// <summary>
@@ -565,10 +812,23 @@ public partial class MainWindow : Window
                     _graphDist += (desired - _graphDist) * 0.05;
 
                     // Status feedback so the user can verify Real Brain is
-                    // actually following something (and which thing).
+                    // actually following something (and which thing). Vault
+                    // lifecycle events outrank MCP ops in the label so the
+                    // user knows WHY the camera moved (file save vs read).
                     if (StatusText != null)
                     {
-                        var opLabel = deep ? "📖 READING" : "🔍 SCANNING";
+                        string opLabel;
+                        if (_attentionTarget.BirthAt.HasValue
+                            && (now - _attentionTarget.BirthAt.Value).TotalSeconds < 6.0)
+                            opLabel = "🌱 NEW NOTE";
+                        else if (_attentionTarget.DyingAt.HasValue
+                            && (now - _attentionTarget.DyingAt.Value).TotalSeconds < 6.0)
+                            opLabel = "💀 DELETED";
+                        else if (_attentionTarget.EditedAt.HasValue
+                            && (now - _attentionTarget.EditedAt.Value).TotalSeconds < PhysicsNode.EditFreshnessSec + 2.0)
+                            opLabel = "✏️ EDITED";
+                        else
+                            opLabel = deep ? "📖 READING" : "🔍 SCANNING";
                         StatusText.Text =
                             $"🧠 AI FOCUS · {opLabel} → {TruncateTitle(_attentionTarget.Title, 40)}";
                     }
@@ -605,7 +865,14 @@ public partial class MainWindow : Window
         foreach (var n in _graphPhysics.Nodes)
         {
             if (n == _attentionTarget) continue;
-            if (n.AccessIntensity < 0.05 && n.LastAccessedAt == DateTime.MinValue) continue;
+            // Skip only the truly cold nodes — ones with no MCP access AND
+            // no recent lifecycle event (birth / edit / death). If any of
+            // those lifecycle stamps are fresh we still want this node to
+            // be considered so Real Brain can fly to a just-written file.
+            if (n.AccessIntensity < 0.05
+                && n.LastAccessedAt == DateTime.MinValue
+                && !HasFreshLifecycleEvent(n))
+                continue;
 
             var score = ScoreOfAttention(n);
             if (score > bestScore) { bestScore = score; best = n; }
@@ -613,17 +880,56 @@ public partial class MainWindow : Window
         return best;
     }
 
-    /// <summary>Compute attention score: intensity blended with recency.</summary>
+    /// <summary>
+    /// True when the node had a vault-file change (birth/edit/death) recently
+    /// enough that Real Brain should still be attending to it.
+    /// </summary>
+    private static bool HasFreshLifecycleEvent(PhysicsNode n)
+    {
+        var now = DateTime.UtcNow;
+        if (n.BirthAt.HasValue && (now - n.BirthAt.Value).TotalSeconds < 6.0) return true;
+        if (n.DyingAt.HasValue && (now - n.DyingAt.Value).TotalSeconds < 6.0) return true;
+        if (n.EditedAt.HasValue && (now - n.EditedAt.Value).TotalSeconds < PhysicsNode.EditFreshnessSec + 2.0) return true;
+        return false;
+    }
+
+    /// <summary>Compute attention score: intensity + recency + vault lifecycle events.</summary>
     private static double ScoreOfAttention(PhysicsNode? n)
     {
         if (n == null) return 0;
+        var now = DateTime.UtcNow;
+
         var recency = n.LastAccessedAt > DateTime.MinValue
-            ? 1.0 / (1.0 + (DateTime.UtcNow - n.LastAccessedAt).TotalSeconds * 0.3)
+            ? 1.0 / (1.0 + (now - n.LastAccessedAt).TotalSeconds * 0.3)
             : 0;
         // Deep ops (read full note / write) get a recency bonus so they
         // win the switch contest against a mere search hit.
         var opBoost = IsDeepOp(n.LastOp) ? 0.2 : 0;
-        return n.AccessIntensity * 0.7 + recency * 0.3 + opBoost;
+
+        // Vault lifecycle boosts — override MCP scoring so the camera
+        // snaps to the newly-edited file even if no MCP tool hit it.
+        // Scores scale 0→1 with decay; births/deaths outrank edits because
+        // they're rarer, more meaningful events.
+        double birthBoost = 0, editBoost = 0, deathBoost = 0;
+        if (n.BirthAt.HasValue)
+        {
+            var age = (now - n.BirthAt.Value).TotalSeconds;
+            if (age < 6.0) birthBoost = 1.3 * (1.0 - age / 6.0);
+        }
+        if (n.DyingAt.HasValue)
+        {
+            var age = (now - n.DyingAt.Value).TotalSeconds;
+            if (age < 6.0) deathBoost = 1.2 * (1.0 - age / 6.0);
+        }
+        if (n.EditedAt.HasValue)
+        {
+            var age = (now - n.EditedAt.Value).TotalSeconds;
+            if (age < PhysicsNode.EditFreshnessSec + 2.0)
+                editBoost = 0.9 * Math.Max(0, 1.0 - age / (PhysicsNode.EditFreshnessSec + 2.0));
+        }
+
+        return n.AccessIntensity * 0.7 + recency * 0.3 + opBoost
+             + birthBoost + editBoost + deathBoost;
     }
 
     private static bool IsDeepOp(string op) =>
@@ -681,8 +987,9 @@ public partial class MainWindow : Window
         //    plus bubbles that haven't been expanded yet ──
         bool[] visible = new bool[physics.Nodes.Count];
         var bubbles = new List<ClusterTree>();
-        var nodeIndexById = new Dictionary<string, int>(physics.Nodes.Count);
-        for (int i = 0; i < physics.Nodes.Count; i++) nodeIndexById[physics.Nodes[i].Id] = i;
+        // Cached: rebuilt inside PhysicsEngine only when Nodes list mutates
+        // (prevents per-frame Dictionary allocation → GC stutter).
+        var nodeIndexById = physics.IdToIndex;
 
         var tree = parent == FullGraphModel ? physics.ClusterTree : null;
         var fractalFocus = parent == BrainModel ? new Point3D(0, 0, 0) : _graphTarget;
@@ -705,24 +1012,32 @@ public partial class MainWindow : Window
             }
         }
 
-        // Apply MaxVisibleNodes cap only to the leaves that survived fractal walk
+        // Apply MaxVisibleNodes cap only to the leaves that survived fractal walk.
+        // Nodes in the middle of a birth or death animation always win a slot —
+        // otherwise the user never sees what just changed.
         if (_maxVisibleNodes > 0)
         {
-            int visCount = visible.Count(v => v);
+            int visCount = 0;
+            for (int i = 0; i < visible.Length; i++) if (visible[i]) visCount++;
             if (visCount > _maxVisibleNodes)
             {
-                var rankedKeep = physics.Nodes
-                    .Select((n, i) => (i, score: n.Importance
-                                              + (n.AccessIntensity > 0.05 ? 1e6 : 0)
-                                              + (i == selectedIdx ? 1e7 : 0),
-                                          visible: visible[i]))
-                    .Where(t => t.visible)
-                    .OrderByDescending(t => t.score)
-                    .Take(_maxVisibleNodes)
-                    .Select(t => t.i)
-                    .ToHashSet();
-                for (int i = 0; i < visible.Length; i++)
-                    if (visible[i] && !rankedKeep.Contains(i)) visible[i] = false;
+                // Reusable scratch buffer — zero allocations per frame.
+                var scored = _visibilityScoreBuf;
+                scored.Clear();
+                if (scored.Capacity < visCount) scored.Capacity = visCount;
+                for (int i = 0; i < physics.Nodes.Count; i++)
+                {
+                    if (!visible[i]) continue;
+                    var n = physics.Nodes[i];
+                    double score = n.Importance
+                                 + (n.AccessIntensity > 0.05 ? 1e6 : 0)
+                                 + (i == selectedIdx ? 1e7 : 0)
+                                 + (n.BirthProgress < 1.0 || n.DeathProgress < 1.0 ? 1e8 : 0);
+                    scored.Add((i, score));
+                }
+                scored.Sort(static (a, b) => b.score.CompareTo(a.score));
+                for (int k = _maxVisibleNodes; k < scored.Count; k++)
+                    visible[scored[k].idx] = false;
             }
         }
 
@@ -754,6 +1069,10 @@ public partial class MainWindow : Window
         var glowGroup = new MeshGeometry3D();
         var pulseGroups = new Dictionary<Color, MeshGeometry3D>();
         var pulseAuraGroup = new MeshGeometry3D();
+        // Lifecycle halos — separate buckets so we can use dedicated materials
+        // (birth = bright white, death = red-orange) instead of cyan aura.
+        var birthHaloGroup = new MeshGeometry3D();
+        var deathHaloGroup = new MeshGeometry3D();
         int renderedCount = 0;
 
         for (int i = 0; i < physics.Nodes.Count; i++)
@@ -762,12 +1081,15 @@ public partial class MainWindow : Window
 
             var node = physics.Nodes[i];
 
-            // Focus-based culling: distance from LookAt, not camera
+            // Focus-based culling: distance from LookAt, not camera.
+            // Lifecycle nodes (being born / dying) always stay visible so
+            // the user can actually see what changed in the vault.
             var dx = node.Position.X - focus.X;
             var dy = node.Position.Y - focus.Y;
             var dz = node.Position.Z - focus.Z;
             var dsq = dx * dx + dy * dy + dz * dz;
-            bool keepAnyway = i == selectedIdx || node.AccessIntensity > 0.05 || node.IsHovered;
+            bool inLifecycle = node.BirthProgress < 1.0 || node.DeathProgress < 1.0;
+            bool keepAnyway = i == selectedIdx || node.AccessIntensity > 0.05 || node.IsHovered || inLifecycle;
             if (!keepAnyway && dsq > focusSqr) continue;
 
             renderedCount++;
@@ -793,14 +1115,17 @@ public partial class MainWindow : Window
             }
 
             // ── Birth / death lifecycle animations ──
-            //   Born: 0 → full size with a white-hot flash that fades in 0.8s.
-            //   Dying: full → 0 over 1s, shrinking & fading.
+            //   Born: 0 → full size with a white-hot flash that fades over BirthDurationSec.
+            //   Dying: full → 0 over DeathDurationSec, shrinking with an expanding red halo.
             var birth = node.BirthProgress;
             var death = node.DeathProgress;
             if (birth < 1.0)
             {
-                // Scale-in curve — starts very small with a burst
-                radius *= 0.3 + 0.7 * birth;
+                // Scale-in curve with overshoot — starts small, pops past 1.0, settles.
+                // Easier to spot than a plain lerp.
+                var t = birth;
+                var overshoot = 1.0 + Math.Sin(t * Math.PI) * 0.25;
+                radius *= (0.25 + 0.75 * t) * overshoot;
             }
             if (death < 1.0)
             {
@@ -828,12 +1153,29 @@ public partial class MainWindow : Window
                     radius * (1.6 + intensity * 0.8), SharedSphereLOD);
             }
 
-            // Birth flash — expanding white halo that fades as birth completes.
-            // Dying version — similar but scaled by death progress so it trails off.
+            // Birth flash — bright white halo expanding out from the new node.
+            // Goes into its own mesh so we can render it brighter than the MCP
+            // pulse aura.
             if (birth < 1.0)
             {
-                AppendSphereToMesh(pulseAuraGroup, node.Position,
-                    radius * (2.0 + (1.0 - birth) * 2.5), SharedSphereLOD);
+                // Two concentric halos — a tight inner flash + a wider rim
+                AppendSphereToMesh(birthHaloGroup, node.Position,
+                    radius * (2.2 + (1.0 - birth) * 3.0), SharedSphereLOD);
+                AppendSphereToMesh(birthHaloGroup, node.Position,
+                    radius * (1.4 + (1.0 - birth) * 1.2), SharedSphereLOD);
+            }
+
+            // Death halo — expanding red-orange ring around the shrinking node.
+            // This is the signal "a node just got deleted from the vault".
+            if (death < 1.0)
+            {
+                var fade = death;                 // 1 → 0 as it dies
+                var ringGrow = 2.0 - death;       // 1 → 2 as it dies
+                // Use the base radius (pre-shrink) so the halo keeps expanding
+                // even as the node itself shrinks to nothing.
+                var baseR = Math.Max(node.Radius * pulse * radiusScale, 0.05);
+                AppendSphereToMesh(deathHaloGroup, node.Position,
+                    baseR * (1.8 + ringGrow * 1.5) * (0.4 + 0.6 * fade), SharedSphereLOD);
             }
 
             // Glow ring for selected
@@ -869,15 +1211,34 @@ public partial class MainWindow : Window
         if (pulseAuraGroup.Positions.Count > 0)
         {
             var auraMat = new EmissiveMaterial(new SolidColorBrush(
-                Color.FromArgb(70, 0, 240, 255)));
+                Color.FromArgb(70, _themeAccent.R, _themeAccent.G, _themeAccent.B)));
             group.Children.Add(new GeometryModel3D(pulseAuraGroup, auraMat));
+        }
+
+        // Birth flash — bright white halo for freshly-born nodes.
+        // Distinct from the cyan MCP aura so new-note creation reads as a
+        // different signal from "node was just read".
+        if (birthHaloGroup.Positions.Count > 0)
+        {
+            var birthMat = new EmissiveMaterial(new SolidColorBrush(
+                Color.FromArgb(200, 255, 255, 255)));
+            group.Children.Add(new GeometryModel3D(birthHaloGroup, birthMat));
+        }
+
+        // Death halo — red-orange expanding ring as the node fades to 0.
+        // Makes deletions impossible to miss.
+        if (deathHaloGroup.Positions.Count > 0)
+        {
+            var deathMat = new EmissiveMaterial(new SolidColorBrush(
+                Color.FromArgb(190, 255, 70, 70)));
+            group.Children.Add(new GeometryModel3D(deathHaloGroup, deathMat));
         }
 
         // Glow for selected
         if (glowGroup.Positions.Count > 0)
         {
             var glowMat = new EmissiveMaterial(new SolidColorBrush(
-                Color.FromArgb(30, 0, 240, 255)));
+                Color.FromArgb(30, _themeAccent.R, _themeAccent.G, _themeAccent.B)));
             group.Children.Add(new GeometryModel3D(glowGroup, glowMat));
         }
 
@@ -887,25 +1248,53 @@ public partial class MainWindow : Window
         // is visible AND at least one is near the camera focus.
         var wikiEdgeMesh = new MeshGeometry3D();
         var autoEdgeMesh = new MeshGeometry3D();
-        var idToIdx = new Dictionary<string, int>(physics.Nodes.Count);
-        for (int i = 0; i < physics.Nodes.Count; i++) idToIdx[physics.Nodes[i].Id] = i;
+        // Reuse the same cached map — already built above, safe to share.
+        var idToIdx = nodeIndexById;
 
         // Scale edge thickness with camera distance so it stays readable
         var edgeScale = Math.Clamp(camDist / 14.0, 0.5, 2.5);
 
         var newEdgeTipMesh = new MeshGeometry3D();   // bright pulse at the tip of growing edges
+        var dyingEdgeMesh = new MeshGeometry3D();    // red-orange fade for edges being removed
 
         foreach (var edge in physics.Edges)
         {
             if (edge.IsAuto && !_showAutoEdges) continue;
             if (!idToIdx.TryGetValue(edge.SourceId, out var srcIdx)) continue;
             if (!idToIdx.TryGetValue(edge.TargetId, out var tgtIdx)) continue;
-            if (!visible[srcIdx] || !visible[tgtIdx]) continue;
+            // For dying edges, allow render even if an endpoint was culled —
+            // otherwise deletions vanish silently. Lifecycle always wins.
+            var deathEdge = edge.DeathProgress;
+            bool inLifecycle = deathEdge < 1.0 || edge.FormProgress < 1.0;
+            if (!inLifecycle && (!visible[srcIdx] || !visible[tgtIdx])) continue;
 
             var src = physics.Nodes[srcIdx];
             var tgt = physics.Nodes[tgtIdx];
-            var target = edge.IsAuto ? autoEdgeMesh : wikiEdgeMesh;
             var baseWidth = edge.IsAuto ? 0.006 : 0.012;
+
+            // Edge death animation — shrink from both ends toward the midpoint
+            // with a red-orange glow, while thickening slightly so it reads
+            // as "this connection is snapping".
+            if (deathEdge < 1.0)
+            {
+                var mid = new Point3D(
+                    (src.Position.X + tgt.Position.X) * 0.5,
+                    (src.Position.Y + tgt.Position.Y) * 0.5,
+                    (src.Position.Z + tgt.Position.Z) * 0.5);
+                var shrunkSrc = new Point3D(
+                    mid.X + (src.Position.X - mid.X) * deathEdge,
+                    mid.Y + (src.Position.Y - mid.Y) * deathEdge,
+                    mid.Z + (src.Position.Z - mid.Z) * deathEdge);
+                var shrunkTgt = new Point3D(
+                    mid.X + (tgt.Position.X - mid.X) * deathEdge,
+                    mid.Y + (tgt.Position.Y - mid.Y) * deathEdge,
+                    mid.Z + (tgt.Position.Z - mid.Z) * deathEdge);
+                AppendLineToMesh(dyingEdgeMesh, shrunkSrc, shrunkTgt,
+                    baseWidth * edgeScale * (1.6 + (1.0 - deathEdge) * 0.8));
+                continue;
+            }
+
+            var target = edge.IsAuto ? autoEdgeMesh : wikiEdgeMesh;
 
             // Edge formation animation — grow from source toward target
             var form = edge.FormProgress;
@@ -920,8 +1309,10 @@ public partial class MainWindow : Window
                     src.Position.Y + dy * form,
                     src.Position.Z + dz * form);
                 AppendLineToMesh(target, src.Position, tip, baseWidth * edgeScale * 1.4);
-                // Bright ball at the tip — like a synapse firing
-                AppendSphereToMesh(newEdgeTipMesh, tip, baseWidth * 3.0, SharedSphereLOD);
+                // Bright ball at the tip — like a synapse firing. Made larger
+                // (6x width instead of 3x) so it stays visible at overview zoom.
+                AppendSphereToMesh(newEdgeTipMesh, tip,
+                    Math.Max(baseWidth * 6.0, 0.05), SharedSphereLOD);
             }
             else
             {
@@ -939,15 +1330,25 @@ public partial class MainWindow : Window
         if (wikiEdgeMesh.Positions.Count > 0)
         {
             var wikiMat = new EmissiveMaterial(new SolidColorBrush(
-                Color.FromArgb(60, 0, 240, 255)));
+                Color.FromArgb(60, _themeAccent.R, _themeAccent.G, _themeAccent.B)));
             group.Children.Add(new GeometryModel3D(wikiEdgeMesh, wikiMat));
         }
         if (autoEdgeMesh.Positions.Count > 0)
         {
-            // Electric purple, very translucent — auto-links are hints, not facts
+            // Secondary accent, very translucent — auto-links are hints, not facts
             var autoMat = new EmissiveMaterial(new SolidColorBrush(
-                Color.FromArgb(30, 139, 92, 246)));
+                Color.FromArgb(30, _themeSecondary.R, _themeSecondary.G, _themeSecondary.B)));
             group.Children.Add(new GeometryModel3D(autoEdgeMesh, autoMat));
+        }
+
+        // Dying-edge pass — bright red-orange so broken links are obvious.
+        // Rendered after live edges so it visually sits on top during the
+        // shrink-toward-midpoint animation.
+        if (dyingEdgeMesh.Positions.Count > 0)
+        {
+            var dyingMat = new EmissiveMaterial(new SolidColorBrush(
+                Color.FromArgb(220, 255, 90, 60)));
+            group.Children.Add(new GeometryModel3D(dyingEdgeMesh, dyingMat));
         }
 
         // Scope ring — holographic torus marking the boundary of the
@@ -986,7 +1387,7 @@ public partial class MainWindow : Window
             var renderedBubbles = new List<(ClusterTree, double)>(bubbles.Count);
 
             var bubbleMeshes = new Dictionary<Color, MeshGeometry3D>();
-            var bubbleOutlines = new Dictionary<Color, MeshGeometry3D>();
+            var bubbleRings = new List<(Point3D center, double radius, Color color)>();
 
             foreach (var b in bubbles)
             {
@@ -997,36 +1398,50 @@ public partial class MainWindow : Window
 
                 if (!bubbleMeshes.TryGetValue(bubbleColor, out var bm))
                     bubbleMeshes[bubbleColor] = bm = new MeshGeometry3D();
-                if (!bubbleOutlines.TryGetValue(bubbleColor, out var om))
-                    bubbleOutlines[bubbleColor] = om = new MeshGeometry3D();
 
                 // Inner filled sphere — sized for readability, not raw bounds
                 // (bounds are often larger than visual needs and overlap peers)
                 var visualR = Math.Min(b.Radius * 0.45, 0.6 + Math.Log(1 + b.LeafCount) * 0.18);
                 AppendSphereToMesh(bm, b.Center, visualR, SharedSphereLOD);
-                // Outer ring — slightly larger, hints at expansion
-                AppendSphereToMesh(om, b.Center, visualR * 1.15, SharedSphereLOD);
 
-                renderedBubbles.Add((b, visualR * 1.15));
+                // Replace the old solid outline shell with a category-colored
+                // equator ring. Rings show the cluster's category at a glance
+                // without occluding nodes inside, and they don't feel like a
+                // "wall" that blocks clicks. Color comes from the cluster's
+                // dominant KnowledgeCategory (always — independent of the
+                // cluster-color toggle, so the user can always tell categories
+                // apart).
+                bubbleRings.Add((b.Center, visualR * 1.05,
+                    GetCategoryColor(b.DominantCategory)));
+
+                renderedBubbles.Add((b, visualR * 1.05));
             }
 
             _lastRenderedBubbles = renderedBubbles;
 
+            // Bubbles render as *almost-invisible* glass: alpha drops from
+            // 55/35/90 → 14/8/40 so the user sees nodes inside clearly and
+            // can click them. The bubble is now more of a hint than a wall —
+            // the outline ring carries the visual weight, the fill is just
+            // a faint tint marking the cluster's territory. Without this
+            // change the outer mesh visually obscured (and felt like it
+            // physically blocked) clicks on inner nodes.
             foreach (var (color, mesh) in bubbleMeshes)
             {
                 var fillMat = new MaterialGroup();
                 fillMat.Children.Add(new DiffuseMaterial(new SolidColorBrush(
-                    Color.FromArgb(55, color.R, color.G, color.B))));
+                    Color.FromArgb(14, color.R, color.G, color.B))));
                 fillMat.Children.Add(new EmissiveMaterial(new SolidColorBrush(
-                    Color.FromArgb(35, color.R, color.G, color.B))));
+                    Color.FromArgb(8, color.R, color.G, color.B))));
                 group.Children.Add(new GeometryModel3D(mesh, fillMat) { BackMaterial = fillMat });
             }
-            foreach (var (color, mesh) in bubbleOutlines)
-            {
-                var outlineMat = new EmissiveMaterial(new SolidColorBrush(
-                    Color.FromArgb(90, color.R, color.G, color.B)));
-                group.Children.Add(new GeometryModel3D(mesh, outlineMat));
-            }
+
+            // Category equator rings — one per bubble, in the bubble's
+            // category color. Replaces the heavy outline shell. The rings
+            // are the primary visual signal for "which category is this
+            // cluster", because they're crisp lines rather than diffuse fog.
+            foreach (var (center, radius, color) in bubbleRings)
+                AppendCategoryEquatorRing(group, center, radius, color);
         }
         else
         {
@@ -1052,7 +1467,19 @@ public partial class MainWindow : Window
     /// </summary>
     private static void BuildStarfieldScene(Model3DGroup group)
     {
-        // Batch by color for cheaper draw calls
+        // Stars are static — cache once, attach by reference every frame.
+        foreach (var model in BuildStarfieldModelsOnce())
+            group.Children.Add(model);
+    }
+
+    // Cached starfield geometry — rebuilt exactly once, then cloned-by-reference
+    // into each render frame's Model3DGroup. Stars don't move, so regenerating
+    // 350 tiny meshes every frame was pure waste (~21k mesh appends/sec).
+    private static List<GeometryModel3D>? _cachedStarfieldModels;
+
+    private static List<GeometryModel3D> BuildStarfieldModelsOnce()
+    {
+        if (_cachedStarfieldModels != null) return _cachedStarfieldModels;
         var batches = new Dictionary<Color, MeshGeometry3D>();
         foreach (var (pos, r, c) in Starfield)
         {
@@ -1060,11 +1487,50 @@ public partial class MainWindow : Window
                 batches[c] = mesh = new MeshGeometry3D();
             AppendSphereToMesh(mesh, pos, r, SharedSphereTiny);
         }
+        var list = new List<GeometryModel3D>(batches.Count);
         foreach (var (c, mesh) in batches)
         {
+            mesh.Freeze();
             var mat = new EmissiveMaterial(new SolidColorBrush(c));
-            group.Children.Add(new GeometryModel3D(mesh, mat));
+            mat.Freeze();
+            var model = new GeometryModel3D(mesh, mat);
+            model.Freeze();
+            list.Add(model);
         }
+        _cachedStarfieldModels = list;
+        return list;
+    }
+
+    /// <summary>
+    /// Lightweight equator ring per bubble — a small XZ-plane torus in
+    /// the cluster's category color. This is the visual signal for "what
+    /// kind of knowledge lives here" — solid spheres don't differentiate
+    /// well, but a colored hoop does. Cheaper than `AppendScopeRing`
+    /// (single ring, no perpendicular pair, no pulse) because we draw
+    /// one for every bubble in the scene.
+    /// </summary>
+    private void AppendCategoryEquatorRing(Model3DGroup group, Point3D center, double radius, Color color)
+    {
+        var mesh = new MeshGeometry3D();
+        const int segments = 56;
+        double thickness = radius * 0.012;
+        double r = radius;
+
+        for (int i = 0; i < segments; i++)
+        {
+            double a0 = (double)i / segments * Math.PI * 2;
+            double a1 = (double)(i + 1) / segments * Math.PI * 2;
+            var p0 = new Point3D(center.X + r * Math.Cos(a0), center.Y, center.Z + r * Math.Sin(a0));
+            var p1 = new Point3D(center.X + r * Math.Cos(a1), center.Y, center.Z + r * Math.Sin(a1));
+            AppendLineToMesh(mesh, p0, p1, thickness);
+        }
+
+        var ringColor = Color.FromArgb(160,
+            (byte)Math.Min(255, color.R + 40),
+            (byte)Math.Min(255, color.G + 40),
+            (byte)Math.Min(255, color.B + 40));
+        var mat = new EmissiveMaterial(new SolidColorBrush(ringColor));
+        group.Children.Add(new GeometryModel3D(mesh, mat));
     }
 
     /// <summary>
@@ -1075,12 +1541,16 @@ public partial class MainWindow : Window
     private void AppendScopeRing(Model3DGroup group, Point3D center, double radius, Color color)
     {
         var mesh = new MeshGeometry3D();
-        int segments = 64;
-        double thickness = radius * 0.012 * (1.0 + 0.3 * Math.Sin(_time * 2));
+        // Denser segments give a crisper dash pattern
+        int segments = 96;
+        // Thinner so the ring reads as a delicate "you are here" marker, not a big halo
+        double thickness = radius * 0.0045 * (1.0 + 0.3 * Math.Sin(_time * 2));
         double r = radius * 0.98;
 
+        // Dashed pattern: emit 2 segments, skip 1 (≈66% duty cycle — reads as dashes)
         for (int i = 0; i < segments; i++)
         {
+            if (i % 3 == 2) continue;
             double a0 = (double)i / segments * Math.PI * 2;
             double a1 = (double)(i + 1) / segments * Math.PI * 2;
             var p0 = new Point3D(center.X + r * Math.Cos(a0), center.Y, center.Z + r * Math.Sin(a0));
@@ -1095,15 +1565,16 @@ public partial class MainWindow : Window
         var mat = new EmissiveMaterial(new SolidColorBrush(ringColor));
         group.Children.Add(new GeometryModel3D(mesh, mat));
 
-        // Secondary perpendicular ring for holographic feel
+        // Secondary perpendicular ring for holographic feel — shorter dashes (skip every other)
         var mesh2 = new MeshGeometry3D();
         for (int i = 0; i < segments; i++)
         {
+            if (i % 2 == 1) continue;
             double a0 = (double)i / segments * Math.PI * 2;
             double a1 = (double)(i + 1) / segments * Math.PI * 2;
             var p0 = new Point3D(center.X, center.Y + r * Math.Cos(a0), center.Z + r * Math.Sin(a0));
             var p1 = new Point3D(center.X, center.Y + r * Math.Cos(a1), center.Z + r * Math.Sin(a1));
-            AppendLineToMesh(mesh2, p0, p1, thickness * 0.6);
+            AppendLineToMesh(mesh2, p0, p1, thickness * 0.55);
         }
         var dimRing = Color.FromArgb(80, color.R, color.G, color.B);
         group.Children.Add(new GeometryModel3D(mesh2, new EmissiveMaterial(new SolidColorBrush(dimRing))));
@@ -1129,11 +1600,12 @@ public partial class MainWindow : Window
             // hit starts tiny and grows as it fades.
             var growth = 1.0 - n.AccessIntensity;
             var ringR = n.Radius * (2.0 + growth * 4.5);
-            double thick = n.Radius * 0.08 * (0.4 + n.AccessIntensity * 0.8);
+            double thick = n.Radius * 0.035 * (0.4 + n.AccessIntensity * 0.8);
 
-            int segs = 32;
+            int segs = 48;
             for (int s = 0; s < segs; s++)
             {
+                if (s % 2 == 1) continue; // dashed: every other segment
                 double a0 = (double)s / segs * Math.PI * 2;
                 double a1 = (double)(s + 1) / segs * Math.PI * 2;
                 var p0 = new Point3D(n.Position.X + ringR * Math.Cos(a0), n.Position.Y, n.Position.Z + ringR * Math.Sin(a0));
@@ -1145,7 +1617,7 @@ public partial class MainWindow : Window
 
         if (count > 0)
         {
-            var rippleColor = Color.FromArgb(180, 0, 240, 255);
+            var rippleColor = Color.FromArgb(180, _themeAccent.R, _themeAccent.G, _themeAccent.B);
             group.Children.Add(new GeometryModel3D(mesh,
                 new EmissiveMaterial(new SolidColorBrush(rippleColor))));
         }
@@ -1162,12 +1634,15 @@ public partial class MainWindow : Window
         var breathe = 1.0 + Math.Sin(_time * 4) * 0.22;
         var baseR = target.Radius * 2.2 * breathe;
 
-        // Twin rings — equator + meridian — like a tactical reticle
+        // Twin rings — equator + meridian — like a tactical reticle.
+        // Dashed for a holographic reticle feel, thinner so it doesn't
+        // overwhelm the node itself.
         var ringMesh = new MeshGeometry3D();
-        int segs = 48;
-        double thick = target.Radius * 0.08;
+        int segs = 72;
+        double thick = target.Radius * 0.035;
         for (int i = 0; i < segs; i++)
         {
+            if (i % 3 == 2) continue; // dashed — 2-on, 1-off pattern
             double a0 = (double)i / segs * Math.PI * 2;
             double a1 = (double)(i + 1) / segs * Math.PI * 2;
             var eq0 = new Point3D(target.Position.X + baseR * Math.Cos(a0),
@@ -1186,13 +1661,13 @@ public partial class MainWindow : Window
             AppendLineToMesh(ringMesh, me0, me1, thick * 0.7);
         }
         group.Children.Add(new GeometryModel3D(ringMesh,
-            new EmissiveMaterial(new SolidColorBrush(Color.FromArgb(220, 0, 240, 255)))));
+            new EmissiveMaterial(new SolidColorBrush(Color.FromArgb(220, _themeAccent.R, _themeAccent.G, _themeAccent.B)))));
 
         // Outer translucent aura
         var haloMesh = new MeshGeometry3D();
         AppendSphereToMesh(haloMesh, target.Position, baseR * 1.15, SharedSphereLOD);
         group.Children.Add(new GeometryModel3D(haloMesh,
-            new EmissiveMaterial(new SolidColorBrush(Color.FromArgb(55, 0, 240, 255)))));
+            new EmissiveMaterial(new SolidColorBrush(Color.FromArgb(55, _themeAccent.R, _themeAccent.G, _themeAccent.B)))));
     }
 
     /// <summary>
@@ -1286,8 +1761,8 @@ public partial class MainWindow : Window
         var centerMesh = new MeshGeometry3D();
         AppendSphereToMesh(centerMesh, new Point3D(0, 0, 0), 1.5, SharedSphere);
         var centerMat = new MaterialGroup();
-        centerMat.Children.Add(new DiffuseMaterial(new SolidColorBrush(Color.FromArgb(60, 0, 240, 255))));
-        centerMat.Children.Add(new EmissiveMaterial(new SolidColorBrush(Color.FromArgb(30, 139, 92, 246))));
+        centerMat.Children.Add(new DiffuseMaterial(new SolidColorBrush(Color.FromArgb(60, _themeAccent.R, _themeAccent.G, _themeAccent.B))));
+        centerMat.Children.Add(new EmissiveMaterial(new SolidColorBrush(Color.FromArgb(30, _themeSecondary.R, _themeSecondary.G, _themeSecondary.B))));
         group.Children.Add(new GeometryModel3D(centerMesh, centerMat));
 
         var orbitMesh = new MeshGeometry3D();
@@ -1300,7 +1775,7 @@ public partial class MainWindow : Window
             AppendSphereToMesh(orbitMesh, pos, 0.08 + rng.NextDouble() * 0.12, SharedSphereLOD);
         }
         var orbitMat = new MaterialGroup();
-        orbitMat.Children.Add(new EmissiveMaterial(new SolidColorBrush(Color.FromArgb(180, 0, 240, 255))));
+        orbitMat.Children.Add(new EmissiveMaterial(new SolidColorBrush(Color.FromArgb(180, _themeAccent.R, _themeAccent.G, _themeAccent.B))));
         group.Children.Add(new GeometryModel3D(orbitMesh, orbitMat));
     }
 
@@ -1424,6 +1899,37 @@ public partial class MainWindow : Window
     private void Viewport_MouseWheel(object s, MouseWheelEventArgs e)
     {
         _camDist = Math.Clamp(_camDist - e.Delta * 0.005, 3, 30);
+        // Stop the wheel event from bubbling to the dashboard's outer
+        // ScrollViewer — otherwise the page scrolls AND the camera zooms
+        // simultaneously, which is the "zoom feels broken" bug.
+        e.Handled = true;
+    }
+
+    /// <summary>
+    /// Frame the entire dashboard graph in the camera's view. Computes the
+    /// bounding sphere of all node positions and pushes the camera back
+    /// just far enough that the sphere fits inside the field of view, with
+    /// a small margin so nodes don't kiss the viewport edges.
+    /// </summary>
+    private void FitDashCamera()
+    {
+        if (_dashPhysics == null || _dashPhysics.Nodes.Count == 0) return;
+
+        double maxR2 = 0;
+        foreach (var n in _dashPhysics.Nodes)
+        {
+            var p = n.Position;
+            var r2 = p.X * p.X + p.Y * p.Y + p.Z * p.Z;
+            if (r2 > maxR2) maxR2 = r2;
+        }
+        var radius = Math.Sqrt(maxR2);
+        if (radius < 0.5) return; // physics not yet positioned
+
+        // FOV = 45° → half-angle 22.5°. Distance such that a sphere of
+        // radius R fills the viewport: dist = R / tan(half-FOV). Add a
+        // 30% margin so the outermost nodes have breathing room.
+        var dist = radius / Math.Tan(22.5 * Math.PI / 180.0) * 1.3;
+        _camDist = Math.Clamp(dist, 3, 30);
     }
 
     private void Viewport_RightClick(object s, MouseButtonEventArgs e)
@@ -1744,21 +2250,30 @@ public partial class MainWindow : Window
         detailBlock.Text = $"{node.Category.ToString().Replace("_", " / ")} · {node.WordCount:N0} words · {node.LinkedIds.Count} links";
         dot.Fill = new SolidColorBrush(GetCategoryColor(node.Category));
 
-        // Load file content preview
+        // Remember which file this panel is bound to (for Edit/Save)
         var graphNode = _graph.Nodes.FirstOrDefault(n => n.Id == node.Id);
-        if (graphNode != null && File.Exists(graphNode.FilePath))
+        var filePath = graphNode?.FilePath;
+        if (panel == GraphNodeInfo) _graphNodeFilePath = filePath;
+        else if (panel == NodeInfoPanel) _dashNodeFilePath = filePath;
+
+        // Load file content preview
+        if (filePath != null && File.Exists(filePath))
         {
             try
             {
-                var content = File.ReadAllText(graphNode.FilePath);
-                // Strip YAML frontmatter
-                if (content.StartsWith("---"))
+                var content = File.ReadAllText(filePath);
+                // Strip YAML frontmatter for the preview only — the editor keeps it.
+                var preview = content;
+                if (preview.StartsWith("---"))
                 {
-                    var endIdx = content.IndexOf("---", 3, StringComparison.Ordinal);
-                    if (endIdx > 0) content = content[(endIdx + 3)..].TrimStart();
+                    var endIdx = preview.IndexOf("---", 3, StringComparison.Ordinal);
+                    if (endIdx > 0) preview = preview[(endIdx + 3)..].TrimStart();
                 }
-                // Show first ~500 chars
-                contentBlock.Text = content.Length > 500 ? content[..500] + "..." : content;
+                contentBlock.Text = preview.Length > 500 ? preview[..500] + "..." : preview;
+
+                // Keep the full content around for when the user hits Edit.
+                if (panel == GraphNodeInfo) _graphNodeRawContent = content;
+                else if (panel == NodeInfoPanel) _dashNodeRawContent = content;
             }
             catch
             {
@@ -1769,6 +2284,232 @@ public partial class MainWindow : Window
         {
             contentBlock.Text = "(File not found)";
         }
+
+        // Reset auto-hide: 15s timer, cancelled while the cursor is inside
+        // the panel or an edit is in progress.
+        if (panel == GraphNodeInfo) ResetGraphNodeHideTimer();
+        else if (panel == NodeInfoPanel) ResetDashNodeHideTimer();
+    }
+
+    // ── Per-panel state for the inline editor + auto-hide ──
+    private string? _dashNodeFilePath;
+    private string? _dashNodeRawContent;
+    private bool _dashNodeEditing;
+    private DispatcherTimer? _dashNodeHideTimer;
+
+    private string? _graphNodeFilePath;
+    private string? _graphNodeRawContent;
+    private bool _graphNodeEditing;
+    private DispatcherTimer? _graphNodeHideTimer;
+
+    private const double NodeInfoHideSeconds = 15.0;
+
+    private void ResetDashNodeHideTimer()
+    {
+        _dashNodeHideTimer ??= new DispatcherTimer(DispatcherPriority.Background);
+        _dashNodeHideTimer.Stop();
+        _dashNodeHideTimer.Interval = TimeSpan.FromSeconds(NodeInfoHideSeconds);
+        _dashNodeHideTimer.Tick -= DashNodeHideTimer_Tick;
+        _dashNodeHideTimer.Tick += DashNodeHideTimer_Tick;
+        if (!_dashNodeEditing && NodeInfoPanel?.Visibility == Visibility.Visible)
+            _dashNodeHideTimer.Start();
+    }
+
+    private void DashNodeHideTimer_Tick(object? s, EventArgs e)
+    {
+        _dashNodeHideTimer?.Stop();
+        if (NodeInfoPanel == null) return;
+        if (_dashNodeEditing) return;                 // don't nuke unsaved edits
+        if (NodeInfoPanel.IsMouseOver) { _dashNodeHideTimer?.Start(); return; }
+        NodeInfoPanel.Visibility = Visibility.Collapsed;
+    }
+
+    private void ResetGraphNodeHideTimer()
+    {
+        _graphNodeHideTimer ??= new DispatcherTimer(DispatcherPriority.Background);
+        _graphNodeHideTimer.Stop();
+        _graphNodeHideTimer.Interval = TimeSpan.FromSeconds(NodeInfoHideSeconds);
+        _graphNodeHideTimer.Tick -= GraphNodeHideTimer_Tick;
+        _graphNodeHideTimer.Tick += GraphNodeHideTimer_Tick;
+        if (!_graphNodeEditing && GraphNodeInfo?.Visibility == Visibility.Visible)
+            _graphNodeHideTimer.Start();
+    }
+
+    private void GraphNodeHideTimer_Tick(object? s, EventArgs e)
+    {
+        _graphNodeHideTimer?.Stop();
+        if (GraphNodeInfo == null) return;
+        if (_graphNodeEditing) return;
+        if (GraphNodeInfo.IsMouseOver) { _graphNodeHideTimer?.Start(); return; }
+        GraphNodeInfo.Visibility = Visibility.Collapsed;
+    }
+
+    // ── Mouse hover pauses the auto-hide countdown ──
+    private void NodeInfoPanel_MouseEnter(object s, MouseEventArgs e) => _dashNodeHideTimer?.Stop();
+    private void NodeInfoPanel_MouseLeave(object s, MouseEventArgs e) => ResetDashNodeHideTimer();
+    private void GraphNodeInfo_MouseEnter(object s, MouseEventArgs e) => _graphNodeHideTimer?.Stop();
+    private void GraphNodeInfo_MouseLeave(object s, MouseEventArgs e) => ResetGraphNodeHideTimer();
+
+    // ── Close (×) ──
+    private void CloseDashNode_Click(object s, RoutedEventArgs e)
+    {
+        CancelDashEdit();
+        NodeInfoPanel.Visibility = Visibility.Collapsed;
+        _dashNodeHideTimer?.Stop();
+    }
+
+    private void CloseGraphNode_Click(object s, RoutedEventArgs e)
+    {
+        CancelGraphEdit();
+        GraphNodeInfo.Visibility = Visibility.Collapsed;
+        _graphNodeHideTimer?.Stop();
+    }
+
+    // ── Edit / Save / Cancel — dashboard ──
+    private void EditDashNode_Click(object s, RoutedEventArgs e)
+    {
+        if (_dashNodeRawContent == null || _dashNodeFilePath == null) return;
+        _dashNodeEditing = true;
+        NodeInfoEditor.Text = _dashNodeRawContent;
+        NodeInfoEditor.Visibility = Visibility.Visible;
+        NodeInfoContentScroll.Visibility = Visibility.Collapsed;
+        DashNodeEditBtn.Visibility = Visibility.Collapsed;
+        DashNodeSaveBtn.Visibility = Visibility.Visible;
+        DashNodeCancelBtn.Visibility = Visibility.Visible;
+        NodeInfoEditor.Focus();
+        _dashNodeHideTimer?.Stop();
+    }
+
+    private void SaveDashNode_Click(object s, RoutedEventArgs e)
+    {
+        if (_dashNodeFilePath == null) return;
+        try
+        {
+            File.WriteAllText(_dashNodeFilePath, NodeInfoEditor.Text);
+            StatusText.Text = $"💾 Saved {Path.GetFileName(_dashNodeFilePath)} · re-indexing…";
+            _dashNodeRawContent = NodeInfoEditor.Text;
+            ExitDashEditMode();
+            // Refresh preview from the just-saved content
+            var preview = _dashNodeRawContent;
+            if (preview.StartsWith("---"))
+            {
+                var endIdx = preview.IndexOf("---", 3, StringComparison.Ordinal);
+                if (endIdx > 0) preview = preview[(endIdx + 3)..].TrimStart();
+            }
+            NodeInfoContent.Text = preview.Length > 500 ? preview[..500] + "..." : preview;
+            // The vault watcher will pick it up, but fire a direct re-index
+            // so the user sees instant feedback in stats + physics.
+            _ = TriggerDirectReindexAsync();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Save failed: {ex.Message}", "Save error",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void CancelDashNode_Click(object s, RoutedEventArgs e) => CancelDashEdit();
+
+    private void CancelDashEdit()
+    {
+        if (!_dashNodeEditing) return;
+        ExitDashEditMode();
+        ResetDashNodeHideTimer();
+    }
+
+    private void ExitDashEditMode()
+    {
+        _dashNodeEditing = false;
+        NodeInfoEditor.Visibility = Visibility.Collapsed;
+        NodeInfoContentScroll.Visibility = Visibility.Visible;
+        DashNodeEditBtn.Visibility = Visibility.Visible;
+        DashNodeSaveBtn.Visibility = Visibility.Collapsed;
+        DashNodeCancelBtn.Visibility = Visibility.Collapsed;
+    }
+
+    // ── Edit / Save / Cancel — brain graph ──
+    private void EditGraphNode_Click(object s, RoutedEventArgs e)
+    {
+        if (_graphNodeRawContent == null || _graphNodeFilePath == null) return;
+        _graphNodeEditing = true;
+        GraphNodeEditor.Text = _graphNodeRawContent;
+        GraphNodeEditor.Visibility = Visibility.Visible;
+        GraphNodeContentScroll.Visibility = Visibility.Collapsed;
+        GraphNodeEditBtn.Visibility = Visibility.Collapsed;
+        GraphNodeSaveBtn.Visibility = Visibility.Visible;
+        GraphNodeCancelBtn.Visibility = Visibility.Visible;
+        GraphNodeEditor.Focus();
+        _graphNodeHideTimer?.Stop();
+    }
+
+    private void SaveGraphNode_Click(object s, RoutedEventArgs e)
+    {
+        if (_graphNodeFilePath == null) return;
+        try
+        {
+            File.WriteAllText(_graphNodeFilePath, GraphNodeEditor.Text);
+            StatusText.Text = $"💾 Saved {Path.GetFileName(_graphNodeFilePath)} · re-indexing…";
+            _graphNodeRawContent = GraphNodeEditor.Text;
+            ExitGraphEditMode();
+            var preview = _graphNodeRawContent;
+            if (preview.StartsWith("---"))
+            {
+                var endIdx = preview.IndexOf("---", 3, StringComparison.Ordinal);
+                if (endIdx > 0) preview = preview[(endIdx + 3)..].TrimStart();
+            }
+            GraphNodeContent.Text = preview.Length > 500 ? preview[..500] + "..." : preview;
+            _ = TriggerDirectReindexAsync();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Save failed: {ex.Message}", "Save error",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void CancelGraphNode_Click(object s, RoutedEventArgs e) => CancelGraphEdit();
+
+    private void CancelGraphEdit()
+    {
+        if (!_graphNodeEditing) return;
+        ExitGraphEditMode();
+        ResetGraphNodeHideTimer();
+    }
+
+    private void ExitGraphEditMode()
+    {
+        _graphNodeEditing = false;
+        GraphNodeEditor.Visibility = Visibility.Collapsed;
+        GraphNodeContentScroll.Visibility = Visibility.Visible;
+        GraphNodeEditBtn.Visibility = Visibility.Visible;
+        GraphNodeSaveBtn.Visibility = Visibility.Collapsed;
+        GraphNodeCancelBtn.Visibility = Visibility.Collapsed;
+    }
+
+    /// <summary>
+    /// Re-runs the indexer + diff-loads the physics so the 3D graph
+    /// reflects a just-saved edit immediately. Safe to call on UI thread —
+    /// the heavy work runs on a background task.
+    /// </summary>
+    private async Task TriggerDirectReindexAsync()
+    {
+        if (_vaultIndexInFlight) return;
+        _vaultIndexInFlight = true;
+        try
+        {
+            var result = await Task.Run(IndexVaultCore);
+            if (result.Graph != null)
+            {
+                _graph = result.Graph;
+                _dashPhysics.LoadFromGraphDiff(_graph);
+                _graphPhysics.LoadFromGraphDiff(_graph);
+                UpdateUI();
+                RefreshVaultTree();
+                var wikiEdges = _graph.Edges.Count(e => e.RelationType == "wiki-link");
+                StatusText.Text = $"✅ Saved · {_graph.TotalNodes} nodes · {wikiEdges} wiki-links";
+            }
+        }
+        finally { _vaultIndexInFlight = false; }
     }
 
     // ═══════════════════════════════════════
@@ -2091,9 +2832,60 @@ public partial class MainWindow : Window
             _identity.SaveToFile(_identityPath);
         }
 
-        BrainNameText.Text = _identity.DisplayName;
-        BrainAddressText.Text = _identity.Address;
+        UpdateBrainTitleLabel();
         FullAddressText.Text = _identity.Address;
+    }
+
+    /// <summary>Shows "(DisplayName · 0xBRAIN-abcd)" next to the app name in the title bar.</summary>
+    private void UpdateBrainTitleLabel()
+    {
+        if (BrainTitleLabel == null || _identity == null) return;
+        // Compact address — first 12 chars of the 0xBRAIN-... hex is plenty.
+        var shortAddr = _identity.Address.Length > 12
+            ? _identity.Address[..12] + "…"
+            : _identity.Address;
+        BrainTitleLabel.Text = $"({_identity.DisplayName} · {shortAddr})";
+    }
+
+    /// <summary>
+    /// Pulls the version straight from the assembly metadata set by the
+    /// csproj &lt;Version&gt; element, so About always matches whatever was
+    /// just built. Removes the old hardcoded "v2.0.0" that went stale.
+    /// </summary>
+    private void UpdateAboutCard()
+    {
+        try
+        {
+            var asm = System.Reflection.Assembly.GetEntryAssembly()
+                   ?? System.Reflection.Assembly.GetExecutingAssembly();
+            var informational = asm
+                .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+                .OfType<System.Reflection.AssemblyInformationalVersionAttribute>()
+                .FirstOrDefault()?.InformationalVersion;
+            var ver = asm.GetName().Version;
+            var display = !string.IsNullOrWhiteSpace(informational)
+                ? informational
+                : ver != null ? $"{ver.Major}.{ver.Minor}.{ver.Build}" : "dev";
+
+            if (AboutVersionText != null)
+                AboutVersionText.Text = $"ObsidianX — Neural Knowledge Network v{display}";
+
+            if (AboutBuildText != null)
+            {
+                var build = "";
+                try
+                {
+                    var loc = asm.Location;
+                    if (!string.IsNullOrEmpty(loc) && File.Exists(loc))
+                        build = File.GetLastWriteTime(loc).ToString("yyyy-MM-dd HH:mm");
+                }
+                catch { }
+                AboutBuildText.Text = string.IsNullOrEmpty(build)
+                    ? $"assembly {ver}"
+                    : $"built {build} · assembly {ver}";
+            }
+        }
+        catch { /* fall back silently to XAML default */ }
     }
 
     private void IndexVault()
@@ -2150,21 +2942,27 @@ public partial class MainWindow : Window
 
     private void CheckClaudeConnection()
     {
+        // Used to also drive a dashboard "Claude AI Connection" card that
+        // duplicated the dedicated Claude tab and confused the layout —
+        // that card has been removed. We still init _claude here (other
+        // code paths use it) and surface status on the dedicated tab.
         _claude = new ClaudeIntegration(_vaultPath);
-        var status = _claude.CheckConnection();
-        if (status.IsConnected)
+
+        // Make sure CLAUDE.md exists with a sensible header on first run;
+        // BrainExporter only owns the marker-bound section, not the rest.
+        var claudeMdPath = Path.Combine(_vaultPath, "CLAUDE.md");
+        if (!File.Exists(claudeMdPath))
         {
-            ClaudeStatusText.Text = "Connected to Claude";
-            ClaudeStatusText.Foreground = (SolidColorBrush)FindResource("NeonGreenBrush");
-            ClaudeDetailText.Text = $"CLAUDE.md active at {_vaultPath}";
-            ClaudeViewStatus.Text = "Claude is connected to your brain vault";
+            try { _claude.GenerateClaudeMd(_graph, _identity); }
+            catch (Exception ex) { Debug.WriteLine($"GenerateClaudeMd failed: {ex.Message}"); }
         }
-        else
+
+        var status = _claude.CheckConnection();
+        if (ClaudeViewStatus != null)
         {
-            ClaudeStatusText.Text = status.StatusMessage;
-            ClaudeStatusText.Foreground = (SolidColorBrush)FindResource("TextSecondaryBrush");
-            ClaudeDetailText.Text = "Click 'Connect to Claude' to set up";
-            ClaudeViewStatus.Text = status.StatusMessage;
+            ClaudeViewStatus.Text = status.IsConnected
+                ? "Claude is connected to your brain vault"
+                : status.StatusMessage;
         }
     }
 
@@ -2279,6 +3077,212 @@ public partial class MainWindow : Window
     }
 
     // ═══════════════════════════════════════
+    // UI COLOR THEME
+    // ═══════════════════════════════════════
+
+    // Each theme only overrides the accent palette — dark backgrounds,
+    // text neutrals, and surface shades stay stable so legibility is
+    // preserved across themes.
+    private record UiThemePreset(
+        string Key,
+        string Label,
+        Color Accent,       // primary glow (was "NeonCyan" — now any accent)
+        Color Secondary,    // electric-purple analogue
+        Color Tertiary,     // neon-pink analogue
+        Color LogoA,        // logo gradient start
+        Color LogoB,        // logo gradient end
+        Color LogoMid);     // logo mid accent
+
+    private static readonly List<UiThemePreset> ThemePresets = new()
+    {
+        new("MagentaNebula",  "Magenta Nebula",  C("#FF2E94"), C("#B044FF"), C("#FF6BB0"), C("#FF1E8A"), C("#8A2BE2"), C("#FF5FA6")),
+        new("NeonCyan",       "Neon Cyan",       C("#00F0FF"), C("#8B5CF6"), C("#FF6BB0"), C("#00E0FF"), C("#8B5CF6"), C("#4FC3F7")),
+        new("MatrixGreen",    "Matrix Green",    C("#00FF88"), C("#00CCAA"), C("#79FFC8"), C("#00FF88"), C("#007F55"), C("#4FD0A5")),
+        new("SunsetOrange",   "Sunset Orange",   C("#FF6B35"), C("#FF2E94"), C("#FFAD5A"), C("#FF5A1F"), C("#B22E7B"), C("#FFB07A")),
+        new("IceBlue",        "Ice Blue",        C("#4FC3F7"), C("#64B5F6"), C("#81D4FA"), C("#29B6F6"), C("#1976D2"), C("#B3E5FC")),
+        new("CrimsonPulse",   "Crimson Pulse",   C("#FF1744"), C("#D500F9"), C("#FF5A7A"), C("#FF1744"), C("#7B1FA2"), C("#FF8A9B"))
+    };
+
+    private static Color C(string hex)
+    {
+        var c = (Color)ColorConverter.ConvertFromString(hex);
+        return c;
+    }
+
+    private void PopulateThemeList()
+    {
+        ThemeList.Items.Clear();
+        foreach (var t in ThemePresets)
+        {
+            var row = new Button
+            {
+                Cursor = System.Windows.Input.Cursors.Hand,
+                Padding = new Thickness(8, 6, 8, 6),
+                Margin = new Thickness(0, 0, 0, 4),
+                BorderThickness = new Thickness(1),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(60, 255, 255, 255)),
+                Background = new SolidColorBrush(Color.FromArgb(20, t.Accent.R, t.Accent.G, t.Accent.B)),
+                HorizontalContentAlignment = HorizontalAlignment.Stretch,
+                Tag = t.Key,
+                ToolTip = $"Apply {t.Label} theme"
+            };
+            var panel = new StackPanel { Orientation = Orientation.Horizontal };
+            panel.Children.Add(new System.Windows.Shapes.Ellipse { Width = 14, Height = 14, Fill = new SolidColorBrush(t.Accent), Margin = new Thickness(0, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center });
+            panel.Children.Add(new System.Windows.Shapes.Ellipse { Width = 14, Height = 14, Fill = new SolidColorBrush(t.Secondary), Margin = new Thickness(0, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center });
+            panel.Children.Add(new System.Windows.Shapes.Ellipse { Width = 14, Height = 14, Fill = new SolidColorBrush(t.Tertiary), Margin = new Thickness(0, 0, 10, 0), VerticalAlignment = VerticalAlignment.Center });
+            var labelText = new TextBlock
+            {
+                Text = t.Label + (t.Key == _uiTheme ? "  \u2713" : ""),
+                Foreground = new SolidColorBrush(Color.FromRgb(0xE8, 0xE6, 0xF5)),
+                FontSize = 12,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            panel.Children.Add(labelText);
+            row.Content = panel;
+            row.Click += (s, e) =>
+            {
+                ApplyUiTheme(t.Key);
+                ThemePopup.IsOpen = false;
+                PopulateThemeList();
+                SaveSettingsToFile();
+            };
+            ThemeList.Items.Add(row);
+        }
+    }
+
+    private void ThemeButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (ThemeList.Items.Count == 0) PopulateThemeList();
+        SyncBgDimSlidersFromState();
+        ThemePopup.IsOpen = !ThemePopup.IsOpen;
+    }
+
+    // Push current dim values into the popup sliders + their % labels. Called
+    // when opening the popup so the UI always reflects live state even if
+    // sliders haven't been touched yet this session.
+    private void SyncBgDimSlidersFromState()
+    {
+        if (GraphBgDimSlider != null) GraphBgDimSlider.Value = _graphBgDim;
+        if (DashBgDimSlider != null)  DashBgDimSlider.Value  = _dashBgDim;
+        if (WindowBgDimSlider != null) WindowBgDimSlider.Value = _windowBgDim;
+        UpdateBgDimLabels();
+    }
+
+    private void UpdateBgDimLabels()
+    {
+        if (GraphBgDimLabel != null)  GraphBgDimLabel.Text  = $"{(int)Math.Round(_graphBgDim * 100)}%";
+        if (DashBgDimLabel != null)   DashBgDimLabel.Text   = $"{(int)Math.Round(_dashBgDim * 100)}%";
+        if (WindowBgDimLabel != null) WindowBgDimLabel.Text = $"{(int)Math.Round(_windowBgDim * 100)}%";
+    }
+
+    // Push dim state into the actual ImageBrush opacities. Safe to call
+    // before first show because we null-check (Window_Loaded runs after
+    // InitializeComponent so the named elements exist).
+    private void ApplyBgDim()
+    {
+        if (GraphBgBrush != null) GraphBgBrush.Opacity = _graphBgDim;
+        if (DashBgBrush != null)  DashBgBrush.Opacity  = _dashBgDim;
+        if (WindowBgTexture != null) WindowBgTexture.Opacity = _windowBgDim;
+        UpdateBgDimLabels();
+    }
+
+    private void GraphBgDimSlider_Changed(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        _graphBgDim = e.NewValue;
+        if (GraphBgBrush != null) GraphBgBrush.Opacity = _graphBgDim;
+        if (GraphBgDimLabel != null) GraphBgDimLabel.Text = $"{(int)Math.Round(_graphBgDim * 100)}%";
+        SaveSettingsToFile();
+    }
+
+    private void DashBgDimSlider_Changed(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        _dashBgDim = e.NewValue;
+        if (DashBgBrush != null) DashBgBrush.Opacity = _dashBgDim;
+        if (DashBgDimLabel != null) DashBgDimLabel.Text = $"{(int)Math.Round(_dashBgDim * 100)}%";
+        SaveSettingsToFile();
+    }
+
+    private void WindowBgDimSlider_Changed(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        _windowBgDim = e.NewValue;
+        if (WindowBgTexture != null) WindowBgTexture.Opacity = _windowBgDim;
+        if (WindowBgDimLabel != null) WindowBgDimLabel.Text = $"{(int)Math.Round(_windowBgDim * 100)}%";
+        SaveSettingsToFile();
+    }
+
+    // Swap the live accent brushes so every `{StaticResource NeonCyanBrush}`
+    // consumer repaints on the next render pass. We mutate the brush
+    // instance (its Color DP) rather than replacing the dictionary entry
+    // — StaticResource usages hold a reference to the brush, not the key.
+    private void ApplyUiTheme(string key)
+    {
+        var t = ThemePresets.FirstOrDefault(p => p.Key == key);
+        if (t == null) return;
+        _uiTheme = key;
+
+        // Cache colors for the 3D renderer (edges, rings, halos read these
+        // every frame and bake them into per-frame meshes).
+        _themeAccent = t.Accent;
+        _themeSecondary = t.Secondary;
+        _themeTertiary = t.Tertiary;
+
+        // 2D renderers cache frozen brushes per theme — repaint to pick up
+        // the new colors next invalidate.
+        DashGraph2D?.SetTheme(_themeAccent, _themeSecondary);
+        FullGraph2D?.SetTheme(_themeAccent, _themeSecondary);
+
+        var res = Application.Current.Resources;
+
+        void SetBrush(string brushKey, Color c)
+        {
+            if (res[brushKey] is SolidColorBrush b && !b.IsFrozen) b.Color = c;
+        }
+        void SetGradient(string brushKey, Color a, Color b)
+        {
+            if (res[brushKey] is LinearGradientBrush g && !g.IsFrozen && g.GradientStops.Count >= 2)
+            {
+                g.GradientStops[0].Color = a;
+                g.GradientStops[^1].Color = b;
+            }
+        }
+        void SetShadow(string effectKey, Color c)
+        {
+            if (res[effectKey] is System.Windows.Media.Effects.DropShadowEffect e && !e.IsFrozen) e.Color = c;
+        }
+
+        // Accent brushes (keep historic names; only values change)
+        SetBrush("NeonCyanBrush", t.Accent);
+        SetBrush("ElectricPurpleBrush", t.Secondary);
+        SetBrush("NeonPinkBrush", t.Tertiary);
+
+        // Gradients that blend accent into secondary/tertiary
+        SetGradient("CyanPurpleGradient", t.Accent, t.Secondary);
+        SetGradient("PurplePinkGradient", t.Secondary, t.Tertiary);
+        SetGradient("LogoGradient", t.LogoA, t.LogoB);
+
+        // Glow shadows tinted with the new accent
+        SetShadow("CyanGlow", t.Accent);
+        SetShadow("PurpleGlow", t.Secondary);
+        SetShadow("PinkGlow", t.Tertiary);
+        SetShadow("SubtleGlow", t.Accent);
+        SetShadow("LogoGlow", t.LogoA);
+
+        // Replace Color resources so DynamicResource bindings throughout the app re-resolve
+        res["NeonCyanColor"] = t.Accent;
+        res["ElectricPurpleColor"] = t.Secondary;
+        res["NeonPinkColor"] = t.Tertiary;
+        res["LogoMagentaColor"] = t.LogoA;
+        res["LogoVioletColor"] = t.LogoB;
+        res["LogoRoseColor"] = t.LogoMid;
+
+        // Retint named 3D directional lights (both dashboard and graph viewports)
+        if (DashKeyLight != null) DashKeyLight.Color = t.Accent;
+        if (DashFillLight != null) DashFillLight.Color = t.Secondary;
+        if (GraphKeyLight != null) GraphKeyLight.Color = t.Accent;
+        if (GraphFillLight != null) GraphFillLight.Color = t.Secondary;
+    }
+
+    // ═══════════════════════════════════════
     // WINDOW CONTROLS
     // ═══════════════════════════════════════
     private void TitleBar_MouseLeftButtonDown(object s, MouseButtonEventArgs e)
@@ -2352,16 +3356,11 @@ public partial class MainWindow : Window
     // ═══════════════════════════════════════
     // ACTIONS
     // ═══════════════════════════════════════
-    private void ConnectClaude_Click(object s, RoutedEventArgs e)
-    {
-        _claude.GenerateClaudeMd(_graph, _identity);
-        CheckClaudeConnection();
-        StatusText.Text = "Claude connected! CLAUDE.md generated.";
-        MessageBox.Show(
-            $"CLAUDE.md generated at:\n{_vaultPath}\\CLAUDE.md\n\n" +
-            "To use:\n1. Open terminal at vault folder\n2. Run: claude\n3. Claude reads your brain profile!\n\nStatus: SUCCESS",
-            "ObsidianX — Claude Connected", MessageBoxButton.OK, MessageBoxImage.Information);
-    }
+    // ConnectClaude_Click was removed along with the dashboard "Connect to
+    // Claude" card. The dedicated AI tab now owns all Claude UI; CLAUDE.md
+    // is auto-generated by CheckClaudeConnection on first launch when the
+    // file is missing, and BrainExporter keeps the auto-managed section
+    // fresh on every export.
 
     private void ReindexVault_Click(object s, RoutedEventArgs e)
     {
@@ -2580,7 +3579,7 @@ public partial class MainWindow : Window
         var startLen = ClaudeOutput.Text.Length;
         try
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
+            using var http = BuildLocalHttpClient(TimeSpan.FromMinutes(5));
             var payload = Newtonsoft.Json.JsonConvert.SerializeObject(new
             {
                 message = q, backend, model, stream = true
@@ -2634,42 +3633,153 @@ public partial class MainWindow : Window
 
     private async void RefreshAiBackends_Click(object s, RoutedEventArgs e) => await LoadAiBackends();
 
+    /// <summary>
+    /// HttpClient configured for localhost calls — proxy disabled so we
+    /// don't pay the ~5-10 second WPAD auto-detect tax that Windows
+    /// imposes by default on every fresh HttpClient. That tax was the
+    /// reason `LoadAiBackends` was timing out at 4s even when the Server
+    /// was reachable; switching to UseProxy=false makes localhost calls
+    /// effectively instant.
+    /// </summary>
+    private static HttpClient BuildLocalHttpClient(double timeoutSec = 8)
+        => BuildLocalHttpClient(TimeSpan.FromSeconds(timeoutSec));
+
+    private static HttpClient BuildLocalHttpClient(TimeSpan timeout)
+    {
+        var handler = new HttpClientHandler
+        {
+            UseProxy = false,
+            UseCookies = false,
+            AllowAutoRedirect = false,
+        };
+        return new HttpClient(handler) { Timeout = timeout };
+    }
+
     private async Task LoadAiBackends()
     {
         if (AiBackendCombo == null) return;
+
+        // Auto-launch the Server if nothing is listening on 5142. This is
+        // the symmetric counterpart to MCP launching the Client — without
+        // it, opening the Client cold leaves AI/model dropdowns empty
+        // because the backends API never responds.
+        TryLaunchServerIfNotRunning();
+
+        // Retry a few times — Kestrel takes 1-3 seconds to bind after
+        // launch, so the first request often misses if we just spawned it.
+        Exception? lastEx = null;
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            try
+            {
+                using var http = BuildLocalHttpClient();
+                var url = _serverUrl.Replace("/brain-hub", "") + "/api/ai/backends";
+                var json = await http.GetStringAsync(url);
+                var root = Newtonsoft.Json.Linq.JObject.Parse(json);
+
+                AiBackendCombo.Items.Clear();
+                AiModelCombo.Items.Clear();
+                var backends = root["backends"] as Newtonsoft.Json.Linq.JArray ?? [];
+                foreach (var be in backends)
+                {
+                    var name = be["name"]?.ToString() ?? "";
+                    var avail = be["available"]?.ToObject<bool>() ?? false;
+                    AiBackendCombo.Items.Add(new ComboBoxItem
+                    {
+                        Content = name,
+                        Tag = be["models"],
+                        Foreground = avail
+                            ? (SolidColorBrush)FindResource("TextPrimaryBrush")
+                            : (SolidColorBrush)FindResource("TextMutedBrush")
+                    });
+                }
+                if (AiBackendCombo.Items.Count > 0) AiBackendCombo.SelectedIndex = 0;
+
+                if (ClaudeViewStatus != null)
+                    ClaudeViewStatus.Text = $"{backends.Count} backend(s) available · default model: {root["defaultModel"]}";
+                return;
+            }
+            catch (Exception ex)
+            {
+                lastEx = ex;
+                if (attempt < 4) await Task.Delay(2000);
+            }
+        }
+
+        if (ClaudeViewStatus != null)
+            ClaudeViewStatus.Text = $"AI Hub unreachable after retries: {lastEx?.Message}. Start the server manually.";
+    }
+
+    /// <summary>
+    /// If `ObsidianX.Server` isn't running, walk up to the solution root,
+    /// pick the freshest build (Release vs Debug, by LastWriteTime — same
+    /// trick MCP uses to launch us), and spawn it minimized. The Server
+    /// is what serves /api/ai/backends, /api/brain/*, etc., so the AI
+    /// model dropdowns and several other Client features are blank
+    /// without it.
+    /// </summary>
+    private static void TryLaunchServerIfNotRunning()
+    {
         try
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
-            var url = _serverUrl.Replace("/brain-hub", "") + "/api/ai/backends";
-            var json = await http.GetStringAsync(url);
-            var root = Newtonsoft.Json.Linq.JObject.Parse(json);
+            if (Process.GetProcessesByName("ObsidianX.Server").Length > 0) return;
 
-            AiBackendCombo.Items.Clear();
-            AiModelCombo.Items.Clear();
-            var backends = root["backends"] as Newtonsoft.Json.Linq.JArray ?? [];
-            foreach (var be in backends)
+            var clientExe = Process.GetCurrentProcess().MainModule?.FileName;
+            if (string.IsNullOrEmpty(clientExe)) return;
+            var solnRoot = FindObsidianxSolutionRoot(Path.GetDirectoryName(clientExe) ?? "");
+            if (solnRoot == null) return;
+
+            string[] candidates =
+            [
+                Path.Combine(solnRoot, "ObsidianX.Server", "bin", "Release", "net10.0", "ObsidianX.Server.exe"),
+                Path.Combine(solnRoot, "ObsidianX.Server", "bin", "Debug",   "net10.0", "ObsidianX.Server.exe"),
+            ];
+
+            var pick = candidates
+                .Where(File.Exists)
+                .Select(p => (path: p, mtime: File.GetLastWriteTimeUtc(p)))
+                .OrderByDescending(t => t.mtime)
+                .Select(t => t.path)
+                .FirstOrDefault();
+            if (string.IsNullOrEmpty(pick)) return;
+
+            // Service-style spawn: no visible console. UseShellExecute=false
+            // + CreateNoWindow=true is the only combination that fully hides
+            // the Kestrel logs window. The user sees only the Client; Server
+            // status is surfaced via the status-bar indicator instead.
+            var psi = new ProcessStartInfo
             {
-                var name = be["name"]?.ToString() ?? "";
-                var avail = be["available"]?.ToObject<bool>() ?? false;
-                AiBackendCombo.Items.Add(new ComboBoxItem
-                {
-                    Content = name,
-                    Tag = be["models"],
-                    Foreground = avail
-                        ? (SolidColorBrush)FindResource("TextPrimaryBrush")
-                        : (SolidColorBrush)FindResource("TextMutedBrush")
-                });
+                FileName = pick,
+                WorkingDirectory = Path.GetDirectoryName(pick)!,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            var proc = Process.Start(psi);
+            // Drain stdout/err so the buffer never fills and blocks the
+            // Server process. We don't show this output; if you need it,
+            // hook a logger here.
+            if (proc != null)
+            {
+                proc.OutputDataReceived += (_, _) => { };
+                proc.ErrorDataReceived += (_, _) => { };
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
             }
-            if (AiBackendCombo.Items.Count > 0) AiBackendCombo.SelectedIndex = 0;
+        }
+        catch (Exception ex) { Debug.WriteLine($"Server launch failed: {ex.Message}"); }
+    }
 
-            if (ClaudeViewStatus != null)
-                ClaudeViewStatus.Text = $"{backends.Count} backend(s) available · default model: {root["defaultModel"]}";
-        }
-        catch (Exception ex)
+    private static string? FindObsidianxSolutionRoot(string startDir)
+    {
+        var dir = new DirectoryInfo(startDir);
+        while (dir != null)
         {
-            if (ClaudeViewStatus != null)
-                ClaudeViewStatus.Text = $"AI Hub unreachable: {ex.Message}. Start the server.";
+            if (File.Exists(Path.Combine(dir.FullName, "ObsidianX.slnx"))) return dir.FullName;
+            dir = dir.Parent;
         }
+        return null;
     }
 
     private void AiBackend_Changed(object s, SelectionChangedEventArgs e)
@@ -2706,7 +3816,7 @@ public partial class MainWindow : Window
 
         try
         {
-            using var http = new HttpClient();
+            using var http = BuildLocalHttpClient();
             using var req = new HttpRequestMessage(HttpMethod.Post, AiServerBase + "/api/ai/keys")
             {
                 Content = new StringContent(payload.ToString(), System.Text.Encoding.UTF8, "application/json")
@@ -2740,7 +3850,7 @@ public partial class MainWindow : Window
     {
         try
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+            using var http = BuildLocalHttpClient(5);
             var json = await http.GetStringAsync(AiServerBase + "/api/ai/keys/status");
             var root = Newtonsoft.Json.Linq.JObject.Parse(json);
 
@@ -2832,7 +3942,7 @@ public partial class MainWindow : Window
     {
         try
         {
-            using var http = new HttpClient();
+            using var http = BuildLocalHttpClient();
             using var req = new HttpRequestMessage(HttpMethod.Post, AiServerBase + "/api/ai/stats/router/reset");
             await http.SendAsync(req);
             await PollRedirectStats();
@@ -2847,7 +3957,7 @@ public partial class MainWindow : Window
         if (RedirectTrafficText == null) return;
         try
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+            using var http = BuildLocalHttpClient(3);
             var json = await http.GetStringAsync(AiServerBase + "/api/ai/stats/router");
             var root = Newtonsoft.Json.Linq.JObject.Parse(json);
             var total = root["totalRequests"]?.ToObject<long>() ?? 0;
@@ -2892,24 +4002,99 @@ public partial class MainWindow : Window
         _vaultWatcher.Enabled = true;
     }
 
-    private void OnVaultChanged()
+    private bool _vaultIndexInFlight;
+
+    private async void OnVaultChanged()
     {
-        // Runs on UI thread (DispatcherTimer tick). Re-index + diff-load so
-        // any new/edited/deleted note animates in the 3D graph immediately.
+        // The heavy work (reading hundreds of .md files, AutoLinker, storage
+        // upsert, brain-export) runs on a background thread so the render
+        // loop keeps hitting 60fps while the vault is being re-ingested.
+        // The physics diff-load + UI refresh still runs on the UI thread.
+        if (_vaultIndexInFlight) return;
+        _vaultIndexInFlight = true;
         var changed = _vaultWatcher?.LastChangedPath ?? "vault";
         StatusText.Text = $"🌱 Auto-ingest: change detected in {Path.GetFileName(changed)} — re-indexing…";
         try
         {
-            IndexVault();
-            _dashPhysics.LoadFromGraphDiff(_graph);
-            _graphPhysics.LoadFromGraphDiff(_graph);
-            UpdateUI();
-            RefreshVaultTree();
-            StatusText.Text = $"✅ Auto-ingest done · {_vaultWatcher?.TotalChangesObserved ?? 0} changes observed total · last: {Path.GetFileName(changed)}";
+            var result = await Task.Run(IndexVaultCore);
+            if (result.Graph != null)
+            {
+                _graph = result.Graph;
+                _dashPhysics.LoadFromGraphDiff(_graph);
+                _graphPhysics.LoadFromGraphDiff(_graph);
+                UpdateUI();
+                RefreshVaultTree();
+                var wikiEdges = _graph.Edges.Count(e => e.RelationType == "wiki-link");
+                var autoEdges = _graph.Edges.Count - wikiEdges;
+                StatusText.Text =
+                    $"✅ Auto-ingest done · {_graph.TotalNodes} nodes · {wikiEdges} wiki · {autoEdges} auto-links{result.ExportMsg}";
+            }
+            else
+            {
+                StatusText.Text = $"Auto-ingest error: {result.ErrorMessage}";
+            }
         }
         catch (Exception ex)
         {
             StatusText.Text = $"Auto-ingest error: {ex.Message}";
+        }
+        finally { _vaultIndexInFlight = false; }
+    }
+
+    private record struct IndexResult(KnowledgeGraph? Graph, string ExportMsg, string? ErrorMessage);
+
+    /// <summary>
+    /// Thread-safe core of IndexVault — no UI writes. Returns the fresh
+    /// KnowledgeGraph + any export status for the caller to display on the
+    /// UI thread. Keep this in sync with IndexVault().
+    /// </summary>
+    private IndexResult IndexVaultCore()
+    {
+        try
+        {
+            if (!Directory.Exists(_vaultPath)) Directory.CreateDirectory(_vaultPath);
+            _indexer.AutoLinker ??= new AutoLinker();
+            _indexer.AutoLinker.Options.Enabled = _autoLinkEnabled;
+            _indexer.AutoLinker.Options.Threshold = _autoLinkThreshold;
+            _categories ??= new CategoryRegistry(_vaultPath);
+            _indexer.CustomCategories = _categories;
+            var g = _indexer.IndexVault(_vaultPath);
+
+            try
+            {
+                _storage ??= BrainStorageFactory.Create(_storageProvider, _vaultPath, _mySqlConnString);
+                _storage.UpsertGraph(g);
+            }
+            catch (Exception ex) { Debug.WriteLine($"Storage upsert failed: {ex.Message}"); }
+
+            string exportMsg;
+            try
+            {
+                if (_identity == null)
+                    exportMsg = " · export SKIPPED (identity not ready)";
+                else
+                {
+                    var r = _exporter.Export(_vaultPath, _identity, g);
+                    exportMsg = $" · exported {r.NodeCount} nodes → brain-export.json";
+                }
+            }
+            catch (Exception ex)
+            {
+                exportMsg = $" · EXPORT FAILED: {ex.Message}";
+                Debug.WriteLine($"Export after index failed: {ex}");
+                try
+                {
+                    var logPath = Path.Combine(_vaultPath, ".obsidianx", "export-error.log");
+                    File.AppendAllText(logPath, $"[{DateTime.Now:O}] {ex}\n\n");
+                }
+                catch { }
+            }
+
+            return new IndexResult(g, exportMsg, null);
+        }
+        catch (Exception ex)
+        {
+            return new IndexResult(null, "", ex.Message);
         }
     }
 
@@ -2934,7 +4119,7 @@ public partial class MainWindow : Window
         if (InstalledModelsList == null) return;
         try
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            using var http = BuildLocalHttpClient(8);
             var json = await http.GetStringAsync(AiServerBase + "/api/ai/models");
             var root = Newtonsoft.Json.Linq.JObject.Parse(json);
 
@@ -2989,7 +4174,7 @@ public partial class MainWindow : Window
 
         try
         {
-            using var http = new HttpClient();
+            using var http = BuildLocalHttpClient();
             using var req = new HttpRequestMessage(HttpMethod.Delete,
                 AiServerBase + $"/api/ai/models/{Uri.EscapeDataString(name)}");
             var resp = await http.SendAsync(req);
@@ -3016,7 +4201,7 @@ public partial class MainWindow : Window
 
         try
         {
-            using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+            using var http = BuildLocalHttpClient(Timeout.InfiniteTimeSpan);
             var payload = Newtonsoft.Json.JsonConvert.SerializeObject(new { name });
             using var req = new HttpRequestMessage(HttpMethod.Post,
                 AiServerBase + "/api/ai/models/pull")
@@ -3278,7 +4463,7 @@ public partial class MainWindow : Window
                 Background = (SolidColorBrush)FindResource("SurfaceBrush"),
                 CornerRadius = new CornerRadius(8), Padding = new Thickness(14, 10, 14, 10),
                 Margin = new Thickness(0, 0, 0, 8),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(30, 0, 240, 255)),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(30, _themeAccent.R, _themeAccent.G, _themeAccent.B)),
                 BorderThickness = new Thickness(1)
             };
             var grid = new Grid();
@@ -3290,8 +4475,7 @@ public partial class MainWindow : Window
             var avatar = new System.Windows.Shapes.Ellipse
             {
                 Width = 36, Height = 36, Margin = new Thickness(0, 0, 12, 0),
-                Fill = new LinearGradientBrush(
-                    Color.FromRgb(0, 240, 255), Color.FromRgb(139, 92, 246), 45)
+                Fill = new LinearGradientBrush(_themeAccent, _themeSecondary, 45)
             };
             grid.Children.Add(avatar);
 
@@ -3446,16 +4630,23 @@ public partial class MainWindow : Window
     }
 
     // ═══════════════════════════════════════
-    // KNOWLEDGE GROWTH CHART
+    // KNOWLEDGE GROWTH CHART — real time-series line chart of vault growth
     // ═══════════════════════════════════════
+    //
+    // The previous version was a snapshot bar chart of expertise scores —
+    // useful but it didn't show "growth". This version plots cumulative
+    // knowledge over real calendar time using each note's CreatedAt /
+    // earliest-known timestamp, so the curve actually traces "the day the
+    // brain learned about Topic X". Top expertise categories each get
+    // their own line; a thicker total line sits behind for context.
+    private bool _growthChartHooked = false;
+
     private void RenderGrowthChart()
     {
-        GrowthCanvas.Children.Clear();
-        GrowthLegend.Children.Clear();
-
-        var expertise = _graph.ExpertiseMap.OrderByDescending(kv => kv.Value.Score).Take(10).ToList();
-        if (expertise.Count == 0)
+        if (_graph.Nodes.Count == 0)
         {
+            GrowthCanvas.Children.Clear();
+            GrowthLegend.Children.Clear();
             GrowthCanvas.Children.Add(new TextBlock
             {
                 Text = "Add notes to your vault to see growth data",
@@ -3465,81 +4656,243 @@ public partial class MainWindow : Window
             return;
         }
 
-        // Wait for canvas to have size
-        GrowthCanvas.Dispatcher.InvokeAsync(() =>
+        // Hook SizeChanged once so the chart re-draws whenever the canvas
+        // gets resized (window resize, first time being made visible from
+        // collapsed state, etc.). The previous Loaded-priority InvokeAsync
+        // sometimes ran before layout completed and produced a blank canvas
+        // because ActualWidth/Height were zero.
+        if (!_growthChartHooked)
+        {
+            _growthChartHooked = true;
+            GrowthCanvas.SizeChanged += (_, _) => DrawGrowthChartCore();
+        }
+        // Defer once so layout has a chance to size the canvas if we just
+        // came from a collapsed view.
+        Dispatcher.BeginInvoke(new Action(DrawGrowthChartCore),
+            System.Windows.Threading.DispatcherPriority.Render);
+    }
+
+    private void DrawGrowthChartCore()
+    {
+        try
+        {
+            GrowthCanvas.Children.Clear();
+            GrowthLegend.Children.Clear();
+            if (_graph.Nodes.Count == 0) return;
+            DrawGrowthChartImpl();
+        }
+        catch (Exception ex)
+        {
+            // Don't let a chart bug crash the whole app. Show a hint
+            // instead so the next render attempt can succeed.
+            Debug.WriteLine($"Growth chart render failed: {ex}");
+            try
+            {
+                GrowthCanvas.Children.Clear();
+                GrowthCanvas.Children.Add(new TextBlock
+                {
+                    Text = $"Chart render error: {ex.Message}",
+                    FontSize = 11,
+                    Foreground = (SolidColorBrush)FindResource("TextMutedBrush"),
+                    Margin = new Thickness(12),
+                });
+            }
+            catch { }
+        }
+    }
+
+    private void DrawGrowthChartImpl()
+    {
         {
             var w = GrowthCanvas.ActualWidth;
             var h = GrowthCanvas.ActualHeight;
-            if (w < 100 || h < 100) { w = 600; h = 300; }
+            if (w < 100 || h < 100) { w = 800; h = 360; }
 
-            double barWidth = Math.Min(60, (w - 40) / expertise.Count - 8);
-            double maxScore = expertise.Max(e => e.Value.Score);
-            if (maxScore < 0.01) maxScore = 1;
-
-            for (int i = 0; i < expertise.Count; i++)
+            // Use CreatedAt when valid, else fall back to ModifiedAt — some
+            // notes lose CreatedAt during import/copy and read as MinValue
+            // (year 1 / 0001) which would skew the X axis to the dawn of time.
+            DateTime BestDate(KnowledgeNode n)
             {
-                var (cat, score) = expertise[i];
-                var color = GetCategoryColor(cat);
-                double barH = (score.Score / maxScore) * (h - 60);
-                double x = 20 + i * (barWidth + 8);
+                var c = n.CreatedAt;
+                var m = n.ModifiedAt;
+                if (c.Year < 2000 && m.Year >= 2000) return m;
+                if (m != default && m < c) return m; // CreatedAt > ModifiedAt = bogus, prefer mod
+                return c.Year >= 2000 ? c : (m.Year >= 2000 ? m : DateTime.UtcNow);
+            }
 
-                // Bar
-                var rect = new System.Windows.Shapes.Rectangle
+            var sorted = _graph.Nodes.Select(n => (Date: BestDate(n), Node: n))
+                                     .Where(t => t.Date.Year >= 2000)
+                                     .OrderBy(t => t.Date)
+                                     .ToList();
+            if (sorted.Count == 0) return;
+
+            var firstDate = sorted[0].Date.Date;
+            var lastDate = DateTime.UtcNow.Date;
+            if (lastDate <= firstDate) lastDate = firstDate.AddDays(1);
+            var span = (lastDate - firstDate).TotalDays;
+
+            // Chart insets
+            const double padL = 56, padR = 16, padT = 16, padB = 36;
+            var chartW = w - padL - padR;
+            var chartH = h - padT - padB;
+            if (chartW < 40 || chartH < 40) return;
+
+            // Top categories to plot as separate lines (cap at 5 for legibility).
+            var topCats = _graph.ExpertiseMap
+                .OrderByDescending(kv => kv.Value.Score)
+                .Take(5)
+                .Select(kv => kv.Key)
+                .ToList();
+
+            // Build cumulative series: per-category and total.
+            var totalSeries = new List<(double tNorm, int count)>();
+            int total = 0;
+            foreach (var (date, _) in sorted)
+            {
+                total++;
+                var t = (date.Date - firstDate).TotalDays / Math.Max(1.0, span);
+                totalSeries.Add((t, total));
+            }
+
+            var perCat = new Dictionary<KnowledgeCategory, List<(double tNorm, int count)>>();
+            foreach (var c in topCats) perCat[c] = [];
+            var counts = topCats.ToDictionary(c => c, _ => 0);
+            foreach (var (date, node) in sorted)
+            {
+                if (!topCats.Contains(node.PrimaryCategory)) continue;
+                counts[node.PrimaryCategory]++;
+                var t = (date.Date - firstDate).TotalDays / Math.Max(1.0, span);
+                perCat[node.PrimaryCategory].Add((t, counts[node.PrimaryCategory]));
+            }
+
+            int maxCount = total;
+            var muted = (SolidColorBrush)FindResource("TextMutedBrush");
+            var grid = (SolidColorBrush)FindResource("SurfaceLightBrush");
+
+            // ── Y axis grid + labels (5 horizontal lines) ──
+            for (int i = 0; i <= 4; i++)
+            {
+                var y = padT + chartH * (1 - i / 4.0);
+                var line = new System.Windows.Shapes.Line
                 {
-                    Width = barWidth, Height = barH,
-                    RadiusX = 4, RadiusY = 4,
-                    Fill = new LinearGradientBrush(color, Color.FromArgb(100, color.R, color.G, color.B), 90)
+                    X1 = padL, X2 = w - padR, Y1 = y, Y2 = y,
+                    Stroke = grid, StrokeThickness = 0.5, Opacity = 0.35
                 };
-                Canvas.SetLeft(rect, x);
-                Canvas.SetTop(rect, h - 40 - barH);
-                GrowthCanvas.Children.Add(rect);
-
-                // Score label on top
+                GrowthCanvas.Children.Add(line);
                 var label = new TextBlock
                 {
-                    Text = $"{score.Score:P0}", FontSize = 9,
-                    Foreground = new SolidColorBrush(color),
+                    Text = ((int)(maxCount * i / 4.0)).ToString("N0"),
+                    FontSize = 9, Foreground = muted,
                     FontFamily = (FontFamily)FindResource("MonoFont")
                 };
-                Canvas.SetLeft(label, x);
-                Canvas.SetTop(label, h - 44 - barH);
+                Canvas.SetLeft(label, 8);
+                Canvas.SetTop(label, y - 7);
                 GrowthCanvas.Children.Add(label);
-
-                // Category label at bottom
-                var catLabel = new TextBlock
-                {
-                    Text = cat.ToString().Replace("_", "\n").Replace("MachineLearning", "ML"),
-                    FontSize = 8, Width = barWidth, TextAlignment = TextAlignment.Center,
-                    Foreground = (SolidColorBrush)FindResource("TextMutedBrush"), TextWrapping = TextWrapping.Wrap
-                };
-                Canvas.SetLeft(catLabel, x);
-                Canvas.SetTop(catLabel, h - 36);
-                GrowthCanvas.Children.Add(catLabel);
-
-                // Notes count inside bar
-                if (barH > 20)
-                {
-                    var countLabel = new TextBlock
-                    {
-                        Text = $"{score.NoteCount}", FontSize = 10, FontWeight = FontWeights.Bold,
-                        Foreground = Brushes.White, Width = barWidth, TextAlignment = TextAlignment.Center
-                    };
-                    Canvas.SetLeft(countLabel, x);
-                    Canvas.SetTop(countLabel, h - 40 - barH + 4);
-                    GrowthCanvas.Children.Add(countLabel);
-                }
-
-                // Legend
-                var legendItem = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 12, 0) };
-                legendItem.Children.Add(new System.Windows.Shapes.Ellipse { Width = 8, Height = 8, Fill = new SolidColorBrush(color), Margin = new Thickness(0, 0, 4, 0) });
-                legendItem.Children.Add(new TextBlock
-                {
-                    Text = $"{cat.ToString().Replace("_", "/")} ({score.TotalWords:N0}w)",
-                    FontSize = 9, Foreground = (SolidColorBrush)FindResource("TextSecondaryBrush")
-                });
-                GrowthLegend.Children.Add(legendItem);
             }
-        }, System.Windows.Threading.DispatcherPriority.Loaded);
+
+            // ── X axis time labels: pick 5 evenly-spaced dates ──
+            for (int i = 0; i <= 4; i++)
+            {
+                var t = i / 4.0;
+                var x = padL + chartW * t;
+                var date = firstDate.AddDays(span * t);
+                var tick = new System.Windows.Shapes.Line
+                {
+                    X1 = x, X2 = x, Y1 = padT + chartH, Y2 = padT + chartH + 4,
+                    Stroke = grid, StrokeThickness = 0.6
+                };
+                GrowthCanvas.Children.Add(tick);
+                var label = new TextBlock
+                {
+                    Text = date.ToString(span > 730 ? "yyyy" : (span > 90 ? "MMM yy" : "d MMM")),
+                    FontSize = 9, Foreground = muted,
+                    FontFamily = (FontFamily)FindResource("MonoFont")
+                };
+                Canvas.SetLeft(label, x - 22);
+                Canvas.SetTop(label, padT + chartH + 8);
+                GrowthCanvas.Children.Add(label);
+            }
+
+            // ── Total line (subtle, behind the per-category lines) ──
+            DrawSeries(totalSeries, _themeAccent, 2.2, padL, padT, chartW, chartH, maxCount, fillUnder: true);
+
+            // ── Per-category lines, distinct colors ──
+            foreach (var cat in topCats)
+            {
+                var color = GetCategoryColor(cat);
+                if (perCat[cat].Count >= 2)
+                    DrawSeries(perCat[cat], color, 1.6, padL, padT, chartW, chartH, maxCount, fillUnder: false);
+
+                // Legend chip
+                var chip = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 12, 0) };
+                chip.Children.Add(new System.Windows.Shapes.Ellipse
+                {
+                    Width = 8, Height = 8, Fill = new SolidColorBrush(color),
+                    Margin = new Thickness(0, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center
+                });
+                chip.Children.Add(new TextBlock
+                {
+                    Text = $"{cat.ToString().Replace("_", "/")} ({counts[cat]})",
+                    FontSize = 10, Foreground = (SolidColorBrush)FindResource("TextSecondaryBrush")
+                });
+                GrowthLegend.Children.Add(chip);
+            }
+
+            // Total chip first in the legend with a different visual
+            var totalChip = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 16, 0) };
+            totalChip.Children.Add(new System.Windows.Shapes.Rectangle
+            {
+                Width = 14, Height = 3, Fill = new SolidColorBrush(_themeAccent),
+                Margin = new Thickness(0, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center
+            });
+            totalChip.Children.Add(new TextBlock
+            {
+                Text = $"Total ({total})",
+                FontSize = 10, FontWeight = FontWeights.SemiBold,
+                Foreground = (SolidColorBrush)FindResource("TextPrimaryBrush")
+            });
+            GrowthLegend.Children.Insert(0, totalChip);
+        }
+    }
+
+    /// <summary>Plot a cumulative time series as a polyline on GrowthCanvas.</summary>
+    private void DrawSeries(
+        List<(double tNorm, int count)> series, Color color, double thickness,
+        double padL, double padT, double chartW, double chartH, int maxCount,
+        bool fillUnder)
+    {
+        if (series.Count < 2 || maxCount <= 0) return;
+
+        var pts = new PointCollection(series.Count);
+        foreach (var (t, c) in series)
+        {
+            var x = padL + t * chartW;
+            var y = padT + chartH * (1 - (double)c / maxCount);
+            pts.Add(new Point(x, y));
+        }
+
+        if (fillUnder)
+        {
+            // Soft area fill below the total line — feels alive.
+            var poly = new System.Windows.Shapes.Polygon
+            {
+                Fill = new LinearGradientBrush(
+                    Color.FromArgb(60, color.R, color.G, color.B),
+                    Color.FromArgb(0,  color.R, color.G, color.B), 90)
+            };
+            var areaPts = new PointCollection(pts) { new Point(padL + chartW, padT + chartH), new Point(padL, padT + chartH) };
+            poly.Points = areaPts;
+            GrowthCanvas.Children.Add(poly);
+        }
+
+        var line = new System.Windows.Shapes.Polyline
+        {
+            Stroke = new SolidColorBrush(color),
+            StrokeThickness = thickness,
+            StrokeLineJoin = PenLineJoin.Round,
+            Points = pts
+        };
+        GrowthCanvas.Children.Add(line);
     }
 
     // ═══════════════════════════════════════
@@ -3573,7 +4926,7 @@ public partial class MainWindow : Window
         if (string.IsNullOrEmpty(newName)) return;
         _identity.DisplayName = newName;
         _identity.SaveToFile(_identityPath);
-        BrainNameText.Text = newName;
+        UpdateBrainTitleLabel();
         StatusText.Text = $"Brain name updated to '{newName}'";
     }
 
@@ -3619,7 +4972,11 @@ public partial class MainWindow : Window
                 ["MySqlConnectionString"] = _mySqlConnString,
                 ["MaxVisibleNodes"] = _maxVisibleNodes,
                 ["CullDistance"] = _cullDistance,
-                ["UseClusterColors"] = _useClusterColors
+                ["UseClusterColors"] = _useClusterColors,
+                ["UiTheme"] = _uiTheme,
+                ["GraphBgDim"] = _graphBgDim,
+                ["DashBgDim"] = _dashBgDim,
+                ["WindowBgDim"] = _windowBgDim
             };
             File.WriteAllText(SettingsFilePath,
                 Newtonsoft.Json.JsonConvert.SerializeObject(settings, Newtonsoft.Json.Formatting.Indented));
@@ -3666,6 +5023,14 @@ public partial class MainWindow : Window
                 double.TryParse(cd.ToString(), System.Globalization.CultureInfo.InvariantCulture, out _cullDistance);
             if (settings.TryGetValue("UseClusterColors", out var ucc) && ucc != null)
                 bool.TryParse(ucc.ToString(), out _useClusterColors);
+            if (settings.TryGetValue("UiTheme", out var uth) && uth != null)
+                _uiTheme = uth.ToString() ?? _uiTheme;
+            if (settings.TryGetValue("GraphBgDim", out var gbd) && gbd != null)
+                double.TryParse(gbd.ToString(), System.Globalization.CultureInfo.InvariantCulture, out _graphBgDim);
+            if (settings.TryGetValue("DashBgDim", out var dbd) && dbd != null)
+                double.TryParse(dbd.ToString(), System.Globalization.CultureInfo.InvariantCulture, out _dashBgDim);
+            if (settings.TryGetValue("WindowBgDim", out var wbd) && wbd != null)
+                double.TryParse(wbd.ToString(), System.Globalization.CultureInfo.InvariantCulture, out _windowBgDim);
         }
         catch (Exception ex) { Debug.WriteLine($"Settings load error: {ex.Message}"); }
     }
@@ -4163,10 +5528,73 @@ public partial class MainWindow : Window
         {
             RefreshMcpStatusBar();
             RefreshAiBackendStatusBar();
+            RefreshServerStatusBar();
         };
         _mcpStatusTimer.Start();
         RefreshMcpStatusBar();
         RefreshAiBackendStatusBar();
+        RefreshServerStatusBar();
+    }
+
+    /// <summary>
+    /// Poll the Server's /api/health every 3s and reflect on the status
+    /// bar chip. The Server runs hidden as a service-style process; this
+    /// chip is the only UI surface that says "yes, it's alive".
+    /// Falls back to "process exists" if the HTTP probe is slow — Kestrel
+    /// can take longer to respond to /api/health than the AI Hub does.
+    /// </summary>
+    private async void RefreshServerStatusBar()
+    {
+        if (ServerStatusDot == null) return;
+        try
+        {
+            using var http = BuildLocalHttpClient(5);
+            var json = await http.GetStringAsync(AiServerBase + "/api/health");
+            var root = Newtonsoft.Json.Linq.JObject.Parse(json);
+            var status = root["status"]?.ToString() ?? "?";
+            ServerStatusDot.Fill = status == "Healthy"
+                ? (SolidColorBrush)FindResource("NeonGreenBrush")
+                : new SolidColorBrush(Color.FromRgb(0xCC, 0x88, 0x44));
+            ServerStatusText.Text = "Srv ✓ :5142";
+        }
+        catch (Exception ex)
+        {
+            // Process-exists fallback — if the Server.exe is alive we still
+            // show green-ish, just with a warning label. Otherwise it's red.
+            var procAlive = Process.GetProcessesByName("ObsidianX.Server").Length > 0;
+            if (procAlive)
+            {
+                ServerStatusDot.Fill = new SolidColorBrush(Color.FromRgb(0xCC, 0x88, 0x44));
+                ServerStatusText.Text = "Srv ⚠ slow";
+            }
+            else
+            {
+                ServerStatusDot.Fill = new SolidColorBrush(Color.FromRgb(0x88, 0x44, 0x44));
+                ServerStatusText.Text = "Srv ✗ (click)";
+            }
+            Debug.WriteLine($"Server health probe failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private void ServerStatusChip_Click(object sender, MouseButtonEventArgs e)
+    {
+        // Prefer "open the dashboard in browser" — Server has its own
+        // cyberpunk web UI at root. If it's down, try to launch it.
+        if (Process.GetProcessesByName("ObsidianX.Server").Length == 0)
+        {
+            TryLaunchServerIfNotRunning();
+            StatusText.Text = "Starting Server… (chip will go green when healthy)";
+            return;
+        }
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = AiServerBase,
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex) { Debug.WriteLine($"open server: {ex.Message}"); }
     }
 
     /// <summary>Poll the AI Hub and reflect current backend + loaded
@@ -4176,7 +5604,7 @@ public partial class MainWindow : Window
         if (AiBackendDot == null) return;
         try
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+            using var http = BuildLocalHttpClient(5);
             var json = await http.GetStringAsync(AiServerBase + "/api/ai/models");
             var root = Newtonsoft.Json.Linq.JObject.Parse(json);
             var running = root["running"] as Newtonsoft.Json.Linq.JArray ?? [];
@@ -4186,23 +5614,30 @@ public partial class MainWindow : Window
             {
                 var name = running[0]["Name"]?.ToString() ?? running[0]["name"]?.ToString() ?? "?";
                 AiBackendDot.Fill = (SolidColorBrush)FindResource("NeonGreenBrush");
-                AiBackendStatus.Text = $"AI: {name} (warm)";
+                // Trim long Ollama model names so the chip doesn't blow up
+                // (e.g. "deepseek-r1:8b" stays, anything longer truncates).
+                if (name.Length > 14) name = name[..13] + "…";
+                AiBackendStatus.Text = $"AI {name}";
+                AiBackendStatus.ToolTip = $"AI loaded: {running[0]["Name"] ?? running[0]["name"]} (warm)";
             }
             else if (installed.Count > 0)
             {
                 AiBackendDot.Fill = (SolidColorBrush)FindResource("NeonCyanBrush");
-                AiBackendStatus.Text = $"AI: {installed.Count} models · idle";
+                AiBackendStatus.Text = $"AI {installed.Count}m";
+                AiBackendStatus.ToolTip = $"{installed.Count} models installed · idle";
             }
             else
             {
                 AiBackendDot.Fill = new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x77));
-                AiBackendStatus.Text = "AI: no models";
+                AiBackendStatus.Text = "AI 0m";
+                AiBackendStatus.ToolTip = "no models installed";
             }
         }
         catch
         {
             AiBackendDot.Fill = new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x77));
-            AiBackendStatus.Text = "AI: offline";
+            AiBackendStatus.Text = "AI off";
+            AiBackendStatus.ToolTip = "AI Hub unreachable";
         }
     }
 
@@ -4215,14 +5650,14 @@ public partial class MainWindow : Window
         McpCliDot.Fill = cliOk
             ? (SolidColorBrush)FindResource("NeonGreenBrush")
             : new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x77));
-        McpCliStatus.Text = cliOk ? "CLI: ✓ live" : "CLI: off";
+        McpCliStatus.Text = cliOk ? "CLI ✓" : "CLI ✗";
 
         // Claude Desktop — check claude_desktop_config.json
         var desktopOk = IsRegisteredInClaudeDesktop();
         McpDesktopDot.Fill = desktopOk
             ? (SolidColorBrush)FindResource("NeonGreenBrush")
             : new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x77));
-        McpDesktopStatus.Text = desktopOk ? "Desktop: ✓ live" : "Desktop: off";
+        McpDesktopStatus.Text = desktopOk ? "DT ✓" : "DT ✗";
 
         // Recent activity — seconds since last access-log event
         var sinceLast = _lastMcpActivity == DateTime.MinValue
@@ -4768,30 +6203,31 @@ public partial class MainWindow : Window
         _accessLogTimer.Start();
     }
 
-    private void PollAccessLog()
+    private bool _accessLogPollInFlight;
+
+    private async void PollAccessLog()
     {
+        // File I/O stays off the UI thread — previously this ran every 400ms
+        // directly on the dispatcher and blocked render frames when the log
+        // was on slow storage (OneDrive, network drives) or being written
+        // concurrently by the MCP server.
+        if (_accessLogPollInFlight) return;
+        _accessLogPollInFlight = true;
         try
         {
-            if (!File.Exists(AccessLogPath)) return;
-            var fi = new FileInfo(AccessLogPath);
-            // File was truncated (e.g. trim in MCP) — reset offset
-            if (fi.Length < _accessLogOffset) _accessLogOffset = 0;
-            if (fi.Length == _accessLogOffset) return;
+            var path = AccessLogPath;
+            long startOffset = _accessLogOffset;
+            var result = await Task.Run(() => ReadAccessLogTail(path, startOffset));
+            if (result.Lines == null) return;
 
-            using var fs = new FileStream(AccessLogPath, FileMode.Open,
-                FileAccess.Read, FileShare.ReadWrite);
-            fs.Seek(_accessLogOffset, SeekOrigin.Begin);
-            using var sr = new StreamReader(fs);
-
-            string? line;
+            _accessLogOffset = result.NewOffset;
             int newEvents = 0;
-            while ((line = sr.ReadLine()) != null)
+            foreach (var line in result.Lines)
             {
                 if (string.IsNullOrWhiteSpace(line)) continue;
                 HandleAccessLine(line);
                 newEvents++;
             }
-            _accessLogOffset = fs.Position;
 
             if (newEvents > 0)
             {
@@ -4802,6 +6238,31 @@ public partial class MainWindow : Window
         }
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }
+        finally { _accessLogPollInFlight = false; }
+    }
+
+    private static (List<string>? Lines, long NewOffset) ReadAccessLogTail(string path, long offset)
+    {
+        try
+        {
+            if (!File.Exists(path)) return (null, offset);
+            var fi = new FileInfo(path);
+            // File was truncated (e.g. trim in MCP) — reset offset
+            if (fi.Length < offset) offset = 0;
+            if (fi.Length == offset) return (null, offset);
+
+            using var fs = new FileStream(path, FileMode.Open,
+                FileAccess.Read, FileShare.ReadWrite);
+            fs.Seek(offset, SeekOrigin.Begin);
+            using var sr = new StreamReader(fs);
+
+            var lines = new List<string>();
+            string? line;
+            while ((line = sr.ReadLine()) != null) lines.Add(line);
+            return (lines, fs.Position);
+        }
+        catch (IOException) { return (null, offset); }
+        catch (UnauthorizedAccessException) { return (null, offset); }
     }
 
     private void HandleAccessLine(string json)
@@ -5022,7 +6483,7 @@ public partial class MainWindow : Window
         {
             Content = "Create", Margin = new Thickness(0, 12, 0, 0),
             Padding = new Thickness(20, 8, 20, 8), HorizontalAlignment = HorizontalAlignment.Right,
-            Background = new SolidColorBrush(Color.FromRgb(0, 240, 255)),
+            Background = new SolidColorBrush(_themeAccent),
             Foreground = new SolidColorBrush(Color.FromRgb(0x0B, 0x0B, 0x1A)),
             FontWeight = FontWeights.Bold, Cursor = Cursors.Hand
         };
@@ -5308,7 +6769,7 @@ public partial class MainWindow : Window
         {
             Content = "Create", Margin = new Thickness(0, 12, 0, 0), Padding = new Thickness(20, 8, 20, 8),
             HorizontalAlignment = HorizontalAlignment.Right,
-            Background = new SolidColorBrush(Color.FromRgb(0, 240, 255)),
+            Background = new SolidColorBrush(_themeAccent),
             Foreground = new SolidColorBrush(Color.FromRgb(0x0B, 0x0B, 0x1A)), FontWeight = FontWeights.Bold
         };
         okBtn.Click += (_, _) => { dialog.DialogResult = true; dialog.Close(); };
@@ -5355,7 +6816,7 @@ public partial class MainWindow : Window
         {
             Content = "Rename", Margin = new Thickness(0, 12, 0, 0), Padding = new Thickness(20, 8, 20, 8),
             HorizontalAlignment = HorizontalAlignment.Right,
-            Background = new SolidColorBrush(Color.FromRgb(0, 240, 255)),
+            Background = new SolidColorBrush(_themeAccent),
             Foreground = new SolidColorBrush(Color.FromRgb(0x0B, 0x0B, 0x1A)), FontWeight = FontWeights.Bold
         };
         okBtn.Click += (_, _) => { dialog.DialogResult = true; dialog.Close(); };

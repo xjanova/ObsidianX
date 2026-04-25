@@ -4,12 +4,14 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:ae="http://icsharpcode.net/sharpdevelop/avalonedit"
+        xmlns:services="clr-namespace:ObsidianX.Client.Services"
         mc:Ignorable="d"
         Title="ObsidianX — Neural Knowledge Engine"
         Width="1400" Height="900" MinWidth="1100" MinHeight="700"
         WindowStartupLocation="CenterScreen"
         WindowStyle="None" AllowsTransparency="True"
         Background="Transparent"
+        Icon="pack://application:,,,/Assets/Logo.ico"
         Loaded="Window_Loaded"
         Closing="Window_Closing">
 
@@ -25,14 +27,18 @@
     </Window.Resources>
 
     <Border CornerRadius="16" Background="{StaticResource DeepSpaceBrush}"
-            BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1">
+            BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1"
+            ClipToBounds="True">
         <Grid>
+            <!-- Subtle full-window nebula texture — barely visible but adds depth -->
+            <Image x:Name="WindowBgTexture" Source="pack://application:,,,/Assets/bk2.png"
+                   Stretch="UniformToFill" Opacity="0.09" IsHitTestVisible="False"/>
             <!-- Background ambient glow -->
             <Ellipse Width="600" Height="600" HorizontalAlignment="Right" VerticalAlignment="Top"
                      Margin="0,-200,-200,0" Opacity="0.03">
                 <Ellipse.Fill>
                     <RadialGradientBrush>
-                        <GradientStop Color="{StaticResource ElectricPurpleColor}" Offset="0"/>
+                        <GradientStop Color="{DynamicResource ElectricPurpleColor}" Offset="0"/>
                         <GradientStop Color="Transparent" Offset="1"/>
                     </RadialGradientBrush>
                 </Ellipse.Fill>
@@ -41,7 +47,7 @@
                      Margin="-100,0,0,-100" Opacity="0.04">
                 <Ellipse.Fill>
                     <RadialGradientBrush>
-                        <GradientStop Color="{StaticResource NeonCyanColor}" Offset="0"/>
+                        <GradientStop Color="{DynamicResource NeonCyanColor}" Offset="0"/>
                         <GradientStop Color="Transparent" Offset="1"/>
                     </RadialGradientBrush>
                 </Ellipse.Fill>
@@ -58,23 +64,144 @@
                 <Border Grid.Row="0" Background="Transparent" MouseLeftButtonDown="TitleBar_MouseLeftButtonDown">
                     <Grid>
                         <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0">
-                            <Border Width="24" Height="24" CornerRadius="6" Margin="0,0,10,0">
-                                <Border.Background>
-                                    <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
-                                        <GradientStop Color="{StaticResource NeonCyanColor}" Offset="0"/>
-                                        <GradientStop Color="{StaticResource ElectricPurpleColor}" Offset="1"/>
-                                    </LinearGradientBrush>
-                                </Border.Background>
-                                <TextBlock Text="X" FontWeight="Black" FontSize="14" Foreground="#0B0B1A"
-                                           HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                            </Border>
+                            <!-- Title-bar logo — seamless (no frame, no clip) so the glow bleeds into the bg -->
+                            <Image Source="pack://application:,,,/Assets/Logo.png"
+                                   Width="30" Height="30" Margin="0,0,10,0"
+                                   Stretch="Uniform" RenderOptions.BitmapScalingMode="HighQuality"/>
                             <TextBlock Text="ObsidianX" FontSize="14" FontWeight="Bold"
                                        Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
                             <TextBlock Text=" — Neural Knowledge Engine" FontSize="11"
                                        Foreground="{StaticResource TextMutedBrush}" VerticalAlignment="Center"
                                        Margin="4,2,0,0"/>
+                            <!-- Brain name in parens, populated from code-behind (ex: "(My Brain)") -->
+                            <TextBlock x:Name="BrainTitleLabel" Text="" FontSize="11"
+                                       Foreground="{StaticResource NeonCyanBrush}"
+                                       VerticalAlignment="Center" Margin="8,2,0,0"
+                                       FontFamily="{StaticResource MonoFont}"
+                                       Cursor="Hand" MouseLeftButtonDown="CopyAddress_Click"
+                                       ToolTip="Click to copy brain address"/>
                         </StackPanel>
                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,0,8,0">
+                            <!-- Theme/palette picker — opens a popup with color swatches + dim sliders.
+                                 Tinted with accent + glow so it's easy to spot in the title bar. -->
+                            <Button x:Name="ThemeButton" Width="40" Height="28"
+                                    Background="Transparent" BorderThickness="0" Cursor="Hand"
+                                    ToolTip="UI theme + background dim"
+                                    Click="ThemeButton_Click" Margin="4,0,4,0">
+                                <Button.Template>
+                                    <ControlTemplate TargetType="Button">
+                                        <Border x:Name="Bd" CornerRadius="6" Padding="6,2"
+                                                Background="Transparent"
+                                                BorderBrush="{StaticResource NeonCyanBrush}" BorderThickness="1">
+                                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                        </Border>
+                                        <ControlTemplate.Triggers>
+                                            <Trigger Property="IsMouseOver" Value="True">
+                                                <Setter TargetName="Bd" Property="Background"
+                                                        Value="{StaticResource SurfaceBrush}"/>
+                                            </Trigger>
+                                        </ControlTemplate.Triggers>
+                                    </ControlTemplate>
+                                </Button.Template>
+                                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                    <TextBlock Text="&#x1F3A8;" FontSize="13" Margin="0,0,2,0"
+                                               VerticalAlignment="Center"/>
+                                    <TextBlock Text="Theme" FontSize="10" FontWeight="SemiBold"
+                                               Foreground="{StaticResource NeonCyanBrush}"
+                                               VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
+                            <Popup x:Name="ThemePopup" PlacementTarget="{Binding ElementName=ThemeButton}"
+                                   Placement="Bottom" StaysOpen="False" AllowsTransparency="True"
+                                   HorizontalOffset="-220" VerticalOffset="4">
+                                <Border Background="{StaticResource DarkPanelBrush}"
+                                        BorderBrush="{StaticResource NeonCyanBrush}" BorderThickness="1"
+                                        CornerRadius="8" Padding="10" MinWidth="280">
+                                    <Border.Effect>
+                                        <DropShadowEffect Color="{DynamicResource NeonCyanColor}"
+                                                          BlurRadius="22" Opacity="0.55" ShadowDepth="0"/>
+                                    </Border.Effect>
+                                    <StackPanel>
+                                        <TextBlock Text="UI COLOR THEME" FontSize="10" FontWeight="SemiBold"
+                                                   Foreground="{StaticResource TextMutedBrush}"
+                                                   FontFamily="{StaticResource MonoFont}"
+                                                   Margin="2,0,0,8"/>
+                                        <ItemsControl x:Name="ThemeList">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><StackPanel/></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                        </ItemsControl>
+
+                                        <Border Margin="0,8,0,0" Padding="0,8,0,0"
+                                                BorderBrush="{StaticResource SurfaceLightBrush}"
+                                                BorderThickness="0,1,0,0">
+                                            <StackPanel>
+                                                <TextBlock Text="BACKGROUND DIM" FontSize="10" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextMutedBrush}"
+                                                           FontFamily="{StaticResource MonoFont}"
+                                                           Margin="2,0,0,6"/>
+
+                                                <Grid Margin="2,0,2,6">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="110"/>
+                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="44"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock Grid.Column="0" Text="Brain graph" FontSize="11"
+                                                               Foreground="{StaticResource TextSecondaryBrush}"
+                                                               VerticalAlignment="Center"/>
+                                                    <Slider Grid.Column="1" x:Name="GraphBgDimSlider"
+                                                            Minimum="0" Maximum="1" SmallChange="0.05" LargeChange="0.1"
+                                                            Value="0.55" ValueChanged="GraphBgDimSlider_Changed"
+                                                            VerticalAlignment="Center"/>
+                                                    <TextBlock Grid.Column="2" x:Name="GraphBgDimLabel" Text="55%"
+                                                               FontSize="10" FontFamily="{StaticResource MonoFont}"
+                                                               Foreground="{StaticResource NeonCyanBrush}"
+                                                               VerticalAlignment="Center" TextAlignment="Right"/>
+                                                </Grid>
+
+                                                <Grid Margin="2,0,2,6">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="110"/>
+                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="44"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock Grid.Column="0" Text="Dashboard 3D" FontSize="11"
+                                                               Foreground="{StaticResource TextSecondaryBrush}"
+                                                               VerticalAlignment="Center"/>
+                                                    <Slider Grid.Column="1" x:Name="DashBgDimSlider"
+                                                            Minimum="0" Maximum="1" SmallChange="0.05" LargeChange="0.1"
+                                                            Value="0.55" ValueChanged="DashBgDimSlider_Changed"
+                                                            VerticalAlignment="Center"/>
+                                                    <TextBlock Grid.Column="2" x:Name="DashBgDimLabel" Text="55%"
+                                                               FontSize="10" FontFamily="{StaticResource MonoFont}"
+                                                               Foreground="{StaticResource NeonCyanBrush}"
+                                                               VerticalAlignment="Center" TextAlignment="Right"/>
+                                                </Grid>
+
+                                                <Grid Margin="2,0,2,2">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="110"/>
+                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="44"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock Grid.Column="0" Text="Window texture" FontSize="11"
+                                                               Foreground="{StaticResource TextSecondaryBrush}"
+                                                               VerticalAlignment="Center"/>
+                                                    <Slider Grid.Column="1" x:Name="WindowBgDimSlider"
+                                                            Minimum="0" Maximum="0.5" SmallChange="0.02" LargeChange="0.05"
+                                                            Value="0.09" ValueChanged="WindowBgDimSlider_Changed"
+                                                            VerticalAlignment="Center"/>
+                                                    <TextBlock Grid.Column="2" x:Name="WindowBgDimLabel" Text="9%"
+                                                               FontSize="10" FontFamily="{StaticResource MonoFont}"
+                                                               Foreground="{StaticResource NeonCyanBrush}"
+                                                               VerticalAlignment="Center" TextAlignment="Right"/>
+                                                </Grid>
+                                            </StackPanel>
+                                        </Border>
+                                    </StackPanel>
+                                </Border>
+                            </Popup>
                             <Button Content="—" Click="Minimize_Click" Width="36" Height="28"
                                     Style="{StaticResource NavButton}" FontSize="12"/>
                             <Button Content="□" Click="Maximize_Click" Width="36" Height="28"
@@ -117,69 +244,65 @@
                                 <RowDefinition Height="Auto"/>
                             </Grid.RowDefinitions>
 
-                            <!-- Brain Identity -->
-                            <Border Grid.Row="0" Margin="12,12,12,8" Padding="14" CornerRadius="10"
-                                    Background="{StaticResource SurfaceBrush}">
-                                <StackPanel>
-                                    <Grid HorizontalAlignment="Center" Margin="0,0,0,8">
-                                        <Ellipse x:Name="PulseRing" Width="56" Height="56" Opacity="0.5"
-                                                 StrokeThickness="2" Stroke="{StaticResource NeonCyanBrush}"/>
-                                        <Ellipse Width="48" Height="48">
-                                            <Ellipse.Fill>
-                                                <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
-                                                    <GradientStop Color="{StaticResource NeonCyanColor}" Offset="0"/>
-                                                    <GradientStop Color="{StaticResource ElectricPurpleColor}" Offset="1"/>
-                                                </LinearGradientBrush>
-                                            </Ellipse.Fill>
-                                        </Ellipse>
-                                        <TextBlock Text="&#x1F9E0;" FontSize="22" HorizontalAlignment="Center"
-                                                   VerticalAlignment="Center"/>
-                                    </Grid>
-                                    <TextBlock x:Name="BrainNameText" Text="My Brain" FontSize="13" FontWeight="SemiBold"
-                                               Foreground="{StaticResource TextPrimaryBrush}" HorizontalAlignment="Center"/>
-                                    <TextBlock x:Name="BrainAddressText" Text="0xBRAIN-..." FontSize="9"
-                                               FontFamily="{StaticResource MonoFont}"
-                                               Foreground="{StaticResource NeonCyanBrush}"
-                                               HorizontalAlignment="Center" Margin="0,4,0,0"
-                                               Cursor="Hand" MouseLeftButtonDown="CopyAddress_Click"
-                                               ToolTip="Click to copy address"/>
-                                </StackPanel>
-                            </Border>
+                            <!-- Brain badge — just the logo. Name/address live in the title bar.
+                                 Uses a radial opacity mask so the logo's dark edges fade seamlessly
+                                 into the sidebar gradient instead of showing a hard square crop. -->
+                            <Grid Grid.Row="0" Margin="8,12,8,12" HorizontalAlignment="Center">
+                                <Ellipse x:Name="PulseRing" Width="190" Height="190" Opacity="0.35"
+                                         StrokeThickness="1.5" Stroke="{StaticResource NeonCyanBrush}"
+                                         Effect="{StaticResource LogoGlow}"/>
+                                <Image Source="pack://application:,,,/Assets/Logo.png"
+                                       Width="180" Height="180" Stretch="Uniform"
+                                       RenderOptions.BitmapScalingMode="HighQuality">
+                                    <Image.OpacityMask>
+                                        <RadialGradientBrush Center="0.5,0.5" GradientOrigin="0.5,0.5"
+                                                             RadiusX="0.55" RadiusY="0.55">
+                                            <GradientStop Color="#FFFFFFFF" Offset="0"/>
+                                            <GradientStop Color="#FFFFFFFF" Offset="0.6"/>
+                                            <GradientStop Color="#00FFFFFF" Offset="1"/>
+                                        </RadialGradientBrush>
+                                    </Image.OpacityMask>
+                                </Image>
+                            </Grid>
 
                             <!-- Nav -->
-                            <StackPanel Grid.Row="1" Margin="0,8,0,0">
-                                <TextBlock Text="NAVIGATION" FontSize="10" Foreground="{StaticResource TextMutedBrush}"
-                                           Margin="22,8,0,12" FontWeight="SemiBold"/>
-                                <Button x:Name="NavDashboard" Content="&#x2B21;  Dashboard"
-                                        Style="{StaticResource NavButtonActive}" Click="Nav_Click" Tag="Dashboard"/>
-                                <Button x:Name="NavBrainGraph" Content="&#x25C9;  Brain Graph"
-                                        Style="{StaticResource NavButton}" Click="Nav_Click" Tag="BrainGraph"/>
-                                <Button x:Name="NavNetwork" Content="&#x2B22;  Network"
-                                        Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Network"/>
-                                <Button x:Name="NavEditor" Content="&#x270F;  Editor"
-                                        Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Editor"/>
-                                <Button x:Name="NavVault" Content="&#x1F4C1;  Vault Explorer"
-                                        Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Vault"/>
-                                <Button x:Name="NavSearch" Content="&#x1F50D;  Search"
-                                        Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Search"/>
-                                <Button x:Name="NavClaude" Content="&#x1F916;  Claude AI"
-                                        Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Claude"/>
+                            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto"
+                                          HorizontalScrollBarVisibility="Disabled"
+                                          PanningMode="VerticalOnly">
+                                <StackPanel Margin="0,8,0,8">
+                                    <TextBlock Text="NAVIGATION" FontSize="10" Foreground="{StaticResource TextMutedBrush}"
+                                               Margin="22,8,0,12" FontWeight="SemiBold"/>
+                                    <Button x:Name="NavDashboard" Content="&#x2B21;  Dashboard"
+                                            Style="{StaticResource NavButtonActive}" Click="Nav_Click" Tag="Dashboard"/>
+                                    <Button x:Name="NavBrainGraph" Content="&#x25C9;  Brain Graph"
+                                            Style="{StaticResource NavButton}" Click="Nav_Click" Tag="BrainGraph"/>
+                                    <Button x:Name="NavNetwork" Content="&#x2B22;  Network"
+                                            Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Network"/>
+                                    <Button x:Name="NavEditor" Content="&#x270F;  Editor"
+                                            Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Editor"/>
+                                    <Button x:Name="NavVault" Content="&#x1F4C1;  Vault Explorer"
+                                            Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Vault"/>
+                                    <Button x:Name="NavSearch" Content="&#x1F50D;  Search"
+                                            Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Search"/>
+                                    <Button x:Name="NavClaude" Content="&#x1F916;  Claude AI"
+                                            Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Claude"/>
 
-                                <Button x:Name="NavGrowth" Content="&#x1F4C8;  Growth"
-                                        Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Growth"/>
+                                    <Button x:Name="NavGrowth" Content="&#x1F4C8;  Growth"
+                                            Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Growth"/>
 
-                                <TextBlock Text="NETWORK" FontSize="10" Foreground="{StaticResource TextMutedBrush}"
-                                           Margin="22,24,0,12" FontWeight="SemiBold"/>
-                                <Button x:Name="NavPeers" Content="&#x1F465;  Peers"
-                                        Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Peers"/>
-                                <Button x:Name="NavSharing" Content="&#x1F504;  Sharing"
-                                        Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Sharing"/>
+                                    <TextBlock Text="NETWORK" FontSize="10" Foreground="{StaticResource TextMutedBrush}"
+                                               Margin="22,24,0,12" FontWeight="SemiBold"/>
+                                    <Button x:Name="NavPeers" Content="&#x1F465;  Peers"
+                                            Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Peers"/>
+                                    <Button x:Name="NavSharing" Content="&#x1F504;  Sharing"
+                                            Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Sharing"/>
 
-                                <TextBlock Text="SYSTEM" FontSize="10" Foreground="{StaticResource TextMutedBrush}"
-                                           Margin="22,24,0,12" FontWeight="SemiBold"/>
-                                <Button x:Name="NavSettings" Content="&#x2699;  Settings"
-                                        Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Settings"/>
-                            </StackPanel>
+                                    <TextBlock Text="SYSTEM" FontSize="10" Foreground="{StaticResource TextMutedBrush}"
+                                               Margin="22,24,0,12" FontWeight="SemiBold"/>
+                                    <Button x:Name="NavSettings" Content="&#x2699;  Settings"
+                                            Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Settings"/>
+                                </StackPanel>
+                            </ScrollViewer>
 
                             <!-- Network Status -->
                             <Border Grid.Row="2" Margin="12,0,12,12" Padding="12" CornerRadius="8"
@@ -241,67 +364,167 @@
                                         </Border>
                                     </UniformGrid>
 
-                                    <!-- 3D Brain + Expertise -->
-                                    <Grid Margin="0,0,0,20">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="*"/>
-                                            <ColumnDefinition Width="360"/>
-                                        </Grid.ColumnDefinitions>
+                                    <!-- 3D Brain Map (full width) with glassmorphism Expertise overlay -->
+                                    <Border Style="{StaticResource CardPanel}" Margin="0,0,0,20" MinHeight="520">
+                                        <Grid>
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto"/>
+                                                <RowDefinition Height="*"/>
+                                                <RowDefinition Height="Auto"/>
+                                            </Grid.RowDefinitions>
 
-                                        <Border Grid.Column="0" Style="{StaticResource CardPanel}" Margin="0,0,12,0" MinHeight="380">
-                                            <Grid>
-                                                <Grid.RowDefinitions>
-                                                    <RowDefinition Height="Auto"/>
-                                                    <RowDefinition Height="*"/>
-                                                    <RowDefinition Height="Auto"/>
-                                                </Grid.RowDefinitions>
+                                            <Grid Grid.Row="0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="NEURAL KNOWLEDGE MAP"
+                                                           FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextMutedBrush}"
+                                                           VerticalAlignment="Center"/>
+                                                <TextBlock Grid.Column="1" x:Name="DashHintText"
+                                                           Text="Drag=rotate | Hover map + scroll=zoom | Click=info | Right-click=kick"
+                                                           FontSize="9" Foreground="{StaticResource TextMutedBrush}"
+                                                           HorizontalAlignment="Right" Opacity="0.6"
+                                                           VerticalAlignment="Center" Margin="0,0,12,0"/>
+                                                <!-- 2D / 3D view toggle. 2D path uses DrawingContext directly,
+                                                     much faster for hundreds of nodes. Default 3D matches the
+                                                     existing visual style. -->
+                                                <StackPanel Grid.Column="2" Orientation="Horizontal">
+                                                    <Button x:Name="DashView3DBtn" Content="3D"
+                                                            Style="{StaticResource NeonButtonFilled}"
+                                                            Padding="10,3" FontSize="10"
+                                                            Tag="3D" Click="DashViewMode_Click"/>
+                                                    <Button x:Name="DashView2DBtn" Content="2D"
+                                                            Style="{StaticResource NeonButton}"
+                                                            Padding="10,3" FontSize="10" Margin="4,0,0,0"
+                                                            Tag="2D" Click="DashViewMode_Click"/>
+                                                </StackPanel>
+                                            </Grid>
 
-                                                <Grid Grid.Row="0">
-                                                    <TextBlock Text="NEURAL KNOWLEDGE MAP" FontSize="11" FontWeight="SemiBold"
-                                                               Foreground="{StaticResource TextMutedBrush}"/>
-                                                    <TextBlock Text="Drag=rotate | Scroll=zoom | Click=info | Right-click=kick"
-                                                               FontSize="9" Foreground="{StaticResource TextMutedBrush}"
-                                                               HorizontalAlignment="Right" Opacity="0.6"/>
-                                                </Grid>
-
-                                                <!-- Transparent Border catches ALL mouse events including empty space -->
-                                                <Border Grid.Row="1" Margin="0,8,0,0" Background="Transparent"
+                                            <!-- Map area: viewport + transparent glass overlay sit in same Grid cell.
+                                                 Mouse wheel only zooms when cursor is over the viewport background;
+                                                 the overlay's ScrollViewer captures wheel for its own scroll. -->
+                                            <Grid Grid.Row="1" Margin="0,8,0,0">
+                                                <Border x:Name="DashView3DBorder" CornerRadius="8" ClipToBounds="True"
                                                         MouseLeftButtonDown="Viewport_MouseDown"
                                                         MouseLeftButtonUp="Viewport_MouseUp"
                                                         MouseMove="Viewport_MouseMove"
                                                         MouseWheel="Viewport_MouseWheel"
                                                         MouseRightButtonDown="Viewport_RightClick">
-                                                <Viewport3D x:Name="BrainViewport" ClipToBounds="True"
-                                                            IsHitTestVisible="False">
-                                                    <Viewport3D.Camera>
-                                                        <PerspectiveCamera x:Name="DashCam" Position="0,2,10"
-                                                                           LookDirection="0,-0.2,-1"
-                                                                           UpDirection="0,1,0" FieldOfView="45"/>
-                                                    </Viewport3D.Camera>
-                                                    <ModelVisual3D>
-                                                        <ModelVisual3D.Content>
-                                                            <AmbientLight Color="#333355"/>
-                                                        </ModelVisual3D.Content>
-                                                    </ModelVisual3D>
-                                                    <ModelVisual3D>
-                                                        <ModelVisual3D.Content>
-                                                            <DirectionalLight Color="#00F0FF" Direction="-1,-1,-1"/>
-                                                        </ModelVisual3D.Content>
-                                                    </ModelVisual3D>
-                                                    <ModelVisual3D>
-                                                        <ModelVisual3D.Content>
-                                                            <DirectionalLight Color="#8B5CF6" Direction="1,0.5,-0.5"/>
-                                                        </ModelVisual3D.Content>
-                                                    </ModelVisual3D>
-                                                    <ModelVisual3D x:Name="BrainModel"/>
-                                                </Viewport3D>
+                                                    <Border.Background>
+                                                        <ImageBrush x:Name="DashBgBrush"
+                                                                    ImageSource="pack://application:,,,/Assets/bk1.png"
+                                                                    Stretch="UniformToFill" Opacity="0.55"/>
+                                                    </Border.Background>
+                                                    <Viewport3D x:Name="BrainViewport" ClipToBounds="True"
+                                                                IsHitTestVisible="False">
+                                                        <Viewport3D.Camera>
+                                                            <PerspectiveCamera x:Name="DashCam" Position="0,2,10"
+                                                                               LookDirection="0,-0.2,-1"
+                                                                               UpDirection="0,1,0" FieldOfView="45"/>
+                                                        </Viewport3D.Camera>
+                                                        <ModelVisual3D>
+                                                            <ModelVisual3D.Content>
+                                                                <AmbientLight Color="#333355"/>
+                                                            </ModelVisual3D.Content>
+                                                        </ModelVisual3D>
+                                                        <ModelVisual3D>
+                                                            <ModelVisual3D.Content>
+                                                                <DirectionalLight x:Name="DashKeyLight" Color="#00F0FF" Direction="-1,-1,-1"/>
+                                                            </ModelVisual3D.Content>
+                                                        </ModelVisual3D>
+                                                        <ModelVisual3D>
+                                                            <ModelVisual3D.Content>
+                                                                <DirectionalLight x:Name="DashFillLight" Color="#8B5CF6" Direction="1,0.5,-0.5"/>
+                                                            </ModelVisual3D.Content>
+                                                        </ModelVisual3D>
+                                                        <ModelVisual3D x:Name="BrainModel"/>
+                                                    </Viewport3D>
                                                 </Border>
 
+                                                <!-- 2D fallback view — same physics, lighter renderer. -->
+                                                <Border x:Name="DashView2DBorder" CornerRadius="8" ClipToBounds="True"
+                                                        Visibility="Collapsed"
+                                                        MouseLeftButtonDown="Dash2D_MouseDown"
+                                                        MouseLeftButtonUp="Dash2D_MouseUp"
+                                                        MouseMove="Dash2D_MouseMove"
+                                                        MouseWheel="Dash2D_MouseWheel"
+                                                        MouseRightButtonDown="Dash2D_RightClick">
+                                                    <Border.Background>
+                                                        <ImageBrush ImageSource="pack://application:,,,/Assets/bk1.png"
+                                                                    Stretch="UniformToFill" Opacity="0.35"/>
+                                                    </Border.Background>
+                                                    <services:Graph2DRenderer x:Name="DashGraph2D"/>
+                                                </Border>
+
+                                                <!-- Glassmorphism Expertise overlay: top-right of map, scrollable.
+                                                     Faux-glass = translucent gradient + subtle white border + drop
+                                                     shadow. WPF has no native backdrop blur, but the bk1 nebula
+                                                     visible through the alpha sells the effect. -->
+                                                <Border HorizontalAlignment="Right" VerticalAlignment="Top"
+                                                        Margin="0,16,16,16" Width="320" MaxHeight="460"
+                                                        CornerRadius="14" Padding="0">
+                                                    <Border.Background>
+                                                        <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                                                            <GradientStop Offset="0" Color="#55101820"/>
+                                                            <GradientStop Offset="1" Color="#33060A10"/>
+                                                        </LinearGradientBrush>
+                                                    </Border.Background>
+                                                    <Border.BorderBrush>
+                                                        <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                                                            <GradientStop Offset="0" Color="#55FFFFFF"/>
+                                                            <GradientStop Offset="1" Color="#11FFFFFF"/>
+                                                        </LinearGradientBrush>
+                                                    </Border.BorderBrush>
+                                                    <Border.BorderThickness>1</Border.BorderThickness>
+                                                    <Border.Effect>
+                                                        <DropShadowEffect BlurRadius="24" ShadowDepth="0"
+                                                                          Color="#000000" Opacity="0.45"/>
+                                                    </Border.Effect>
+                                                    <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                                                  HorizontalScrollBarVisibility="Disabled"
+                                                                  Padding="16" CanContentScroll="False"
+                                                                  PanningMode="VerticalOnly">
+                                                        <StackPanel>
+                                                            <TextBlock Text="EXPERTISE PROFILE" FontSize="11"
+                                                                       FontWeight="SemiBold"
+                                                                       Foreground="{StaticResource TextMutedBrush}"
+                                                                       Margin="0,0,0,12"/>
+                                                            <StackPanel x:Name="ExpertisePanel"/>
+                                                            <Border Margin="0,16,0,0" Padding="10" CornerRadius="8"
+                                                                    Background="#33000000">
+                                                                <StackPanel>
+                                                                    <TextBlock Text="BRAIN ADDRESS" FontSize="9"
+                                                                               Foreground="{StaticResource TextMutedBrush}"
+                                                                               Margin="0,0,0,4"/>
+                                                                    <TextBlock x:Name="FullAddressText" Text="0xBRAIN-..."
+                                                                               FontSize="10" FontFamily="{StaticResource MonoFont}"
+                                                                               Foreground="{StaticResource NeonCyanBrush}"
+                                                                               TextWrapping="Wrap"/>
+                                                                    <TextBlock Text="VAULT PATH" FontSize="9"
+                                                                               Foreground="{StaticResource TextMutedBrush}"
+                                                                               Margin="0,8,0,4"/>
+                                                                    <TextBlock x:Name="VaultPathText" Text="..."
+                                                                               FontSize="10" FontFamily="{StaticResource MonoFont}"
+                                                                               Foreground="{StaticResource TextSecondaryBrush}"
+                                                                               TextWrapping="Wrap"/>
+                                                                </StackPanel>
+                                                            </Border>
+                                                        </StackPanel>
+                                                    </ScrollViewer>
+                                                </Border>
+                                            </Grid>
+
                                                 <!-- Node Info Panel (shows on click) -->
+                                                <!-- Auto-hides after 15s idle · Close with × · Edit & save inline -->
                                                 <Border x:Name="NodeInfoPanel" Grid.Row="2" Visibility="Collapsed"
                                                         Background="{StaticResource SurfaceBrush}" CornerRadius="8"
-                                                        Padding="14,10" Margin="0,8,0,0" MaxHeight="200"
-                                                        BorderBrush="{StaticResource NeonCyanBrush}" BorderThickness="1">
+                                                        Padding="14,10" Margin="0,8,0,0" MaxHeight="260"
+                                                        BorderBrush="{StaticResource NeonCyanBrush}" BorderThickness="1"
+                                                        MouseEnter="NodeInfoPanel_MouseEnter"
+                                                        MouseLeave="NodeInfoPanel_MouseLeave">
                                                     <Grid>
                                                         <Grid.RowDefinitions>
                                                             <RowDefinition Height="Auto"/>
@@ -325,66 +548,43 @@
                                                             <StackPanel Grid.Column="2" Orientation="Horizontal">
                                                                 <Button Content="&#x26A1; Kick" Style="{StaticResource NeonButton}"
                                                                         Padding="10,4" FontSize="11" Click="KickNode_Click" Margin="0,0,4,0"/>
+                                                                <Button x:Name="DashNodeEditBtn" Content="&#x270E; Edit"
+                                                                        Style="{StaticResource NeonButton}"
+                                                                        Padding="10,4" FontSize="11" Click="EditDashNode_Click" Margin="0,0,4,0"/>
+                                                                <Button x:Name="DashNodeSaveBtn" Content="&#x1F4BE; Save"
+                                                                        Style="{StaticResource NeonButtonFilled}"
+                                                                        Visibility="Collapsed"
+                                                                        Padding="10,4" FontSize="11" Click="SaveDashNode_Click" Margin="0,0,4,0"/>
+                                                                <Button x:Name="DashNodeCancelBtn" Content="Cancel"
+                                                                        Style="{StaticResource NeonButton}"
+                                                                        Visibility="Collapsed"
+                                                                        Padding="10,4" FontSize="11" Click="CancelDashNode_Click" Margin="0,0,4,0"/>
                                                                 <Button Content="&#x1F4D6; Open" Style="{StaticResource NeonButtonFilled}"
-                                                                        Padding="10,4" FontSize="11" Click="OpenDashNodeFile_Click"/>
+                                                                        Padding="10,4" FontSize="11" Click="OpenDashNodeFile_Click" Margin="0,0,4,0"/>
+                                                                <Button Content="&#x2715;" Style="{StaticResource NeonButton}"
+                                                                        Padding="8,4" FontSize="11" ToolTip="Close"
+                                                                        Click="CloseDashNode_Click"/>
                                                             </StackPanel>
                                                         </Grid>
-                                                        <!-- Content Preview -->
-                                                        <ScrollViewer Grid.Row="1" MaxHeight="120" Margin="0,8,0,0"
-                                                                      VerticalScrollBarVisibility="Auto">
-                                                            <TextBlock x:Name="NodeInfoContent" Text="" FontSize="11"
-                                                                       Foreground="{StaticResource TextSecondaryBrush}"
-                                                                       TextWrapping="Wrap" FontFamily="{StaticResource MonoFont}"/>
-                                                        </ScrollViewer>
+                                                        <!-- Content Preview / Editor -->
+                                                        <Grid Grid.Row="1" Margin="0,8,0,0">
+                                                            <ScrollViewer x:Name="NodeInfoContentScroll" MaxHeight="160"
+                                                                          VerticalScrollBarVisibility="Auto">
+                                                                <TextBlock x:Name="NodeInfoContent" Text="" FontSize="11"
+                                                                           Foreground="{StaticResource TextSecondaryBrush}"
+                                                                           TextWrapping="Wrap" FontFamily="{StaticResource MonoFont}"/>
+                                                            </ScrollViewer>
+                                                            <TextBox x:Name="NodeInfoEditor" Visibility="Collapsed"
+                                                                     MinHeight="160" MaxHeight="220"
+                                                                     AcceptsReturn="True" TextWrapping="Wrap"
+                                                                     VerticalScrollBarVisibility="Auto"
+                                                                     FontFamily="{StaticResource MonoFont}"
+                                                                     Style="{StaticResource NeonTextBox}"/>
+                                                        </Grid>
                                                     </Grid>
                                                 </Border>
                                             </Grid>
                                         </Border>
-
-                                        <Border Grid.Column="1" Style="{StaticResource CardPanel}">
-                                            <StackPanel>
-                                                <TextBlock Text="EXPERTISE PROFILE" FontSize="11" FontWeight="SemiBold"
-                                                           Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,16"/>
-                                                <StackPanel x:Name="ExpertisePanel"/>
-                                                <Border Margin="0,20,0,0" Padding="12" CornerRadius="8"
-                                                        Background="{StaticResource SurfaceBrush}">
-                                                    <StackPanel>
-                                                        <TextBlock Text="BRAIN ADDRESS" FontSize="10"
-                                                                   Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,6"/>
-                                                        <TextBlock x:Name="FullAddressText" Text="0xBRAIN-..."
-                                                                   FontSize="11" FontFamily="{StaticResource MonoFont}"
-                                                                   Foreground="{StaticResource NeonCyanBrush}" TextWrapping="Wrap"/>
-                                                        <TextBlock Text="VAULT PATH" FontSize="10"
-                                                                   Foreground="{StaticResource TextMutedBrush}" Margin="0,12,0,6"/>
-                                                        <TextBlock x:Name="VaultPathText" Text="..."
-                                                                   FontSize="11" FontFamily="{StaticResource MonoFont}"
-                                                                   Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"/>
-                                                    </StackPanel>
-                                                </Border>
-                                            </StackPanel>
-                                        </Border>
-                                    </Grid>
-
-                                    <!-- Claude Connection -->
-                                    <Border Style="{StaticResource CardPanel}" Margin="0,0,0,20">
-                                        <Grid>
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="*"/>
-                                                <ColumnDefinition Width="Auto"/>
-                                            </Grid.ColumnDefinitions>
-                                            <StackPanel>
-                                                <TextBlock Text="CLAUDE AI CONNECTION" FontSize="11" FontWeight="SemiBold"
-                                                           Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,8"/>
-                                                <TextBlock x:Name="ClaudeStatusText" Text="Checking connection..."
-                                                           FontSize="14" Foreground="{StaticResource TextPrimaryBrush}"/>
-                                                <TextBlock x:Name="ClaudeDetailText" Text="" FontSize="11"
-                                                           Foreground="{StaticResource TextSecondaryBrush}" Margin="0,4,0,0"/>
-                                            </StackPanel>
-                                            <Button Grid.Column="1" Content="Connect to Claude"
-                                                    Style="{StaticResource NeonButtonFilled}"
-                                                    Click="ConnectClaude_Click" VerticalAlignment="Center"/>
-                                        </Grid>
-                                    </Border>
 
                                     <!-- Quick Actions -->
                                     <Border Style="{StaticResource CardPanel}">
@@ -469,17 +669,31 @@
                                             <Button Content="&#x1F4A5; Shake" Style="{StaticResource NeonButton}"
                                                     Padding="10,3" FontSize="10" Click="ShakeGraph_Click" Margin="0,0,6,0"/>
                                             <Button Content="&#x1F504; Reset" Style="{StaticResource NeonButton}"
-                                                    Padding="10,3" FontSize="10" Click="ResetCamera_Click"/>
+                                                    Padding="10,3" FontSize="10" Click="ResetCamera_Click" Margin="0,0,12,0"/>
+                                            <Button x:Name="GraphView3DBtn" Content="3D"
+                                                    Style="{StaticResource NeonButtonFilled}"
+                                                    Padding="10,3" FontSize="10"
+                                                    Tag="3D" Click="GraphViewMode_Click" Margin="0,0,4,0"/>
+                                            <Button x:Name="GraphView2DBtn" Content="2D"
+                                                    Style="{StaticResource NeonButton}"
+                                                    Padding="10,3" FontSize="10"
+                                                    Tag="2D" Click="GraphViewMode_Click"/>
                                         </StackPanel>
                                     </Grid>
 
-                                    <!-- Transparent border catches mouse on empty space -->
-                                    <Border Grid.Row="1" Background="Transparent"
+                                    <!-- Transparent border catches mouse on empty space.
+                                         bk2 nebula paints the skybox behind the graph viewport. -->
+                                    <Border x:Name="GraphView3DBorder" Grid.Row="1" CornerRadius="6" ClipToBounds="True"
                                             MouseLeftButtonDown="FullGraph_MouseDown"
                                             MouseLeftButtonUp="FullGraph_MouseUp"
                                             MouseMove="FullGraph_MouseMove"
                                             MouseWheel="FullGraph_MouseWheel"
                                             MouseRightButtonDown="FullGraph_RightClick">
+                                        <Border.Background>
+                                            <ImageBrush x:Name="GraphBgBrush"
+                                                        ImageSource="pack://application:,,,/Assets/bk2.png"
+                                                        Stretch="UniformToFill" Opacity="0.55"/>
+                                        </Border.Background>
                                     <Grid>
                                     <Viewport3D x:Name="FullGraphViewport" ClipToBounds="True"
                                                 IsHitTestVisible="False">
@@ -492,10 +706,10 @@
                                             <ModelVisual3D.Content><AmbientLight Color="#444466"/></ModelVisual3D.Content>
                                         </ModelVisual3D>
                                         <ModelVisual3D>
-                                            <ModelVisual3D.Content><DirectionalLight Color="#00F0FF" Direction="-1,-1,-1"/></ModelVisual3D.Content>
+                                            <ModelVisual3D.Content><DirectionalLight x:Name="GraphKeyLight" Color="#00F0FF" Direction="-1,-1,-1"/></ModelVisual3D.Content>
                                         </ModelVisual3D>
                                         <ModelVisual3D>
-                                            <ModelVisual3D.Content><DirectionalLight Color="#FF006E" Direction="1,1,-0.5"/></ModelVisual3D.Content>
+                                            <ModelVisual3D.Content><DirectionalLight x:Name="GraphFillLight" Color="#FF006E" Direction="1,1,-0.5"/></ModelVisual3D.Content>
                                         </ModelVisual3D>
                                         <ModelVisual3D x:Name="FullGraphModel"/>
                                     </Viewport3D>
@@ -510,7 +724,7 @@
                                             BorderThickness="1" CornerRadius="4" Padding="8,5"
                                             HorizontalAlignment="Left" VerticalAlignment="Top">
                                         <Border.Effect>
-                                            <DropShadowEffect Color="{StaticResource NeonCyanColor}"
+                                            <DropShadowEffect Color="{DynamicResource NeonCyanColor}"
                                                               BlurRadius="12" Opacity="0.4" ShadowDepth="0"/>
                                         </Border.Effect>
                                         <StackPanel>
@@ -569,9 +783,9 @@
                                                VerticalAlignment="Top" Opacity="0.5"
                                                IsHitTestVisible="False" Panel.ZIndex="9">
                                         <Rectangle.Fill>
-                                            <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                                            <LinearGradientBrush x:Name="ScanlineBrush" StartPoint="0,0" EndPoint="1,0">
                                                 <GradientStop Color="Transparent" Offset="0"/>
-                                                <GradientStop Color="#FF00F0FF" Offset="0.5"/>
+                                                <GradientStop Color="{DynamicResource NeonCyanColor}" Offset="0.5"/>
                                                 <GradientStop Color="Transparent" Offset="1"/>
                                             </LinearGradientBrush>
                                         </Rectangle.Fill>
@@ -584,7 +798,7 @@
                                             Background="#F00B0B1A" BorderBrush="{StaticResource NeonCyanBrush}"
                                             BorderThickness="1" CornerRadius="6" MaxWidth="420">
                                         <Border.Effect>
-                                            <DropShadowEffect Color="{StaticResource NeonCyanColor}"
+                                            <DropShadowEffect Color="{DynamicResource NeonCyanColor}"
                                                               BlurRadius="20" Opacity="0.4" ShadowDepth="0"/>
                                         </Border.Effect>
                                         <StackPanel>
@@ -621,11 +835,28 @@
                                     </Grid>
                                     </Border>
 
-                                    <!-- Selected Node Info with Content Preview -->
+                                    <!-- 2D fallback for the full brain graph. Same physics, lighter draw. -->
+                                    <Border x:Name="GraphView2DBorder" Grid.Row="1" CornerRadius="6" ClipToBounds="True"
+                                            Visibility="Collapsed"
+                                            MouseLeftButtonDown="Graph2D_MouseDown"
+                                            MouseLeftButtonUp="Graph2D_MouseUp"
+                                            MouseMove="Graph2D_MouseMove"
+                                            MouseWheel="Graph2D_MouseWheel"
+                                            MouseRightButtonDown="Graph2D_RightClick">
+                                        <Border.Background>
+                                            <ImageBrush ImageSource="pack://application:,,,/Assets/bk2.png"
+                                                        Stretch="UniformToFill" Opacity="0.35"/>
+                                        </Border.Background>
+                                        <services:Graph2DRenderer x:Name="FullGraph2D"/>
+                                    </Border>
+
+                                    <!-- Selected Node Info — auto-hides after 15s idle, × closes, edit+save inline -->
                                     <Border x:Name="GraphNodeInfo" Grid.Row="2" Visibility="Collapsed"
                                             Background="{StaticResource SurfaceBrush}" CornerRadius="8"
-                                            Padding="14,10" Margin="0,8,0,0" MaxHeight="220"
-                                            BorderBrush="{StaticResource NeonCyanBrush}" BorderThickness="1">
+                                            Padding="14,10" Margin="0,8,0,0" MaxHeight="300"
+                                            BorderBrush="{StaticResource NeonCyanBrush}" BorderThickness="1"
+                                            MouseEnter="GraphNodeInfo_MouseEnter"
+                                            MouseLeave="GraphNodeInfo_MouseLeave">
                                         <Grid>
                                             <Grid.RowDefinitions>
                                                 <RowDefinition Height="Auto"/>
@@ -649,16 +880,38 @@
                                                 <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
                                                     <Button Content="&#x26A1; Kick" Style="{StaticResource NeonButton}"
                                                             Padding="10,4" FontSize="11" Click="KickGraphNode_Click" Margin="0,0,6,0"/>
+                                                    <Button x:Name="GraphNodeEditBtn" Content="&#x270E; Edit"
+                                                            Style="{StaticResource NeonButton}"
+                                                            Padding="10,4" FontSize="11" Click="EditGraphNode_Click" Margin="0,0,6,0"/>
+                                                    <Button x:Name="GraphNodeSaveBtn" Content="&#x1F4BE; Save"
+                                                            Style="{StaticResource NeonButtonFilled}"
+                                                            Visibility="Collapsed"
+                                                            Padding="10,4" FontSize="11" Click="SaveGraphNode_Click" Margin="0,0,6,0"/>
+                                                    <Button x:Name="GraphNodeCancelBtn" Content="Cancel"
+                                                            Style="{StaticResource NeonButton}"
+                                                            Visibility="Collapsed"
+                                                            Padding="10,4" FontSize="11" Click="CancelGraphNode_Click" Margin="0,0,6,0"/>
                                                     <Button Content="&#x1F4D6; Open" Style="{StaticResource NeonButtonFilled}"
-                                                            Padding="10,4" FontSize="11" Click="OpenNodeFile_Click"/>
+                                                            Padding="10,4" FontSize="11" Click="OpenNodeFile_Click" Margin="0,0,6,0"/>
+                                                    <Button Content="&#x2715;" Style="{StaticResource NeonButton}"
+                                                            Padding="8,4" FontSize="11" ToolTip="Close"
+                                                            Click="CloseGraphNode_Click"/>
                                                 </StackPanel>
                                             </Grid>
-                                            <ScrollViewer Grid.Row="1" MaxHeight="140" Margin="0,8,0,0"
-                                                          VerticalScrollBarVisibility="Auto">
-                                                <TextBlock x:Name="GraphNodeContent" Text="" FontSize="11"
-                                                           Foreground="{StaticResource TextSecondaryBrush}"
-                                                           TextWrapping="Wrap" FontFamily="{StaticResource MonoFont}"/>
-                                            </ScrollViewer>
+                                            <Grid Grid.Row="1" Margin="0,8,0,0">
+                                                <ScrollViewer x:Name="GraphNodeContentScroll" MaxHeight="180"
+                                                              VerticalScrollBarVisibility="Auto">
+                                                    <TextBlock x:Name="GraphNodeContent" Text="" FontSize="11"
+                                                               Foreground="{StaticResource TextSecondaryBrush}"
+                                                               TextWrapping="Wrap" FontFamily="{StaticResource MonoFont}"/>
+                                                </ScrollViewer>
+                                                <TextBox x:Name="GraphNodeEditor" Visibility="Collapsed"
+                                                         MinHeight="180" MaxHeight="240"
+                                                         AcceptsReturn="True" TextWrapping="Wrap"
+                                                         VerticalScrollBarVisibility="Auto"
+                                                         FontFamily="{StaticResource MonoFont}"
+                                                         Style="{StaticResource NeonTextBox}"/>
+                                            </Grid>
                                         </Grid>
                                     </Border>
                                 </Grid>
@@ -693,7 +946,7 @@
                                                     <Ellipse Width="160" Height="160" Opacity="0.1">
                                                         <Ellipse.Fill>
                                                             <RadialGradientBrush>
-                                                                <GradientStop Color="{StaticResource ElectricPurpleColor}" Offset="0"/>
+                                                                <GradientStop Color="{DynamicResource ElectricPurpleColor}" Offset="0"/>
                                                                 <GradientStop Color="Transparent" Offset="1"/>
                                                             </RadialGradientBrush>
                                                         </Ellipse.Fill>
@@ -1067,7 +1320,7 @@
                                 <StackPanel Margin="0,0,0,16">
                                     <TextBlock Text="Knowledge Growth" FontSize="24" FontWeight="Bold"
                                                Foreground="{StaticResource TextPrimaryBrush}" Margin="0,0,0,4"/>
-                                    <TextBlock Text="Track your brain's expertise growth across domains"
+                                    <TextBlock Text="Cumulative notes over real time — top categories tracked separately"
                                                FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"/>
                                 </StackPanel>
                                 <Border Grid.Row="1" Style="{StaticResource CardPanel}">
@@ -1726,14 +1979,31 @@
 
                                         <!-- About -->
                                         <Border Style="{StaticResource CardPanel}">
-                                            <StackPanel>
-                                                <TextBlock Text="ABOUT" FontSize="11" FontWeight="SemiBold"
-                                                           Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,8"/>
-                                                <TextBlock Text="ObsidianX — Neural Knowledge Network v2.0.0"
-                                                           FontSize="13" Foreground="{StaticResource TextPrimaryBrush}"/>
-                                                <TextBlock Text="Decentralized brain-to-brain knowledge sharing"
-                                                           FontSize="11" Foreground="{StaticResource TextSecondaryBrush}" Margin="0,4,0,0"/>
-                                            </StackPanel>
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <!-- Full logo, square-cropped -->
+                                                <Border Grid.Column="0" Width="72" Height="72" CornerRadius="10"
+                                                        Margin="0,0,16,0" ClipToBounds="True"
+                                                        Effect="{StaticResource LogoGlow}">
+                                                    <Image Source="pack://application:,,,/Assets/Logo.png"
+                                                           Stretch="UniformToFill"/>
+                                                </Border>
+                                                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                                    <TextBlock Text="ABOUT" FontSize="11" FontWeight="SemiBold"
+                                                               Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,8"/>
+                                                    <TextBlock x:Name="AboutVersionText"
+                                                               Text="ObsidianX — Neural Knowledge Network"
+                                                               FontSize="13" Foreground="{StaticResource TextPrimaryBrush}"/>
+                                                    <TextBlock Text="Decentralized brain-to-brain knowledge sharing"
+                                                               FontSize="11" Foreground="{StaticResource TextSecondaryBrush}" Margin="0,4,0,0"/>
+                                                    <TextBlock x:Name="AboutBuildText" FontSize="10"
+                                                               Foreground="{StaticResource TextMutedBrush}"
+                                                               FontFamily="{StaticResource MonoFont}" Margin="0,6,0,0"/>
+                                                </StackPanel>
+                                            </Grid>
                                         </Border>
                                     </StackPanel>
                                 </ScrollViewer>
@@ -1751,7 +2021,7 @@
                             BorderBrush="{StaticResource NeonCyanBrush}" BorderThickness="1"
                             CornerRadius="12" Padding="0">
                         <Border.Effect>
-                            <DropShadowEffect Color="{StaticResource NeonCyanColor}" BlurRadius="30" Opacity="0.3" ShadowDepth="0"/>
+                            <DropShadowEffect Color="{DynamicResource NeonCyanColor}" BlurRadius="30" Opacity="0.3" ShadowDepth="0"/>
                         </Border.Effect>
                         <Grid>
                             <Grid.RowDefinitions>
@@ -1771,41 +2041,72 @@
                     </Border>
                 </Grid>
 
-                <!-- STATUS BAR -->
+                <!-- STATUS BAR — 3-column grid so the left status text can
+                     truncate gracefully when chips on the right grow long.
+                     Old version used a single cell with HorizontalAlignment
+                     and the three sections overlapped each other. -->
                 <Border Grid.Row="2" Background="{StaticResource DarkPanelBrush}"
                         BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="0,1,0,0">
                     <Grid Margin="16,0">
-                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Center">
-                            <Ellipse x:Name="StatusDot" Width="6" Height="6" Fill="{StaticResource NeonGreenBrush}" Margin="0,0,6,0"/>
-                            <TextBlock x:Name="StatusText" Text="Ready" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+
+                        <!-- Left: free-form status message. Truncates with ellipsis
+                             rather than pushing the chips off-screen. -->
+                        <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center"
+                                    Margin="0,0,12,0">
+                            <Ellipse x:Name="StatusDot" Width="6" Height="6"
+                                     Fill="{StaticResource NeonGreenBrush}" Margin="0,0,6,0"/>
+                            <TextBlock x:Name="StatusText" Text="Ready" FontSize="10"
+                                       Foreground="{StaticResource TextMutedBrush}"
+                                       TextTrimming="CharacterEllipsis"
+                                       VerticalAlignment="Center"/>
                         </StackPanel>
 
-                        <!-- MCP / Claude connection indicators in the middle -->
-                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
+                        <!-- Center: MCP / Claude / AI / Server chips. Compact labels
+                             so the row stays narrow. Each dot has a tooltip with the
+                             full meaning. -->
+                        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center"
+                                    Margin="0,0,12,0">
                             <Ellipse x:Name="McpCliDot" Width="6" Height="6" Fill="#555577" Margin="0,0,4,0"
                                      ToolTip="Claude Code CLI registration status"/>
-                            <TextBlock x:Name="McpCliStatus" Text="CLI: ?" FontSize="10"
+                            <TextBlock x:Name="McpCliStatus" Text="CLI ?" FontSize="10"
                                        FontFamily="{StaticResource MonoFont}"
-                                       Foreground="{StaticResource TextMutedBrush}" Margin="0,0,14,0"/>
+                                       Foreground="{StaticResource TextMutedBrush}" Margin="0,0,10,0"/>
                             <Ellipse x:Name="McpDesktopDot" Width="6" Height="6" Fill="#555577" Margin="0,0,4,0"
                                      ToolTip="Claude Desktop registration status"/>
-                            <TextBlock x:Name="McpDesktopStatus" Text="Desktop: ?" FontSize="10"
+                            <TextBlock x:Name="McpDesktopStatus" Text="DT ?" FontSize="10"
                                        FontFamily="{StaticResource MonoFont}"
-                                       Foreground="{StaticResource TextMutedBrush}" Margin="0,0,14,0"/>
+                                       Foreground="{StaticResource TextMutedBrush}" Margin="0,0,10,0"/>
                             <Ellipse x:Name="McpActivityDot" Width="6" Height="6" Fill="#555577" Margin="0,0,4,0"
                                      ToolTip="Recent MCP activity (access-log tail)"/>
                             <TextBlock x:Name="McpActivityStatus" Text="idle" FontSize="10"
                                        FontFamily="{StaticResource MonoFont}"
-                                       Foreground="{StaticResource TextMutedBrush}" Margin="0,0,14,0"/>
+                                       Foreground="{StaticResource TextMutedBrush}" Margin="0,0,10,0"/>
                             <Ellipse x:Name="AiBackendDot" Width="6" Height="6" Fill="#555577" Margin="0,0,4,0"
                                      ToolTip="Active AI backend + model"/>
-                            <TextBlock x:Name="AiBackendStatus" Text="AI: off" FontSize="10"
+                            <TextBlock x:Name="AiBackendStatus" Text="AI off" FontSize="10"
                                        FontFamily="{StaticResource MonoFont}"
-                                       Foreground="{StaticResource TextMutedBrush}"/>
+                                       Foreground="{StaticResource TextMutedBrush}" Margin="0,0,10,0"/>
+                            <Border x:Name="ServerStatusChip" Background="Transparent"
+                                    Cursor="Hand" Padding="0" MouseLeftButtonUp="ServerStatusChip_Click"
+                                    ToolTip="ObsidianX Server (Kestrel :5142) — click to open dashboard">
+                                <StackPanel Orientation="Horizontal">
+                                    <Ellipse x:Name="ServerStatusDot" Width="6" Height="6"
+                                             Fill="#555577" Margin="0,0,4,0"/>
+                                    <TextBlock x:Name="ServerStatusText" Text="Srv ?" FontSize="10"
+                                               FontFamily="{StaticResource MonoFont}"
+                                               Foreground="{StaticResource TextMutedBrush}"/>
+                                </StackPanel>
+                            </Border>
                         </StackPanel>
 
-                        <TextBlock x:Name="VersionText" Text="ObsidianX v2.0.0" FontSize="10"
-                                   Foreground="{StaticResource TextMutedBrush}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                        <!-- Right: version. -->
+                        <TextBlock Grid.Column="2" x:Name="VersionText" Text="ObsidianX v2.0.0" FontSize="10"
+                                   Foreground="{StaticResource TextMutedBrush}" VerticalAlignment="Center"/>
                     </Grid>
                 </Border>
             </Grid>

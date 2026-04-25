@@ -1,24 +1,31 @@
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
 
-    <!-- ═══════════════════════════════════════════════════ -->
-    <!-- ObsidianX Cyberpunk Theme — Deep Space + Neon Glow -->
-    <!-- ═══════════════════════════════════════════════════ -->
+    <!-- ═════════════════════════════════════════════════════════ -->
+    <!-- ObsidianX Theme — Magenta Nebula (palette tuned to logo)  -->
+    <!-- Primary: hot magenta glow · Secondary: electric purple     -->
+    <!-- Background: deep purple-black space                        -->
+    <!-- ═════════════════════════════════════════════════════════ -->
 
     <!-- Color Palette -->
-    <Color x:Key="DeepSpaceColor">#FF0B0B1A</Color>
-    <Color x:Key="DarkPanelColor">#FF12122A</Color>
-    <Color x:Key="SurfaceColor">#FF1A1A2E</Color>
-    <Color x:Key="SurfaceLightColor">#FF252545</Color>
-    <Color x:Key="NeonCyanColor">#FF00F0FF</Color>
-    <Color x:Key="ElectricPurpleColor">#FF8B5CF6</Color>
-    <Color x:Key="NeonPinkColor">#FFFF006E</Color>
+    <Color x:Key="DeepSpaceColor">#FF0A0510</Color>
+    <Color x:Key="DarkPanelColor">#FF170A28</Color>
+    <Color x:Key="SurfaceColor">#FF1F1236</Color>
+    <Color x:Key="SurfaceLightColor">#FF2D1A4A</Color>
+    <!-- Historically "NeonCyan" — now the primary magenta glow that matches the logo -->
+    <Color x:Key="NeonCyanColor">#FFFF2E94</Color>
+    <Color x:Key="ElectricPurpleColor">#FFB044FF</Color>
+    <Color x:Key="NeonPinkColor">#FFFF6BB0</Color>
     <Color x:Key="NeonGreenColor">#FF00FF88</Color>
-    <Color x:Key="TextPrimaryColor">#FFE0E0FF</Color>
-    <Color x:Key="TextSecondaryColor">#FF8888AA</Color>
-    <Color x:Key="TextMutedColor">#FF555577</Color>
-    <Color x:Key="DangerColor">#FFFF4444</Color>
+    <Color x:Key="TextPrimaryColor">#FFF5E5FA</Color>
+    <Color x:Key="TextSecondaryColor">#FFC3A7D8</Color>
+    <Color x:Key="TextMutedColor">#FF6F5287</Color>
+    <Color x:Key="DangerColor">#FFFF5566</Color>
     <Color x:Key="SuccessColor">#FF00FF88</Color>
+    <!-- Dedicated logo-accent colors for direct references in XAML/code -->
+    <Color x:Key="LogoMagentaColor">#FFFF1E8A</Color>
+    <Color x:Key="LogoRoseColor">#FFFF5FA6</Color>
+    <Color x:Key="LogoVioletColor">#FF8A2BE2</Color>
 
     <!-- Brushes -->
     <SolidColorBrush x:Key="DeepSpaceBrush" Color="{StaticResource DeepSpaceColor}"/>
@@ -47,15 +54,23 @@
     </LinearGradientBrush>
 
     <LinearGradientBrush x:Key="SidebarGradient" StartPoint="0,0" EndPoint="0,1">
-        <GradientStop Color="#FF0D0D22" Offset="0"/>
-        <GradientStop Color="#FF080818" Offset="1"/>
+        <GradientStop Color="#FF12071F" Offset="0"/>
+        <GradientStop Color="#FF070310" Offset="1"/>
     </LinearGradientBrush>
 
-    <!-- Glow Effects -->
-    <DropShadowEffect x:Key="CyanGlow" Color="{StaticResource NeonCyanColor}" BlurRadius="15" ShadowDepth="0" Opacity="0.6"/>
-    <DropShadowEffect x:Key="PurpleGlow" Color="{StaticResource ElectricPurpleColor}" BlurRadius="15" ShadowDepth="0" Opacity="0.6"/>
+    <!-- Magenta → purple logo gradient, used on the top brand strip, filled
+         buttons, and the sidebar brain halo. -->
+    <LinearGradientBrush x:Key="LogoGradient" StartPoint="0,0" EndPoint="1,1">
+        <GradientStop Color="{StaticResource LogoMagentaColor}" Offset="0"/>
+        <GradientStop Color="{StaticResource LogoVioletColor}" Offset="1"/>
+    </LinearGradientBrush>
+
+    <!-- Glow Effects — all tuned to the logo's magenta signature -->
+    <DropShadowEffect x:Key="CyanGlow" Color="{StaticResource NeonCyanColor}" BlurRadius="18" ShadowDepth="0" Opacity="0.75"/>
+    <DropShadowEffect x:Key="PurpleGlow" Color="{StaticResource ElectricPurpleColor}" BlurRadius="18" ShadowDepth="0" Opacity="0.7"/>
     <DropShadowEffect x:Key="PinkGlow" Color="{StaticResource NeonPinkColor}" BlurRadius="15" ShadowDepth="0" Opacity="0.6"/>
-    <DropShadowEffect x:Key="SubtleGlow" Color="{StaticResource NeonCyanColor}" BlurRadius="8" ShadowDepth="0" Opacity="0.3"/>
+    <DropShadowEffect x:Key="SubtleGlow" Color="{StaticResource NeonCyanColor}" BlurRadius="10" ShadowDepth="0" Opacity="0.4"/>
+    <DropShadowEffect x:Key="LogoGlow" Color="{StaticResource LogoMagentaColor}" BlurRadius="28" ShadowDepth="0" Opacity="0.85"/>
 
     <!-- Fonts -->
     <FontFamily x:Key="MainFont">Segoe UI, Arial</FontFamily>
@@ -207,10 +222,105 @@
         <!-- Text is already uppercase in XAML content -->
     </Style>
 
-    <!-- ScrollBar Style -->
+    <!-- ═══════════════════════════════════════════════════════════
+         ScrollBar — thin (8px), rounded magenta thumb, fades in on hover.
+         Custom template because the stock WPF ScrollBar is 17px wide and
+         doesn't take a Width setter unless the template is replaced.
+         ═══════════════════════════════════════════════════════════ -->
+    <Style x:Key="ScrollBarThumbStyle" TargetType="Thumb">
+        <Setter Property="IsTabStop" Value="False"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Thumb">
+                    <Border x:Name="Tb" CornerRadius="3"
+                            Background="{StaticResource LogoGradient}"
+                            Opacity="0.55" Margin="2,0"/>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Tb" Property="Opacity" Value="0.95"/>
+                        </Trigger>
+                        <Trigger Property="IsDragging" Value="True">
+                            <Setter TargetName="Tb" Property="Opacity" Value="1.0"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <Style x:Key="ScrollBarThumbHorizontalStyle" TargetType="Thumb" BasedOn="{StaticResource ScrollBarThumbStyle}">
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Thumb">
+                    <Border x:Name="Tb" CornerRadius="3"
+                            Background="{StaticResource LogoGradient}"
+                            Opacity="0.55" Margin="0,2"/>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Tb" Property="Opacity" Value="0.95"/>
+                        </Trigger>
+                        <Trigger Property="IsDragging" Value="True">
+                            <Setter TargetName="Tb" Property="Opacity" Value="1.0"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- Vertical template — thumb hugs the right edge of scrolling content. -->
+    <ControlTemplate x:Key="VerticalScrollBarTemplate" TargetType="ScrollBar">
+        <Grid Background="Transparent">
+            <Track x:Name="PART_Track" IsDirectionReversed="True" Focusable="False">
+                <Track.Thumb>
+                    <Thumb Style="{StaticResource ScrollBarThumbStyle}"/>
+                </Track.Thumb>
+                <Track.IncreaseRepeatButton>
+                    <RepeatButton Background="Transparent" BorderThickness="0"
+                                  Command="ScrollBar.PageDownCommand" Opacity="0"/>
+                </Track.IncreaseRepeatButton>
+                <Track.DecreaseRepeatButton>
+                    <RepeatButton Background="Transparent" BorderThickness="0"
+                                  Command="ScrollBar.PageUpCommand" Opacity="0"/>
+                </Track.DecreaseRepeatButton>
+            </Track>
+        </Grid>
+    </ControlTemplate>
+
+    <!-- Horizontal template — thumb hugs the bottom edge. -->
+    <ControlTemplate x:Key="HorizontalScrollBarTemplate" TargetType="ScrollBar">
+        <Grid Background="Transparent">
+            <Track x:Name="PART_Track" IsDirectionReversed="False" Focusable="False">
+                <Track.Thumb>
+                    <Thumb Style="{StaticResource ScrollBarThumbHorizontalStyle}"/>
+                </Track.Thumb>
+                <Track.IncreaseRepeatButton>
+                    <RepeatButton Background="Transparent" BorderThickness="0"
+                                  Command="ScrollBar.PageRightCommand" Opacity="0"/>
+                </Track.IncreaseRepeatButton>
+                <Track.DecreaseRepeatButton>
+                    <RepeatButton Background="Transparent" BorderThickness="0"
+                                  Command="ScrollBar.PageLeftCommand" Opacity="0"/>
+                </Track.DecreaseRepeatButton>
+            </Track>
+        </Grid>
+    </ControlTemplate>
+
     <Style TargetType="ScrollBar">
-        <Setter Property="Width" Value="6"/>
         <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="BorderThickness" Value="0"/>
+        <Style.Triggers>
+            <Trigger Property="Orientation" Value="Vertical">
+                <Setter Property="Width" Value="8"/>
+                <Setter Property="Height" Value="Auto"/>
+                <Setter Property="Template" Value="{StaticResource VerticalScrollBarTemplate}"/>
+            </Trigger>
+            <Trigger Property="Orientation" Value="Horizontal">
+                <Setter Property="Width" Value="Auto"/>
+                <Setter Property="Height" Value="8"/>
+                <Setter Property="Template" Value="{StaticResource HorizontalScrollBarTemplate}"/>
+            </Trigger>
+        </Style.Triggers>
     </Style>
 
     <!-- TextBox Style -->

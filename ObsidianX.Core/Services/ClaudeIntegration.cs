@@ -48,21 +48,12 @@ public class ClaudeIntegration
         sb.AppendLine();
         sb.AppendLine("This is an ObsidianX-managed knowledge vault. Notes are Markdown files organized by knowledge domains.");
         sb.AppendLine();
-        sb.AppendLine("## Expertise Profile");
-        sb.AppendLine();
-
-        var topExpertise = graph.ExpertiseMap
-            .OrderByDescending(kv => kv.Value.Score)
-            .Take(10);
-
-        foreach (var (category, score) in topExpertise)
-        {
-            var bar = new string('█', (int)(score.Score * 20));
-            var empty = new string('░', 20 - (int)(score.Score * 20));
-            sb.AppendLine($"- **{category}**: {bar}{empty} {score.Score:P0} ({score.NoteCount} notes, {score.TotalWords:N0} words)");
-        }
-
-        sb.AppendLine();
+        // The expertise profile used to be rendered here as a static
+        // snapshot — but BrainExporter writes a live, marker-managed
+        // `## Brain Profile` section below that updates on every export.
+        // Two copies of the same chart drifted out of sync (one stale,
+        // one fresh) and obscured the per-category percentages. We now
+        // defer entirely to the auto-managed section.
         sb.AppendLine("## Instructions for Claude");
         sb.AppendLine();
         sb.AppendLine("- When working with this vault, respect the existing folder structure and linking patterns.");

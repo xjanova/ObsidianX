@@ -224,10 +224,10 @@ public class BrainExporter
     private static void UpdateClaudeMd(string vaultPath, BrainExport export)
     {
         var path = Path.Combine(vaultPath, "CLAUDE.md");
-        var injected = BuildClaudeSection(export);
+        var injected = BuildClaudeSection(export).TrimEnd('\r', '\n');
         if (!File.Exists(path))
         {
-            File.WriteAllText(path, injected);
+            File.WriteAllText(path, injected + "\n");
             return;
         }
 
@@ -238,11 +238,24 @@ public class BrainExporter
         string updated;
         if (begin >= 0 && end > begin)
         {
-            updated = existing[..begin] + injected + existing[(end + ClaudeEndMarker.Length)..];
+            // Surgical splice. Trim trailing newlines on the prefix and
+            // leading newlines on the suffix so we don't accumulate blank
+            // lines on every export — that's how a single-shot exporter
+            // grew CLAUDE.md to 1200+ trailing blank lines over many
+            // index runs in one session.
+            var prefix = existing[..begin].TrimEnd('\r', '\n');
+            var suffix = existing[(end + ClaudeEndMarker.Length)..].TrimStart('\r', '\n');
+
+            var sb = new StringBuilder();
+            if (prefix.Length > 0) { sb.Append(prefix); sb.Append("\n\n"); }
+            sb.Append(injected);
+            sb.Append('\n');
+            if (suffix.Length > 0) { sb.Append('\n'); sb.Append(suffix.TrimEnd('\r', '\n')); sb.Append('\n'); }
+            updated = sb.ToString();
         }
         else
         {
-            updated = existing.TrimEnd() + "\n\n" + injected;
+            updated = existing.TrimEnd() + "\n\n" + injected + "\n";
         }
         File.WriteAllText(path, updated);
     }
