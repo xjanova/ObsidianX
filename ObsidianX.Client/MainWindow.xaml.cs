@@ -249,6 +249,11 @@ public partial class MainWindow : Window
         _graphPhysics.LoadFromGraph(_graph);
         _graphPhysics.Disturb(_graph.TotalNodes > 20 ? 0.08 : 0.4);
 
+        // Background pass: compute embedding-based attraction springs so
+        // semantically-similar notes nudge each other in the layout. No-op
+        // when no embeddings exist yet; safe to fire-and-forget.
+        _ = RecomputeSemanticSpringsAsync();
+
         // Frame all nodes in the dashboard map by default so users see the
         // whole brain on first load instead of a zoomed-into-the-middle slice.
         // Re-run after the first physics tick has actually placed nodes.
@@ -7332,6 +7337,44 @@ public partial class MainWindow : Window
     private const double PulseHoldSeconds = 2.0;
     private const double PulseHoldFloor = 0.55;
     private const double PulseDecayHalfLife = 2.9;
+
+    /// <summary>
+    /// Recompute embedding-similarity springs and attach them to both
+    /// physics engines. O(N²) cosine — runs on a worker thread so the
+    /// UI doesn't stall. Skips silently when no embeddings exist.
+    /// </summary>
+    private async Task RecomputeSemanticSpringsAsync()
+    {
+        try
+        {
+            var nodeIds = _graphPhysics.Nodes.Select(n => n.Id).ToList();
+            // Build the structural pair set on the UI thread to avoid
+            // racing the Edges list while the engine is mid-tick.
+            var structural = new HashSet<(string, string)>();
+            foreach (var ed in _graphPhysics.Edges)
+                structural.Add((ed.SourceId, ed.TargetId));
+
+            var result = await Task.Run(() =>
+                new ObsidianX.Core.Services.SemanticSpringComputer()
+                    .Compute(_vaultPath, nodeIds, structural));
+
+            if (result.Springs.Count == 0) return;
+
+            // Attach the same spring list to both engines so the dashboard
+            // map and the full graph view feel each other's nudge.
+            _dashPhysics.SemanticSprings = result.Springs;
+            _graphPhysics.SemanticSprings = result.Springs;
+
+            try
+            {
+                StatusText.Text = $"🧬 Semantic springs ready: {result.Springs.Count} pairs "
+                    + $"from {result.NodesWithEmbedding} embedded notes "
+                    + $"({result.PairsAboveThreshold}/{result.PairsChecked} above threshold)";
+            }
+            catch { /* status bar not visible during early bootstrap is fine */ }
+        }
+        catch { /* best-effort — semantic springs are optional */ }
+    }
     /// <summary>
     /// Decide whether the 2D view needs a repaint this frame. Returns true
     /// if the graph still has kinetic energy, any node is in a lifecycle

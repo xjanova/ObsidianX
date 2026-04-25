@@ -159,6 +159,18 @@ public class PhysicsEngine
     public List<PhysicsNode> Nodes { get; } = [];
     public List<PhysicsEdge> Edges { get; } = [];
 
+    /// <summary>Optional semantic-similarity springs computed by
+    /// <c>SemanticSpringComputer</c>. Apply ON TOP OF structural Edges,
+    /// at a small fraction of the structural spring strength so they
+    /// nudge similar notes closer without overriding link topology.
+    /// Empty when no embeddings are available — physics still works.</summary>
+    public List<ObsidianX.Core.Services.SemanticSpring> SemanticSprings { get; set; } = [];
+
+    /// <summary>Strength multiplier applied to semantic springs relative to
+    /// structural ones. 0.12 means a "very similar" pair (similarity 1.0)
+    /// pulls about 12% as hard as a real wiki-link does.</summary>
+    public double SemanticSpringStrength { get; set; } = 0.12;
+
     public double Repulsion { get; set; } = 8.0;
     public double SpringStrength { get; set; } = 0.06;
     public double SpringLength { get; set; } = 2.5;
@@ -505,6 +517,31 @@ public class PhysicsEngine
             var force = dir * forceMag;
             forces[si] += force;
             forces[ti] -= force;
+        }
+
+        // ── 2b. Semantic springs — soft attraction between embedding-similar
+        //        pairs that AREN'T already wiki-linked. Same FR style force as
+        //        structural springs but scaled by SemanticSpringStrength so the
+        //        layout still favours real link topology. No-op when the
+        //        SemanticSprings list is empty (no embeddings generated yet).
+        if (SemanticSprings.Count > 0)
+        {
+            foreach (var spring in SemanticSprings)
+            {
+                if (!nodeIndex.TryGetValue(spring.SourceId, out var si)) continue;
+                if (!nodeIndex.TryGetValue(spring.TargetId, out var ti)) continue;
+
+                var delta = Nodes[ti].Position - Nodes[si].Position;
+                var dist = Math.Max(0.05, delta.Length);
+                var k = IdealLength;
+                var forceMag = (dist * dist) / k * SpringStrength
+                             * SemanticSpringStrength * spring.Similarity;
+
+                var dir = delta; dir.Normalize();
+                var force = dir * forceMag;
+                forces[si] += force;
+                forces[ti] -= force;
+            }
         }
 
         // ── 3. Per-community gravity — pulls cluster members together ──
