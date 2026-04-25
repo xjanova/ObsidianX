@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows;
 
 namespace ObsidianX.Client;
@@ -17,9 +18,50 @@ public partial class App : Application
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern void SHChangeNotify(uint eventId, uint flags, IntPtr item1, IntPtr item2);
 
+    // ── Single-instance gate ──────────────────────────────────────
+    // The app holds heavyweight singletons (file watcher, vault index,
+    // SignalR client, MCP access-log tail) that don't tolerate two
+    // copies running at once — multiple instances would race on
+    // .obsidianx/access-log.ndjson and brain-export.json. Hold a named
+    // mutex for the whole process lifetime; if a second copy launches,
+    // it bails out before WPF spins up any UI. Mutex naming "Global\\"
+    // makes it cross-session on Windows so even Run-As-Different-User
+    // doesn't accidentally start a duplicate.
+    private static Mutex? _singleInstanceMutex;
+    private const string SingleInstanceMutexName =
+        "Global\\ObsidianX.Client.singleinstance.0xBRAIN-f099-be76-07f0-aad3";
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindow(string? lpClassName, string? lpWindowName);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    private const int SW_RESTORE = 9;
+
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+
+        // Try to claim the single-instance mutex. If we don't get it,
+        // somebody else is already running — bring their window forward
+        // and shut this process down before any heavy init runs.
+        bool createdNew;
+        _singleInstanceMutex = new Mutex(initiallyOwned: true,
+            name: SingleInstanceMutexName, out createdNew);
+        if (!createdNew)
+        {
+            FocusExistingInstance();
+            // Shutdown(0) here would still run more App init; Environment.Exit
+            // is the cleanest way out before WPF builds a window.
+            Environment.Exit(0);
+            return;
+        }
 
         try
         {
@@ -31,6 +73,25 @@ public partial class App : Application
         {
             Debug.WriteLine($"Shortcut setup failed: {ex.Message}");
         }
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        try { _singleInstanceMutex?.ReleaseMutex(); } catch { /* mutex may already be abandoned */ }
+        _singleInstanceMutex?.Dispose();
+        _singleInstanceMutex = null;
+        base.OnExit(e);
+    }
+
+    private static void FocusExistingInstance()
+    {
+        // Best-effort: walk the existing app's main-window title and
+        // bring it forward. The WPF Window's title is set in the XAML —
+        // if it changes, this string needs to match.
+        var hwnd = FindWindow(null, "ObsidianX — Neural Knowledge Engine");
+        if (hwnd == IntPtr.Zero) return;
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
     }
 
     // Create or self-heal a Desktop shortcut pointing at this exe. Uses the

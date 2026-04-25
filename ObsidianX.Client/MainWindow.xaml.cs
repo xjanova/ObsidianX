@@ -37,6 +37,40 @@ public partial class MainWindow : Window
     // Auto-import + brain export
     private readonly VaultImporter _importer = new();
     private readonly BrainExporter _exporter = new();
+    private readonly EmbeddingService _embeddings = new();
+    private readonly TokenSavingsTracker _tokenSavings = new();
+    private readonly TokenUsageAggregator _tokenUsage = new();
+    private System.Windows.Threading.DispatcherTimer? _tokenSavingsTimer;
+    /// <summary>
+    /// Path to the brain-mode file the UserPromptSubmit/Stop hooks read.
+    /// One-liner content: "always" | "auto" | "off". Missing file =
+    /// "always" (so first-time users get hooks active by default).
+    /// </summary>
+    private static string BrainModePath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".claude", "brain-mode.txt");
+
+    private string ReadBrainMode()
+    {
+        try
+        {
+            if (!File.Exists(BrainModePath)) return "always";
+            var s = File.ReadAllText(BrainModePath).Trim().ToLowerInvariant();
+            return s == "auto" || s == "off" ? s : "always";
+        }
+        catch { return "always"; }
+    }
+
+    private void WriteBrainMode(string mode)
+    {
+        try
+        {
+            var dir = Path.GetDirectoryName(BrainModePath);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            File.WriteAllText(BrainModePath, mode + "\n");
+        }
+        catch (Exception ex) { Debug.WriteLine($"WriteBrainMode: {ex.Message}"); }
+    }
     private readonly List<string> _scanPaths = [];
     private bool _scanWholeMachine;
     private string _scanPatterns = "CLAUDE.md;README.md;*.md";
@@ -109,7 +143,10 @@ public partial class MainWindow : Window
 
     // Camera modes
     private enum CameraMode { Free, FollowPulse, Orbit, Overview, RandomWalk, RealBrain }
-    private CameraMode _cameraMode = CameraMode.Free;
+    // Default to RealBrain so first-time visitors land in "watch the AI
+    // think" mode rather than a static drag camera. This is what the user
+    // wants: the camera follows MCP/edit activity automatically.
+    private CameraMode _cameraMode = CameraMode.RealBrain;
     private DateTime _lastRandomTargetChange = DateTime.UtcNow;
     private int _randomTargetIdx = -1;
     private readonly Random _cameraRng = new();
@@ -126,6 +163,24 @@ public partial class MainWindow : Window
     // Camera returns here when activity stops so the user keeps their
     // bearings. Captured lazily when the first attention fires.
     private (Point3D target, double dist)? _realBrainHome;
+
+    // ── Electric arcs ───────────────────────────────────────────────
+    // When a node is touched (read/write/MCP-pull) we spawn a traveling
+    // bolt along every connected edge. It crawls from source to target
+    // over its lifetime so the eye reads it as "current flowing" rather
+    // than a static highlight. Stored as a flat list, drained per frame
+    // by ArcLifetimeSec; the user asked for ≥ 2 s visibility so the
+    // default is 2.4 s.
+    private sealed class ElectricArc
+    {
+        public PhysicsEngine Physics = null!;
+        public string SrcId = "";
+        public string TgtId = "";
+        public DateTime StartedAt;
+        public Color Tint;
+    }
+    private const double ArcLifetimeSec = 2.4;
+    private readonly List<ElectricArc> _arcs = new(64);
 
     // Node selection
     private int? _selectedNodeDash;
@@ -150,6 +205,7 @@ public partial class MainWindow : Window
         ["Peers"] = "PeersView",
         ["Sharing"] = "SharingView",
         ["Growth"] = "GrowthView",
+        ["Tokens"] = "TokensView",
         ["Settings"] = "SettingsView",
         ["Editor"] = "EditorView",
         ["Search"] = "SearchView"
@@ -175,6 +231,10 @@ public partial class MainWindow : Window
         pulse.Begin();
 
         UpdateAboutCard();
+        // Fire-and-forget: hits GitHub Releases for the latest tag and
+        // refreshes the bottom-bar label if a newer build is available.
+        // Doesn't block startup — UX nicety only.
+        _ = CheckLatestReleaseAsync();
         InitializeIdentity();
         LoadSettingsFromFile();
         ApplyUiTheme(_uiTheme);
@@ -193,6 +253,26 @@ public partial class MainWindow : Window
         // whole brain on first load instead of a zoomed-into-the-middle slice.
         // Re-run after the first physics tick has actually placed nodes.
         FitDashCamera();
+
+        // Brain Graph: auto-fit + Real Brain attention as the default
+        // landing experience. Without this, the camera lands at its XAML
+        // initial position (often inside the cluster) and stays in Free
+        // drag mode — which doesn't match the "AI watch" framing the user
+        // wants. Done after the physics dispatches its first tick so node
+        // positions are real.
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            FitGraphCamera();
+            _cameraMode = CameraMode.RealBrain;
+            _attentionTarget = null;
+            _attentionStartedAt = DateTime.UtcNow;
+            FullGraph2D.FitToContent();
+        }), System.Windows.Threading.DispatcherPriority.ContextIdle);
+
+        // Token-savings gauge ticks every 5s by tailing access-log.ndjson.
+        // Cheap (single sequential file read), so a busy brain doesn't
+        // accumulate stale numbers in the toolbar.
+        StartTokenSavingsTimer();
         Dispatcher.BeginInvoke(new Action(FitDashCamera),
             System.Windows.Threading.DispatcherPriority.ContextIdle);
 
@@ -334,7 +414,15 @@ public partial class MainWindow : Window
             if (_dashView2D)
             {
                 DashGraph2D.SelectedIndex = _selectedNodeDash;
-                DashGraph2D.InvalidateVisual();
+                var arcs = BuildArcSnapshot(_dashPhysics);
+                DashGraph2D.Arcs = arcs;
+                // Skip the redraw when the graph is settled AND no live arcs/
+                // pulses need animating. WPF was happily repainting 60×/s on
+                // a static graph which is what made the stutter feel "always
+                // there" — now the dispatcher can yield and other UI work
+                // (e.g. typing in editor) gets responsive.
+                if (Needs2DRedraw(_dashPhysics, arcs))
+                    DashGraph2D.InvalidateVisual();
             }
             else
             {
@@ -348,7 +436,10 @@ public partial class MainWindow : Window
             if (_graphView2D)
             {
                 FullGraph2D.SelectedIndex = _selectedNodeGraph;
-                FullGraph2D.InvalidateVisual();
+                var arcs = BuildArcSnapshot(_graphPhysics);
+                FullGraph2D.Arcs = arcs;
+                if (Needs2DRedraw(_graphPhysics, arcs))
+                    FullGraph2D.InvalidateVisual();
             }
             else
             {
@@ -434,12 +525,19 @@ public partial class MainWindow : Window
         if (hit.HasValue)
         {
             _selectedNodeDash = hit;
+            var node = _dashPhysics.Nodes[hit.Value];
             ShowNodeInfo(NodeInfoPanel, NodeInfoTitle, NodeInfoDetail, NodeInfoDot,
-                NodeInfoContent, _dashPhysics.Nodes[hit.Value]);
+                NodeInfoContent, node);
+            // Spawn an electric arc fan-out from the clicked node so the
+            // user gets immediate visual feedback of which neighbours it
+            // connects to. Same path as MCP-driven pulses, just triggered
+            // by user interaction instead of an access-log event.
+            BumpPulseForNode(_dashPhysics, node.Id, "click");
         }
         _dash2DDragging = true;
         _dash2DLastMouse = e.GetPosition((IInputElement)s);
         ((UIElement)s).CaptureMouse();
+        Mark2DDirty();
     }
 
     private void Dash2D_MouseUp(object s, MouseButtonEventArgs e)
@@ -458,6 +556,7 @@ public partial class MainWindow : Window
             DashGraph2D.ViewCenter.X - dx / DashGraph2D.Scale,
             DashGraph2D.ViewCenter.Y + dy / DashGraph2D.Scale);
         _dash2DLastMouse = pos;
+        Mark2DDirty();
     }
 
     private void Dash2D_MouseWheel(object s, MouseWheelEventArgs e)
@@ -472,6 +571,7 @@ public partial class MainWindow : Window
             DashGraph2D.ViewCenter.X + (worldBefore.X - worldAfter.X),
             DashGraph2D.ViewCenter.Y + (worldBefore.Y - worldAfter.Y));
         e.Handled = true;
+        Mark2DDirty();
     }
 
     private void Dash2D_RightClick(object s, MouseButtonEventArgs e)
@@ -487,16 +587,59 @@ public partial class MainWindow : Window
     private void Graph2D_MouseDown(object s, MouseButtonEventArgs e)
     {
         var p = e.GetPosition(FullGraph2D);
-        var hit = FullGraph2D.HitTest(p);
+        // First try a precise hit; if that misses, fall back to nearest
+        // node within 60 px so a click in dense empty space still
+        // triggers a pulse on the closest neighbour. Lets the edge-blink
+        // demo work without pixel-perfect aim.
+        var hit = FullGraph2D.HitTest(p) ?? FindNearestNode2D(p, _graphPhysics, 60);
         if (hit.HasValue)
         {
             _selectedNodeGraph = hit;
+            var node = _graphPhysics.Nodes[hit.Value];
             ShowNodeInfo(GraphNodeInfo, GraphNodeTitle, GraphNodeMeta, GraphNodeDot,
-                GraphNodeContent, _graphPhysics.Nodes[hit.Value]);
+                GraphNodeContent, node);
+            // Click = synthetic touch: bumps AccessIntensity AND spawns
+            // arcs to every neighbour so the user can SEE the
+            // connections light up without waiting for MCP traffic.
+            BumpPulseForNode(_graphPhysics, node.Id, "click");
+            if (StatusText != null)
+                StatusText.Text = $"⚡ Click → {node.Title} · arcs: {_arcs.Count}";
+        }
+        else if (StatusText != null)
+        {
+            StatusText.Text = "Click missed all nodes";
         }
         _graph2DDragging = true;
         _graph2DLastMouse = e.GetPosition((IInputElement)s);
         ((UIElement)s).CaptureMouse();
+        Mark2DDirty();
+    }
+
+    /// <summary>
+    /// Brute-force nearest-node search, used as a fallback when the
+    /// renderer's stricter <see cref="Services.Graph2DRenderer.HitTest"/>
+    /// reports null. Returns the index of the nearest node within
+    /// <paramref name="maxPx"/> screen pixels of <paramref name="screenPt"/>,
+    /// or null if everything is too far away.
+    /// </summary>
+    private int? FindNearestNode2D(Point screenPt, PhysicsEngine physics, double maxPx)
+    {
+        if (physics.Nodes.Count == 0) return null;
+        int bestI = -1;
+        double bestD2 = maxPx * maxPx;
+        for (int i = 0; i < physics.Nodes.Count; i++)
+        {
+            var sp = FullGraph2D.WorldToScreen(physics.Nodes[i].Position);
+            var dx = sp.X - screenPt.X;
+            var dy = sp.Y - screenPt.Y;
+            var d2 = dx * dx + dy * dy;
+            if (d2 < bestD2)
+            {
+                bestD2 = d2;
+                bestI = i;
+            }
+        }
+        return bestI < 0 ? null : bestI;
     }
 
     private void Graph2D_MouseUp(object s, MouseButtonEventArgs e)
@@ -515,6 +658,7 @@ public partial class MainWindow : Window
             FullGraph2D.ViewCenter.X - dx / FullGraph2D.Scale,
             FullGraph2D.ViewCenter.Y + dy / FullGraph2D.Scale);
         _graph2DLastMouse = pos;
+        Mark2DDirty();
     }
 
     private void Graph2D_MouseWheel(object s, MouseWheelEventArgs e)
@@ -528,6 +672,7 @@ public partial class MainWindow : Window
             FullGraph2D.ViewCenter.X + (worldBefore.X - worldAfter.X),
             FullGraph2D.ViewCenter.Y + (worldBefore.Y - worldAfter.Y));
         e.Handled = true;
+        Mark2DDirty();
     }
 
     private void Graph2D_RightClick(object s, MouseButtonEventArgs e)
@@ -1065,7 +1210,14 @@ public partial class MainWindow : Window
         double radiusScale = camDist < 6 ? 0.7 : camDist > 40 ? 1.25 : 1.0;
 
         // --- BATCH ALL NODES INTO ONE MESH PER MATERIAL ---
+        // Two buckets per color so close-up nodes can fade independently of
+        // the far ones. The user reported balls looked "washed out" because
+        // the same low-alpha emissive was applied at every distance — at
+        // overview that turned every dot into a smudge. Now: at distance,
+        // bright/solid; only when the camera is close to a specific ball
+        // does that ball fade to glass (so you can see what's behind it).
         var colorGroups = new Dictionary<Color, (MeshGeometry3D mesh, bool emissive)>();
+        var nearFadeGroups = new Dictionary<Color, MeshGeometry3D>();
         var glowGroup = new MeshGeometry3D();
         var pulseGroups = new Dictionary<Color, MeshGeometry3D>();
         var pulseAuraGroup = new MeshGeometry3D();
@@ -1074,6 +1226,15 @@ public partial class MainWindow : Window
         var birthHaloGroup = new MeshGeometry3D();
         var deathHaloGroup = new MeshGeometry3D();
         int renderedCount = 0;
+
+        // Near-fade threshold: distance from CAMERA (not focus) below which
+        // a node starts becoming translucent. Tightened from 0.35 × camDist
+        // to 0.22 × camDist + a 0.6 floor so the overview keeps every ball
+        // sharp — only the one (or two) you're literally flying through
+        // fades enough to see what's behind it. Earlier value sucked too
+        // many "merely close" balls into the see-through bucket.
+        var nearFadeThreshold = Math.Max(0.6, camDist * 0.22);
+        var nearFadeSqr = nearFadeThreshold * nearFadeThreshold;
 
         for (int i = 0; i < physics.Nodes.Count; i++)
         {
@@ -1137,10 +1298,31 @@ public partial class MainWindow : Window
             var farLod = dsq > focusSqr * 0.3 || physics.Nodes.Count > 150 || camDist > 30;
             var sphereMesh = farLod && !isSelected ? SharedSphereLOD : SharedSphere;
 
-            if (!colorGroups.ContainsKey(color))
-                colorGroups[color] = (new MeshGeometry3D(), false);
+            // Per-node distance from the actual camera lens (not focus) —
+            // governs whether the ball goes to the bright bucket or the
+            // see-through bucket.
+            var cdx = node.Position.X - camPos.X;
+            var cdy = node.Position.Y - camPos.Y;
+            var cdz = node.Position.Z - camPos.Z;
+            var camDsq = cdx * cdx + cdy * cdy + cdz * cdz;
+            // Selected/hovered/active nodes never fade — they're the
+            // signal the user is trying to track.
+            bool nearFade = camDsq < nearFadeSqr
+                            && !isSelected && !node.IsHovered && intensity < 0.05
+                            && birth >= 1.0 && death >= 1.0;
 
-            AppendSphereToMesh(colorGroups[color].mesh, node.Position, radius, sphereMesh);
+            if (nearFade)
+            {
+                if (!nearFadeGroups.TryGetValue(color, out var nf))
+                    nearFadeGroups[color] = nf = new MeshGeometry3D();
+                AppendSphereToMesh(nf, node.Position, radius, sphereMesh);
+            }
+            else
+            {
+                if (!colorGroups.ContainsKey(color))
+                    colorGroups[color] = (new MeshGeometry3D(), false);
+                AppendSphereToMesh(colorGroups[color].mesh, node.Position, radius, sphereMesh);
+            }
 
             // Extra hot-layer: bright overlay mesh for pulsed nodes
             if (intensity > 0.05)
@@ -1183,13 +1365,32 @@ public partial class MainWindow : Window
                 AppendSphereToMesh(glowGroup, node.Position, radius * 1.5, SharedSphereLOD);
         }
 
-        // Add color-grouped node meshes
+        // Bright (far) bucket — fully opaque, no transparency at all.
+        // User reported the outermost balls were still translucent at
+        // alpha 230. Pushed BOTH diffuse and emissive to full 255 so
+        // far-bucket spheres are completely solid; only the near-fade
+        // bucket is allowed to show through.
         foreach (var (color, (mesh, _)) in colorGroups)
         {
             var mat = new MaterialGroup();
             mat.Children.Add(new DiffuseMaterial(new SolidColorBrush(color)));
             mat.Children.Add(new EmissiveMaterial(new SolidColorBrush(
-                Color.FromArgb(100, color.R, color.G, color.B))));
+                Color.FromArgb(255, color.R, color.G, color.B))));
+            group.Children.Add(new GeometryModel3D(mesh, mat) { BackMaterial = mat });
+        }
+
+        // Near-fade bucket — only the ball(s) the camera is INSIDE turn
+        // into translucent glass. Diffuse alpha is preserved by
+        // SolidColorBrush(Argb) because WPF respects the brush opacity on
+        // DiffuseMaterial. Alpha values stay low (90/45) so the next layer
+        // of balls behind the foreground one is clearly readable.
+        foreach (var (color, mesh) in nearFadeGroups)
+        {
+            var mat = new MaterialGroup();
+            mat.Children.Add(new DiffuseMaterial(new SolidColorBrush(
+                Color.FromArgb(90, color.R, color.G, color.B))));
+            mat.Children.Add(new EmissiveMaterial(new SolidColorBrush(
+                Color.FromArgb(45, color.R, color.G, color.B))));
             group.Children.Add(new GeometryModel3D(mesh, mat) { BackMaterial = mat });
         }
 
@@ -1365,6 +1566,12 @@ public partial class MainWindow : Window
         // Pulse ripples — expanding rings on nodes hit by MCP access,
         // like a sonar ping. Independent of the node mesh pulse.
         AppendPulseRipples(group, physics, visible);
+
+        // Electric arcs — current flowing along edges from touched node
+        // toward each neighbour. Uses a jittery polyline so it reads as
+        // a bolt instead of a clean line. Lifespan is ArcLifetimeSec so
+        // the user has at least 2 s to register the connection.
+        AppendElectricArcs(group, physics, nodeIndexById);
 
         // AI FOCUS indicator — a bright persistent halo + "AI FOCUS"
         // label around whatever Real Brain is currently attending to.
@@ -1578,6 +1785,139 @@ public partial class MainWindow : Window
         }
         var dimRing = Color.FromArgb(80, color.R, color.G, color.B);
         group.Children.Add(new GeometryModel3D(mesh2, new EmissiveMaterial(new SolidColorBrush(dimRing))));
+    }
+
+    /// <summary>
+    /// Render every live electric arc as a jittery polyline. Each arc owns
+    /// a (src, tgt, startTime) triple — its head crawls from src to tgt
+    /// over the first ~70% of the lifetime, the tail trails behind, and
+    /// the whole thing fades out in the last 30%.
+    ///
+    /// The bolt geometry is rebuilt every frame because the camera target
+    /// already forces a full RebuildScene pass — there's nothing to gain
+    /// by caching it. The jitter is seeded by arc start time so each bolt
+    /// has its own consistent "shape" instead of flickering pixels.
+    /// </summary>
+    private void AppendElectricArcs(Model3DGroup group,
+        PhysicsEngine physics, Dictionary<string, int> idToIdx)
+    {
+        if (_arcs.Count == 0) return;
+        var now = DateTime.UtcNow;
+        // Drop expired bolts globally so they don't keep getting walked
+        // every frame. Cross-engine arcs (dash vs graph) stay in the list
+        // — the per-arc filter below ignores them when this physics pass
+        // is for the other view.
+        _arcs.RemoveAll(a => (now - a.StartedAt).TotalSeconds > ArcLifetimeSec);
+
+        // Group arcs by tint colour so we can draw all cyan bolts as one
+        // emissive mesh and all magenta bolts as another — same batching
+        // trick the node renderer uses.
+        var tintMeshes = new Dictionary<Color, MeshGeometry3D>();
+        var headMesh = new MeshGeometry3D();
+        Color headTint = _themeAccent;
+
+        foreach (var arc in _arcs)
+        {
+            if (arc.Physics != physics) continue;
+            if (!idToIdx.TryGetValue(arc.SrcId, out var si)) continue;
+            if (!idToIdx.TryGetValue(arc.TgtId, out var ti)) continue;
+
+            var ageSec = (now - arc.StartedAt).TotalSeconds;
+            var t = ageSec / ArcLifetimeSec;            // 0..1
+            if (t >= 1.0) continue;
+
+            // Bolt head leads the trail. Travels from 0 → 1 over the first
+            // 70% of the lifetime, then sits at 1 while the trail fades.
+            var headT = Math.Min(1.0, t / 0.7);
+            // Tail follows behind by ~30% of the path.
+            var tailT = Math.Max(0.0, headT - 0.3);
+            // Brightness: full from 0 to 70%, fade-out the last 30%.
+            var brightness = t < 0.7 ? 1.0 : 1.0 - (t - 0.7) / 0.3;
+
+            var src = physics.Nodes[si].Position;
+            var tgt = physics.Nodes[ti].Position;
+            var dx = tgt.X - src.X;
+            var dy = tgt.Y - src.Y;
+            var dz = tgt.Z - src.Z;
+            var len = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+            if (len < 0.01) continue;
+
+            // Jitter scale grows with edge length — long edges get more
+            // wobble so the bolt reads as electric, not laser-straight.
+            var jitter = Math.Min(0.18, len * 0.04);
+
+            // Per-arc seed → consistent shape, no per-frame flicker.
+            var seed = unchecked((int)(arc.StartedAt.Ticks & 0x7FFFFFFF))
+                       ^ arc.SrcId.GetHashCode() ^ arc.TgtId.GetHashCode();
+            var rng = new Random(seed);
+
+            // Build the polyline by sampling 14 segments between tailT
+            // and headT. Each interior vertex is offset perpendicular to
+            // the edge direction by a noisy amount.
+            const int segs = 14;
+            // Pre-compute an arbitrary perpendicular basis once per arc.
+            var dir = new Vector3D(dx, dy, dz);
+            dir.Normalize();
+            var up = Math.Abs(dir.Y) > 0.95 ? new Vector3D(1, 0, 0) : new Vector3D(0, 1, 0);
+            var perpA = Vector3D.CrossProduct(dir, up); perpA.Normalize();
+            var perpB = Vector3D.CrossProduct(dir, perpA); perpB.Normalize();
+
+            if (!tintMeshes.TryGetValue(arc.Tint, out var mesh))
+                tintMeshes[arc.Tint] = mesh = new MeshGeometry3D();
+
+            // Width pulses with brightness so the bolt visually thickens
+            // while it's "live" and thins out as it fades.
+            var width = 0.025 * (0.5 + 0.5 * brightness);
+
+            Point3D Sample(double u)
+            {
+                var px = src.X + dx * u;
+                var py = src.Y + dy * u;
+                var pz = src.Z + dz * u;
+                if (u <= 0.001 || u >= 0.999) return new Point3D(px, py, pz);
+                var ja = (rng.NextDouble() - 0.5) * 2.0 * jitter;
+                var jb = (rng.NextDouble() - 0.5) * 2.0 * jitter;
+                return new Point3D(
+                    px + perpA.X * ja + perpB.X * jb,
+                    py + perpA.Y * ja + perpB.Y * jb,
+                    pz + perpA.Z * ja + perpB.Z * jb);
+            }
+
+            var prev = Sample(tailT);
+            for (int s = 1; s <= segs; s++)
+            {
+                var u = tailT + (headT - tailT) * (s / (double)segs);
+                var cur = Sample(u);
+                AppendLineToMesh(mesh, prev, cur, width);
+                prev = cur;
+            }
+
+            // Bright glowing head — sits at the leading tip of the bolt,
+            // size pulses with brightness. White-hot regardless of tint
+            // so the eye locks onto where the current is right now.
+            var head = Sample(headT);
+            AppendSphereToMesh(headMesh, head, 0.07 * (0.6 + 0.4 * brightness),
+                SharedSphereLOD);
+            headTint = arc.Tint;
+        }
+
+        foreach (var (tint, mesh) in tintMeshes)
+        {
+            if (mesh.Positions.Count == 0) continue;
+            var emissive = new EmissiveMaterial(new SolidColorBrush(
+                Color.FromArgb(235, tint.R, tint.G, tint.B)));
+            group.Children.Add(new GeometryModel3D(mesh, emissive));
+        }
+        if (headMesh.Positions.Count > 0)
+        {
+            // White-hot tinted core
+            var hot = Color.FromArgb(255,
+                (byte)Math.Min(255, headTint.R + 120),
+                (byte)Math.Min(255, headTint.G + 120),
+                (byte)Math.Min(255, headTint.B + 120));
+            group.Children.Add(new GeometryModel3D(headMesh,
+                new EmissiveMaterial(new SolidColorBrush(hot))));
+        }
     }
 
     /// <summary>
@@ -1930,6 +2270,24 @@ public partial class MainWindow : Window
         // 30% margin so the outermost nodes have breathing room.
         var dist = radius / Math.Tan(22.5 * Math.PI / 180.0) * 1.3;
         _camDist = Math.Clamp(dist, 3, 30);
+    }
+
+    /// <summary>
+    /// Same as <see cref="FitDashCamera"/> but for the Brain Graph view.
+    /// Frames the entire graph cloud in <see cref="GraphCam"/> so the
+    /// user starts looking at the whole brain instead of a corner of it.
+    /// </summary>
+    private void FitGraphCamera()
+    {
+        if (_graphPhysics == null || _graphPhysics.Nodes.Count == 0) return;
+        var b = ComputeBounds(_graphPhysics);
+        if (b.radius < 0.5) return;
+        _graphTarget = b.center;
+        // Slightly looser margin than the dashboard fit (ratio 2.5 vs the
+        // dashboard's tan-based formula) — the Brain Graph is the "deep
+        // view" and benefits from a touch more breathing room before the
+        // user starts diving in.
+        _graphDist = Math.Clamp(b.radius * 2.5, 6, 120);
     }
 
     private void Viewport_RightClick(object s, MouseButtonEventArgs e)
@@ -2847,28 +3205,78 @@ public partial class MainWindow : Window
         BrainTitleLabel.Text = $"({_identity.DisplayName} · {shortAddr})";
     }
 
+    // ── Versioning ─────────────────────────────────────────────────
+    // Build pipeline (see .github/workflows/build-and-release.yml):
+    //   push to main → workflow stamps BUILD_VERSION = "2.0.<commitCount>"
+    //                  and BUILD_COMMIT = short sha
+    //   csproj reads them into <Version> + <InformationalVersion>
+    //   we read those back at runtime → About card + bottom bar always
+    //   match the GitHub tag that produced the binary.
+    // Local builds with no env vars get "2.0.0-dev+local" so dev work
+    // doesn't accidentally claim it's a release.
+    private const string GitHubRepo = "xjanova/ObsidianX";
+    private const string GitHubLatestUrl = "https://api.github.com/repos/" + GitHubRepo + "/releases/latest";
+    private string? _latestRemoteVersion;          // e.g. "2.0.137" — null until first poll succeeds
+
     /// <summary>
-    /// Pulls the version straight from the assembly metadata set by the
-    /// csproj &lt;Version&gt; element, so About always matches whatever was
-    /// just built. Removes the old hardcoded "v2.0.0" that went stale.
+    /// Read the SemVer string the build pipeline stamped into
+    /// AssemblyInformationalVersion. Falls back to AssemblyVersion if the
+    /// informational attribute is missing (shouldn't happen for shipped
+    /// builds — only matters when something runs the dll without the
+    /// csproj-set metadata).
+    /// </summary>
+    private (string display, string compareKey) GetLocalVersion()
+    {
+        var asm = System.Reflection.Assembly.GetEntryAssembly()
+               ?? System.Reflection.Assembly.GetExecutingAssembly();
+        var informational = asm
+            .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+            .OfType<System.Reflection.AssemblyInformationalVersionAttribute>()
+            .FirstOrDefault()?.InformationalVersion;
+        var ver = asm.GetName().Version;
+        var display = !string.IsNullOrWhiteSpace(informational)
+            ? informational!
+            : (ver != null ? $"{ver.Major}.{ver.Minor}.{ver.Build}" : "dev");
+        // The compareKey is the bare "2.0.137" — strip "+sha" build metadata
+        // and any "-dev" suffix so the remote/local comparison works on the
+        // numeric SemVer alone.
+        var key = display;
+        var plus = key.IndexOf('+'); if (plus >= 0) key = key[..plus];
+        var dash = key.IndexOf('-'); if (dash >= 0) key = key[..dash];
+        return (display, key);
+    }
+
+    /// <summary>
+    /// Update both the About card and the bottom-bar version label so they
+    /// can never drift apart. Called on startup and again after the
+    /// GitHub-latest poll finishes.
     /// </summary>
     private void UpdateAboutCard()
     {
         try
         {
+            var (display, key) = GetLocalVersion();
             var asm = System.Reflection.Assembly.GetEntryAssembly()
                    ?? System.Reflection.Assembly.GetExecutingAssembly();
-            var informational = asm
-                .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
-                .OfType<System.Reflection.AssemblyInformationalVersionAttribute>()
-                .FirstOrDefault()?.InformationalVersion;
             var ver = asm.GetName().Version;
-            var display = !string.IsNullOrWhiteSpace(informational)
-                ? informational
-                : ver != null ? $"{ver.Major}.{ver.Minor}.{ver.Build}" : "dev";
 
+            // The headline matches the bottom bar — bare "v2.0.40" — so
+            // the user can scan the two places and confirm they're the
+            // same build at a glance. Full informational string moves to
+            // the smaller mono-font line below. If a GitHub release poll
+            // has reported a newer tag, append the same "↑v2.0.45" arrow
+            // the bottom bar shows.
             if (AboutVersionText != null)
-                AboutVersionText.Text = $"ObsidianX — Neural Knowledge Network v{display}";
+            {
+                var head = $"ObsidianX — Neural Knowledge Network v{key}";
+                if (!string.IsNullOrEmpty(_latestRemoteVersion))
+                {
+                    var cmp = CompareSemVerTriples(key, _latestRemoteVersion!);
+                    if (cmp < 0) head += $"  ↑v{_latestRemoteVersion}";
+                    else if (cmp == 0) head += "  · latest";
+                }
+                AboutVersionText.Text = head;
+            }
 
             if (AboutBuildText != null)
             {
@@ -2880,13 +3288,118 @@ public partial class MainWindow : Window
                         build = File.GetLastWriteTime(loc).ToString("yyyy-MM-dd HH:mm");
                 }
                 catch { }
+                // Detail line carries the full informational string
+                // (e.g. "2.0.40-dev+7607ba0-dirty") so the dev-mode +
+                // commit + dirty tags stay accessible without cluttering
+                // the headline.
+                var detail = $"v{display} · assembly {ver}";
                 AboutBuildText.Text = string.IsNullOrEmpty(build)
-                    ? $"assembly {ver}"
-                    : $"built {build} · assembly {ver}";
+                    ? detail
+                    : $"{detail} · built {build}";
             }
+
+            UpdateBottomBarVersion();
         }
         catch { /* fall back silently to XAML default */ }
     }
+
+    private void UpdateBottomBarVersion()
+    {
+        if (VersionText == null) return;
+        var (display, localKey) = GetLocalVersion();
+
+        // Bottom bar shows the bare SemVer only (e.g. "v2.0.40") so it fits
+        // alongside the other status chips. An "↑" arrow with the new
+        // SemVer is appended only when an update is available — matches
+        // the visual weight of "DT ?" / "Srv ?" in the same row.
+        string label = $"v{localKey}";
+        string tip = $"ObsidianX v{display}";
+        if (!string.IsNullOrEmpty(_latestRemoteVersion))
+        {
+            var cmp = CompareSemVerTriples(localKey, _latestRemoteVersion!);
+            if (cmp < 0)
+            {
+                label += $" ↑v{_latestRemoteVersion}";
+                tip += $"\nUpdate available: v{_latestRemoteVersion}";
+            }
+            else if (cmp == 0)
+            {
+                tip += "\nLatest release on GitHub";
+            }
+            else
+            {
+                tip += $"\nLatest release: v{_latestRemoteVersion}";
+            }
+        }
+        VersionText.Text = label;
+        VersionText.ToolTip = tip;
+    }
+
+    /// <summary>
+    /// Compare two "x.y.z" version strings. Returns -1/0/1 like a comparer.
+    /// Non-numeric or shorter inputs are treated as zero on missing parts —
+    /// good enough for our 3-part SemVer scheme; anything richer can swap
+    /// to System.Version.Parse later.
+    /// </summary>
+    private static int CompareSemVerTriples(string a, string b)
+    {
+        var aParts = a.Split('.');
+        var bParts = b.Split('.');
+        for (int i = 0; i < 3; i++)
+        {
+            int.TryParse(i < aParts.Length ? aParts[i] : "0", out var av);
+            int.TryParse(i < bParts.Length ? bParts[i] : "0", out var bv);
+            if (av != bv) return av < bv ? -1 : 1;
+        }
+        return 0;
+    }
+
+    /// <summary>
+    /// Hit the GitHub releases API in the background and refresh the
+    /// version label if a newer release exists. Best-effort: rate limits,
+    /// no network, private repo — all silently swallowed because this is
+    /// a UX nicety, not a load-bearing call.
+    /// </summary>
+    private async System.Threading.Tasks.Task CheckLatestReleaseAsync()
+    {
+        try
+        {
+            using var http = new System.Net.Http.HttpClient
+            {
+                Timeout = TimeSpan.FromSeconds(6)
+            };
+            // GitHub requires a User-Agent on all API requests; without it
+            // they return 403. Use the product name + local version so
+            // their telemetry can spot real clients vs scrapers.
+            var (display, _) = GetLocalVersion();
+            http.DefaultRequestHeaders.UserAgent.ParseAdd($"ObsidianX/{display} (+https://github.com/{GitHubRepo})");
+            http.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
+
+            var json = await http.GetStringAsync(GitHubLatestUrl).ConfigureAwait(false);
+            // Tiny ad-hoc parse — pulling tag_name and html_url. Avoids
+            // taking a dependency on Octokit just for two strings.
+            var obj = Newtonsoft.Json.Linq.JObject.Parse(json);
+            var tag = obj["tag_name"]?.ToString();      // e.g. "v2.0.137"
+            if (string.IsNullOrWhiteSpace(tag)) return;
+
+            var clean = tag.StartsWith("v", StringComparison.OrdinalIgnoreCase) ? tag[1..] : tag;
+            await Dispatcher.InvokeAsync(() =>
+            {
+                _latestRemoteVersion = clean;
+                // Refresh BOTH labels — bottom bar and About card — so
+                // they stay in lock-step. The user explicitly checks
+                // both spots to confirm "is this really the version I
+                // think I'm running".
+                UpdateAboutCard();
+            });
+        }
+        catch
+        {
+            // Offline, rate-limited, repo private, json shape changed —
+            // any of these just leave the version label as-is.
+        }
+    }
+
 
     private void IndexVault()
     {
@@ -2938,6 +3451,27 @@ public partial class MainWindow : Window
         var wikiEdges = _graph.Edges.Count(e => e.RelationType == "wiki-link");
         var autoEdges = _graph.Edges.Count - wikiEdges;
         StatusText.Text = $"Indexed {_graph.TotalNodes} nodes · {wikiEdges} wiki · {autoEdges} auto-links · storage: {_storage?.ProviderName ?? "File"}{exportMsg}";
+
+        // Background-precompute embeddings for any new/changed notes so
+        // the MCP semantic-search tools have vectors to rank against.
+        // Fire-and-forget: doesn't block indexing, gracefully no-ops
+        // when Ollama or the model isn't available, and writes sidecar
+        // .bin files into .obsidianx/embeddings/.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var written = await _embeddings.PrecomputeMissingAsync(_vaultPath, _graph);
+                if (written > 0)
+                {
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        StatusText.Text += $" · {written} new embeddings";
+                    });
+                }
+            }
+            catch (Exception ex) { Debug.WriteLine($"Embedding precompute failed: {ex.Message}"); }
+        });
     }
 
     private void CheckClaudeConnection()
@@ -2979,7 +3513,18 @@ public partial class MainWindow : Window
 
     private void BuildExpertiseBars()
     {
-        ExpertisePanel.Children.Clear();
+        // Build the bars once into a fresh list, then clone the visual
+        // tree into both host panels — Dashboard map AND Brain Graph
+        // overlay. Cheaper than building twice and guarantees the two
+        // surfaces stay perfectly in sync.
+        BuildExpertiseBarsInto(ExpertisePanel);
+        if (GraphExpertisePanel != null)
+            BuildExpertiseBarsInto(GraphExpertisePanel);
+    }
+
+    private void BuildExpertiseBarsInto(StackPanel host)
+    {
+        host.Children.Clear();
         Color[] barColors =
         [
             Color.FromRgb(0, 240, 255), Color.FromRgb(139, 92, 246),
@@ -3030,12 +3575,12 @@ public partial class MainWindow : Window
                 Foreground = (SolidColorBrush)FindResource("TextMutedBrush"),
                 Margin = new Thickness(0, 2, 0, 0)
             });
-            ExpertisePanel.Children.Add(panel);
+            host.Children.Add(panel);
         }
 
         if (_graph.ExpertiseMap.Count == 0)
         {
-            ExpertisePanel.Children.Add(new TextBlock
+            host.Children.Add(new TextBlock
             {
                 Text = "No notes indexed yet.\nAdd .md files to your vault.",
                 FontSize = 12,
@@ -3044,6 +3589,151 @@ public partial class MainWindow : Window
                 TextWrapping = TextWrapping.Wrap
             });
         }
+    }
+
+    /// <summary>
+    /// Toggle the Brain Graph's expertise overlay. Off by default so the
+    /// graph has full width; user opens it when they want the bird's-eye
+    /// view of the brain's category strengths without leaving the graph.
+    /// </summary>
+    private void GraphExpertiseToggle_Click(object sender, RoutedEventArgs e)
+    {
+        if (GraphExpertiseHost == null) return;
+        var nowVisible = GraphExpertiseHost.Visibility != Visibility.Visible;
+        GraphExpertiseHost.Visibility = nowVisible ? Visibility.Visible : Visibility.Collapsed;
+        if (GraphExpertiseToggleBtn != null)
+            GraphExpertiseToggleBtn.Style = (Style)FindResource(
+                nowVisible ? "NeonButtonFilled" : "NeonButton");
+    }
+
+    // ── Token-savings gauge + brain bypass ──
+
+    /// <summary>
+    /// Refresh the token-savings chip from <c>access-log.ndjson</c>.
+    /// Runs every 5 s on a dispatcher timer so the user sees a live
+    /// counter that ticks up as they (or Claude) make brain calls.
+    /// </summary>
+    private void RefreshTokenSavings()
+    {
+        if (TokenSavingsText == null || TokenSavingsChip == null) return;
+        try
+        {
+            var stats = _tokenSavings.Compute(_vaultPath);
+            // Format as "+12.3k" or "+456" depending on size, with the
+            // up-arrow when net positive (most of the time) or "(-)"
+            // when net negative (a fresh brain that's been called a lot
+            // but hasn't replaced any external work yet).
+            var net = stats.NetSaved;
+            var sign = net >= 0 ? "+" : "";
+            var formatted = Math.Abs(net) >= 1000
+                ? $"{sign}{net / 1000.0:F1}k"
+                : $"{sign}{net}";
+
+            var mode = ReadBrainMode();
+            // Chip prefix carries the mode at a glance:
+            //   💰 = always (full coverage, max savings potential)
+            //   🤖 = auto   (skips short prompts to dodge wasted reminders)
+            //   🚫 = off    (no hooks fire — pure manual operation)
+            var prefix = mode switch
+            {
+                "off"  => "🚫",
+                "auto" => "🤖",
+                _      => "💰"
+            };
+            TokenSavingsText.Text = $"{prefix} {formatted} tok";
+            TokenSavingsChip.ToolTip =
+                $"Brain net savings: {net:N0} tokens\n" +
+                $"Calls: {stats.TotalCalls} ({stats.GrossSaved:N0} avoided − {stats.GrossSpent:N0} spent)\n" +
+                $"Mode: {mode.ToUpperInvariant()} — click to cycle Always → Auto → Off\n" +
+                "\nBreakdown by op:\n" +
+                string.Join("\n", stats.CallsByOp.OrderByDescending(kv => kv.Value)
+                    .Take(8).Select(kv => $"  {kv.Key}: {kv.Value}"));
+
+            // Tint matches the chip prefix so the user reads the mode
+            // without having to expand the tooltip:
+            //   green  = always (everything tracked + reminded)
+            //   cyan   = auto   (smart middle path)
+            //   amber  = off    (paused; shown so the user remembers)
+            (Color bgEnd, Color borderEnd, Color fg) = mode switch
+            {
+                "off"  => (Color.FromRgb(0xFF, 0xC0, 0x40),
+                           Color.FromRgb(0xFF, 0xC0, 0x40),
+                           Color.FromRgb(0xFF, 0xC0, 0x40)),
+                "auto" => (Color.FromRgb(0x40, 0xC0, 0xFF),
+                           Color.FromRgb(0x40, 0xC0, 0xFF),
+                           Color.FromRgb(0x80, 0xD0, 0xFF)),
+                _      => (Color.FromRgb(0x00, 0xFF, 0x88),
+                           Color.FromRgb(0x00, 0xFF, 0x88),
+                           Color.FromRgb(0x5D, 0xFF, 0x9D))
+            };
+            TokenSavingsChip.Background = new SolidColorBrush(
+                Color.FromArgb(0x1A, bgEnd.R, bgEnd.G, bgEnd.B));
+            TokenSavingsChip.BorderBrush = new SolidColorBrush(
+                Color.FromArgb(0x55, borderEnd.R, borderEnd.G, borderEnd.B));
+            TokenSavingsText.Foreground = new SolidColorBrush(fg);
+
+            // Sync button label + style with the mode so the toolbar
+            // is one consistent display.
+            if (BrainBypassBtn != null)
+            {
+                BrainBypassBtn.Content = mode switch
+                {
+                    "off"  => "🚫 Off",
+                    "auto" => "🤖 Auto",
+                    _      => "🧠 Always"
+                };
+                // Always-on uses the filled style (active state),
+                // Auto and Off use the outlined style so "always" reads
+                // visually as the strong default.
+                BrainBypassBtn.Style = (Style)FindResource(
+                    mode == "always" ? "NeonButtonFilled" : "NeonButton");
+            }
+        }
+        catch { /* widget is best-effort, never crash the UI */ }
+    }
+
+    private void StartTokenSavingsTimer()
+    {
+        if (_tokenSavingsTimer != null) return;
+        _tokenSavingsTimer = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(5)
+        };
+        _tokenSavingsTimer.Tick += (_, _) => RefreshTokenSavings();
+        _tokenSavingsTimer.Start();
+        // Run once immediately so the chip isn't blank on first frame.
+        RefreshTokenSavings();
+    }
+
+    private void TokenSavingsChip_Click(object sender, MouseButtonEventArgs e)
+        => CycleBrainMode();
+
+    private void BrainBypass_Click(object sender, RoutedEventArgs e)
+        => CycleBrainMode();
+
+    /// <summary>
+    /// Cycle the brain-mode through always → auto → off → always.
+    /// Each click writes the new state to <c>brain-mode.txt</c>; the
+    /// PowerShell hooks read it on the next prompt and decide whether
+    /// to inject the brain-first reminder.
+    /// </summary>
+    private void CycleBrainMode()
+    {
+        var current = ReadBrainMode();
+        var next = current switch
+        {
+            "always" => "auto",
+            "auto"   => "off",
+            _        => "always"
+        };
+        WriteBrainMode(next);
+        StatusText.Text = next switch
+        {
+            "always" => "🧠 Brain-first ALWAYS — every prompt gets a brain-search reminder; max coverage for deep work",
+            "auto"   => "🤖 Brain-first AUTO — skip reminder when prompt < 60 chars; smart default",
+            _        => "🚫 Brain-first OFF — no reminders. Use for trivial chat / pure greenfield."
+        };
+        RefreshTokenSavings();
     }
 
     // ═══════════════════════════════════════
@@ -3069,6 +3759,7 @@ public partial class MainWindow : Window
 
         // Special rendering for specific views
         if (tag == "Growth") RenderGrowthChart();
+        if (tag == "Tokens") RenderTokenEconomyChart();
         if (tag == "Peers") RefreshPeersList();
         if (tag == "Editor") RefreshBacklinks();
         if (tag == "Search") SearchBox.Focus();
@@ -4640,6 +5331,205 @@ public partial class MainWindow : Window
     // brain learned about Topic X". Top expertise categories each get
     // their own line; a thicker total line sits behind for context.
     private bool _growthChartHooked = false;
+
+    // ── Token Economy chart ──
+    private bool _tokenChartHooked;
+
+    private void RenderTokenEconomyChart()
+    {
+        if (TokensCanvas == null) return;
+        if (!_tokenChartHooked)
+        {
+            _tokenChartHooked = true;
+            TokensCanvas.SizeChanged += (_, _) => DrawTokenEconomyCore();
+        }
+        Dispatcher.BeginInvoke(new Action(DrawTokenEconomyCore),
+            System.Windows.Threading.DispatcherPriority.Render);
+    }
+
+    private void DrawTokenEconomyCore()
+    {
+        try
+        {
+            TokensCanvas.Children.Clear();
+            var series = _tokenUsage.Compute(_vaultPath, hoursBack: 24 * 14);
+
+            // Top-line stat cards
+            TokensActualText.Text     = $"{series.TotalActual:N0}";
+            TokensProjectionText.Text = $"{series.TotalProjection:N0}";
+            TokensSavedText.Text      = $"{series.TotalSaved:N0}";
+            TokensSavedPctText.Text   = series.TotalProjection == 0
+                ? "no data yet"
+                : $"{series.SavingsPercent:F0}% of projection";
+            int brainCalls = series.Buckets.Sum(b => b.BrainCalls);
+            int otherCalls = series.Buckets.Sum(b => b.OtherToolCalls);
+            TokensCallsText.Text = $"{brainCalls} / {otherCalls}";
+
+            if (series.Buckets.Count < 2)
+            {
+                TokensCanvas.Children.Add(new TextBlock
+                {
+                    Text = "Use Claude through this brain for a while — the chart fills as MCP and tool calls accumulate.",
+                    FontSize = 13,
+                    Foreground = (SolidColorBrush)FindResource("TextMutedBrush"),
+                    FontStyle = FontStyles.Italic,
+                    Margin = new Thickness(16),
+                    TextWrapping = TextWrapping.Wrap,
+                    MaxWidth = 600,
+                });
+                return;
+            }
+
+            var w = TokensCanvas.ActualWidth;
+            var h = TokensCanvas.ActualHeight;
+            if (w < 100 || h < 100) { w = 800; h = 360; }
+
+            const double padL = 64, padR = 16, padT = 16, padB = 36;
+            var chartW = w - padL - padR;
+            var chartH = h - padT - padB;
+            if (chartW < 40 || chartH < 40) return;
+
+            var first = series.Buckets[0].Hour;
+            var last = series.Buckets[^1].Hour;
+            var span = (last - first).TotalHours;
+            if (span <= 0) span = 1;
+
+            // Cumulative both lines so the gap is the eye-grabbing
+            // "saved" area. Per-bucket would be jaggier and harder to
+            // read at a glance.
+            var actualPts = new List<Point>();
+            var projPts = new List<Point>();
+            long actualSum = 0, projSum = 0;
+            foreach (var b in series.Buckets)
+            {
+                actualSum += b.ActualSpent;
+                projSum += b.ProjectionWithoutBrain;
+                var t = (b.Hour - first).TotalHours / span;
+                actualPts.Add(new Point(padL + chartW * t, 0));
+                projPts.Add(new Point(padL + chartW * t, 0));
+            }
+            long maxY = Math.Max(projSum, 1);
+
+            // Y axis grid + labels
+            var muted = (SolidColorBrush)FindResource("TextMutedBrush");
+            var grid = (SolidColorBrush)FindResource("SurfaceLightBrush");
+            for (int i = 0; i <= 4; i++)
+            {
+                var y = padT + chartH * (1 - i / 4.0);
+                var line = new System.Windows.Shapes.Line
+                {
+                    X1 = padL, X2 = w - padR, Y1 = y, Y2 = y,
+                    Stroke = grid, StrokeThickness = 0.5, Opacity = 0.35
+                };
+                TokensCanvas.Children.Add(line);
+                var label = new TextBlock
+                {
+                    Text = FormatTokens((long)(maxY * i / 4.0)),
+                    FontSize = 9, Foreground = muted,
+                    FontFamily = (FontFamily)FindResource("MonoFont")
+                };
+                Canvas.SetLeft(label, 6);
+                Canvas.SetTop(label, y - 7);
+                TokensCanvas.Children.Add(label);
+            }
+
+            // Plot cumulative — recompute Y now that we know maxY
+            actualSum = 0; projSum = 0;
+            for (int i = 0; i < series.Buckets.Count; i++)
+            {
+                var b = series.Buckets[i];
+                actualSum += b.ActualSpent;
+                projSum += b.ProjectionWithoutBrain;
+                var ty = (double)actualSum / maxY;
+                var py = (double)projSum / maxY;
+                actualPts[i] = new Point(actualPts[i].X, padT + chartH * (1 - ty));
+                projPts[i] = new Point(projPts[i].X, padT + chartH * (1 - py));
+            }
+
+            // Shaded "savings" band — fill the gap between projection
+            // and actual so the eye reads the difference instantly.
+            var fill = new System.Windows.Shapes.Polygon
+            {
+                Fill = new SolidColorBrush(Color.FromArgb(0x22, 0x5D, 0xFF, 0x9D)),
+                Stroke = null
+            };
+            var fillPts = new System.Windows.Media.PointCollection();
+            foreach (var p in projPts) fillPts.Add(p);
+            for (int i = actualPts.Count - 1; i >= 0; i--) fillPts.Add(actualPts[i]);
+            fill.Points = fillPts;
+            TokensCanvas.Children.Add(fill);
+
+            // Projection line — pink dashed
+            var projLine = new System.Windows.Shapes.Polyline
+            {
+                Stroke = new SolidColorBrush(Color.FromRgb(0xFF, 0x6B, 0x9D)),
+                StrokeThickness = 2,
+                StrokeDashArray = new DoubleCollection { 4, 3 }
+            };
+            foreach (var p in projPts) projLine.Points.Add(p);
+            TokensCanvas.Children.Add(projLine);
+
+            // Actual line — green solid
+            var actualLine = new System.Windows.Shapes.Polyline
+            {
+                Stroke = new SolidColorBrush(Color.FromRgb(0x5D, 0xFF, 0x9D)),
+                StrokeThickness = 2.5
+            };
+            foreach (var p in actualPts) actualLine.Points.Add(p);
+            TokensCanvas.Children.Add(actualLine);
+
+            // Mode markers — small dot per bucket coloured by dominant
+            // mode that hour. Lets the user see "the gap is bigger when
+            // brain mode was always-on, smaller when it was off".
+            for (int i = 0; i < series.Buckets.Count; i++)
+            {
+                var b = series.Buckets[i];
+                Color dot = b.DominantMode switch
+                {
+                    "always" => Color.FromRgb(0x5D, 0xFF, 0x9D),
+                    "auto"   => Color.FromRgb(0x40, 0xC0, 0xFF),
+                    "off"    => Color.FromRgb(0xFF, 0xC0, 0x40),
+                    _        => Color.FromRgb(0x88, 0x88, 0xAA)
+                };
+                var ell = new System.Windows.Shapes.Ellipse
+                {
+                    Width = 5, Height = 5,
+                    Fill = new SolidColorBrush(dot)
+                };
+                Canvas.SetLeft(ell, actualPts[i].X - 2.5);
+                Canvas.SetTop(ell, actualPts[i].Y - 2.5);
+                TokensCanvas.Children.Add(ell);
+            }
+
+            // X axis date labels — sparse so they don't crowd
+            int labelCount = Math.Min(6, series.Buckets.Count);
+            for (int i = 0; i < labelCount; i++)
+            {
+                var idx = (int)((series.Buckets.Count - 1) * (i / (double)Math.Max(1, labelCount - 1)));
+                var b = series.Buckets[idx];
+                var t = (b.Hour - first).TotalHours / span;
+                var x = padL + chartW * t;
+                var label = new TextBlock
+                {
+                    Text = b.Hour.ToLocalTime().ToString("MMM d HH:mm"),
+                    FontSize = 9, Foreground = muted,
+                    FontFamily = (FontFamily)FindResource("MonoFont")
+                };
+                Canvas.SetLeft(label, x - 28);
+                Canvas.SetTop(label, h - 24);
+                TokensCanvas.Children.Add(label);
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Token chart render failed: {ex}");
+        }
+    }
+
+    private static string FormatTokens(long n) =>
+        n >= 1_000_000 ? $"{n / 1_000_000.0:F1}M" :
+        n >= 1_000     ? $"{n / 1_000.0:F1}k" :
+        n.ToString("N0");
 
     private void RenderGrowthChart()
     {
@@ -6303,7 +7193,7 @@ public partial class MainWindow : Window
         catch (Newtonsoft.Json.JsonException) { }
     }
 
-    private static void FindAndBumpByTitleOrPath(PhysicsEngine physics, string hint, string op = "mcp")
+    private void FindAndBumpByTitleOrPath(PhysicsEngine physics, string hint, string op = "mcp")
     {
         foreach (var n in physics.Nodes)
         {
@@ -6313,6 +7203,7 @@ public partial class MainWindow : Window
                 n.AccessCount++;
                 n.LastAccessedAt = DateTime.UtcNow;
                 n.LastOp = op;
+                SpawnArcsFromNode(physics, n.Id, op);
                 return;
             }
         }
@@ -6336,7 +7227,7 @@ public partial class MainWindow : Window
         catch { /* best-effort */ }
     }
 
-    private static bool BumpPulseForNode(PhysicsEngine physics, string nodeId, string op = "mcp")
+    private bool BumpPulseForNode(PhysicsEngine physics, string nodeId, string op = "mcp")
     {
         var node = physics.Nodes.FirstOrDefault(n => n.Id == nodeId);
         if (node == null) return false;
@@ -6344,19 +7235,140 @@ public partial class MainWindow : Window
         node.AccessCount++;
         node.LastAccessedAt = DateTime.UtcNow;
         node.LastOp = op;
+        SpawnArcsFromNode(physics, node.Id, op);
         return true;
+    }
+
+    /// <summary>
+    /// Fire an electric bolt down every edge incident to <paramref name="nodeId"/>.
+    /// Cyan for MCP reads, magenta for writes — gives the user a live read
+    /// of "where the current is flowing right now". Arcs auto-expire after
+    /// <see cref="ArcLifetimeSec"/> so old activity doesn't pile up.
+    /// Capped at 12 outgoing arcs per touch so a hub node doesn't spam the
+    /// scene; we pick the strongest-link neighbours first.
+    /// </summary>
+    private void SpawnArcsFromNode(PhysicsEngine physics, string nodeId, string op)
+    {
+        if (physics.Edges.Count == 0) return;
+        var tint = op.Contains("write", StringComparison.OrdinalIgnoreCase)
+                   || op.Contains("edit",  StringComparison.OrdinalIgnoreCase)
+                   || op.Contains("save",  StringComparison.OrdinalIgnoreCase)
+            ? _themeSecondary
+            : _themeAccent;
+        var now = DateTime.UtcNow;
+
+        // Drop expired arcs lazily here so the list never balloons.
+        if (_arcs.Count > 256)
+            _arcs.RemoveAll(a => (now - a.StartedAt).TotalSeconds > ArcLifetimeSec);
+
+        int spawned = 0;
+        foreach (var e in physics.Edges)
+        {
+            if (spawned >= 12) break;
+            string? otherId =
+                e.SourceId == nodeId ? e.TargetId :
+                e.TargetId == nodeId ? e.SourceId : null;
+            if (otherId == null) continue;
+
+            _arcs.Add(new ElectricArc
+            {
+                Physics = physics,
+                SrcId = nodeId,
+                TgtId = otherId,
+                StartedAt = now,
+                Tint = tint
+            });
+            spawned++;
+        }
+    }
+
+    /// <summary>
+    /// Two-stage pulse decay so users actually have time to see what happened:
+    ///   stage 1 — first 2.0 s after a hit: HOLD intensity at ≥ 0.55 (above the
+    ///             "hot" threshold of 0.4) so the bright yellow core stays
+    ///             visible long enough for the eye to lock on
+    ///   stage 2 — after that: exponential decay with 3.5 s half-life so the
+    ///             trail lingers but doesn't hang around forever
+    /// Half-life alone (2.5 s) gave a sub-1 s window above the hot threshold,
+    /// which is why MCP pulses felt like flicker.
+    /// </summary>
+    private const double PulseHoldSeconds = 2.0;
+    private const double PulseHoldFloor = 0.55;
+    /// <summary>
+    /// Decide whether the 2D view needs a repaint this frame. Returns true
+    /// if the graph still has kinetic energy, any node is in a lifecycle
+    /// animation, any pulse is decaying, OR there's at least one live arc.
+    /// On an idle graph this collapses 60 redraws/s into ~0, which is the
+    /// difference between "smooth" and "stutter" on weaker hardware.
+    /// User pan/zoom forces a redraw via <see cref="Mark2DDirty"/>.
+    /// </summary>
+    private const double IdleEnergyThreshold = 0.05;
+    private bool _force2DRedraw = true;
+    private void Mark2DDirty() => _force2DRedraw = true;
+
+    private bool Needs2DRedraw(PhysicsEngine physics,
+        List<(string srcId, string tgtId, double t, Color tint)> arcs)
+    {
+        if (_force2DRedraw) { _force2DRedraw = false; return true; }
+        if (arcs.Count > 0) return true;
+        if (physics.TotalEnergy > IdleEnergyThreshold) return true;
+        // Lifecycle / pulse animations all imply per-frame visual change.
+        foreach (var n in physics.Nodes)
+        {
+            if (n.AccessIntensity > 0.001) return true;
+            if (n.BirthProgress < 1.0 || n.DeathProgress < 1.0) return true;
+        }
+        foreach (var e in physics.Edges)
+        {
+            if (e.FormProgress < 1.0 || e.DeathProgress < 1.0) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Project the live arc list down to the (srcId, tgtId, t, tint) tuples
+    /// that <see cref="Services.Graph2DRenderer"/> consumes, filtered to the
+    /// physics engine the 2D view is bound to. Allocated fresh each frame —
+    /// the list is small (typically &lt; 30 entries during a burst) and the
+    /// cost is well under DrawingContext geometry batching.
+    /// </summary>
+    private List<(string srcId, string tgtId, double t, Color tint)>
+        BuildArcSnapshot(PhysicsEngine physics)
+    {
+        var now = DateTime.UtcNow;
+        var snap = new List<(string, string, double, Color)>(_arcs.Count);
+        foreach (var a in _arcs)
+        {
+            // The two physics engines (dash + graph) carry different node
+            // sets. We use the IDs to look up nodes inside the renderer,
+            // so cross-engine arcs would silently drop at the lookup
+            // step anyway — explicit early-skip just keeps the snapshot
+            // honest. (Earlier we saw _arcs populated but snapshot empty,
+            // which was a click-handler hit-detection bug, not this filter.)
+            if (a.Physics != physics) continue;
+            var t = (now - a.StartedAt).TotalSeconds / ArcLifetimeSec;
+            if (t < 0 || t >= 1.0) continue;
+            snap.Add((a.SrcId, a.TgtId, t, a.Tint));
+        }
+        return snap;
     }
 
     private static void DecayPulses(PhysicsEngine physics, double dt)
     {
-        // Exponential decay with ~2.5s half-life
-        var factor = Math.Pow(0.5, dt / 2.5);
+        var factor = Math.Pow(0.5, dt / 3.5);
+        var now = DateTime.UtcNow;
         foreach (var n in physics.Nodes)
         {
-            if (n.AccessIntensity > 0.001)
-                n.AccessIntensity *= factor;
+            if (n.AccessIntensity <= 0.001) { n.AccessIntensity = 0; continue; }
+            var ageSec = (now - n.LastAccessedAt).TotalSeconds;
+            if (ageSec < PulseHoldSeconds)
+            {
+                if (n.AccessIntensity < PulseHoldFloor) n.AccessIntensity = PulseHoldFloor;
+            }
             else
-                n.AccessIntensity = 0;
+            {
+                n.AccessIntensity *= factor;
+            }
         }
     }
 

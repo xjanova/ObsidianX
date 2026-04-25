@@ -289,6 +289,8 @@
 
                                     <Button x:Name="NavGrowth" Content="&#x1F4C8;  Growth"
                                             Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Growth"/>
+                                    <Button x:Name="NavTokens" Content="&#x1F4B0;  Tokens"
+                                            Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Tokens"/>
 
                                     <TextBlock Text="NETWORK" FontSize="10" Foreground="{StaticResource TextMutedBrush}"
                                                Margin="22,24,0,12" FontWeight="SemiBold"/>
@@ -653,12 +655,15 @@
                                                         <Setter Property="Padding" Value="8,4"/>
                                                     </Style>
                                                 </ComboBox.ItemContainerStyle>
-                                                <ComboBoxItem Content="Free (drag)" IsSelected="True"/>
+                                                <ComboBoxItem Content="Free (drag)"/>
                                                 <ComboBoxItem Content="Follow Pulse"/>
                                                 <ComboBoxItem Content="Orbit"/>
                                                 <ComboBoxItem Content="Overview"/>
                                                 <ComboBoxItem Content="Random Walk"/>
-                                                <ComboBoxItem Content="Real Brain (5s dwell)"/>
+                                                <!-- Default mode: camera follows MCP/edit activity so the
+                                                     user sees the AI's attention in real time. Matches
+                                                     _cameraMode = CameraMode.RealBrain in MainWindow.xaml.cs. -->
+                                                <ComboBoxItem Content="Real Brain (5s dwell)" IsSelected="True"/>
                                             </ComboBox>
                                             <Button Content="&#x2B06; Up" Style="{StaticResource NeonButton}"
                                                     Padding="10,3" FontSize="10" Click="ZoomOutLevel_Click" Margin="0,0,6,0"
@@ -669,7 +674,39 @@
                                             <Button Content="&#x1F4A5; Shake" Style="{StaticResource NeonButton}"
                                                     Padding="10,3" FontSize="10" Click="ShakeGraph_Click" Margin="0,0,6,0"/>
                                             <Button Content="&#x1F504; Reset" Style="{StaticResource NeonButton}"
-                                                    Padding="10,3" FontSize="10" Click="ResetCamera_Click" Margin="0,0,12,0"/>
+                                                    Padding="10,3" FontSize="10" Click="ResetCamera_Click" Margin="0,0,6,0"/>
+                                            <!-- Toggle the expertise overlay panel inside the brain graph
+                                                 view. Same data as the Dashboard's right-rail panel; hidden
+                                                 by default so the graph has full width when not needed. -->
+                                            <Button x:Name="GraphExpertiseToggleBtn"
+                                                    Content="&#x1F4CA; Expertise"
+                                                    Style="{StaticResource NeonButton}"
+                                                    Padding="10,3" FontSize="10"
+                                                    Click="GraphExpertiseToggle_Click" Margin="0,0,6,0"
+                                                    ToolTip="Toggle the expertise profile overlay"/>
+                                            <!-- Token savings gauge — hover for breakdown by op.
+                                                 Runs Compute() on the access-log every ~5s and shows
+                                                 net saved tokens. Click to toggle bypass (pauses the
+                                                 brain-first hooks so trivial conversations don't
+                                                 waste 160 tok/turn on reminders). -->
+                                            <Border x:Name="TokenSavingsChip" Padding="8,3"
+                                                    Margin="0,0,6,0" CornerRadius="3"
+                                                    Background="#1A00FF88"
+                                                    BorderBrush="#5500FF88" BorderThickness="1"
+                                                    Cursor="Hand"
+                                                    MouseLeftButtonUp="TokenSavingsChip_Click">
+                                                <TextBlock x:Name="TokenSavingsText"
+                                                           Text="&#x1F4B0; +0 tok"
+                                                           FontSize="10"
+                                                           FontFamily="{StaticResource MonoFont}"
+                                                           Foreground="#5DFF9D"/>
+                                            </Border>
+                                            <Button x:Name="BrainBypassBtn"
+                                                    Content="&#x1F9E0; Always"
+                                                    Style="{StaticResource NeonButtonFilled}"
+                                                    Padding="10,3" FontSize="10"
+                                                    Click="BrainBypass_Click" Margin="0,0,12,0"
+                                                    ToolTip="Cycle brain-mode: Always → Auto → Off → Always.&#x0a;Always = inject reminder every turn (best for long sessions, deep debug)&#x0a;Auto = skip reminder when prompt &lt; 60 chars (best general use)&#x0a;Off = no reminders (best for trivial chat / greenfield)"/>
                                             <Button x:Name="GraphView3DBtn" Content="3D"
                                                     Style="{StaticResource NeonButtonFilled}"
                                                     Padding="10,3" FontSize="10"
@@ -848,6 +885,61 @@
                                                         Stretch="UniformToFill" Opacity="0.35"/>
                                         </Border.Background>
                                         <services:Graph2DRenderer x:Name="FullGraph2D"/>
+                                    </Border>
+
+                                    <!-- Glassmorphism Expertise overlay for Brain Graph view.
+                                         Same data as Dashboard's panel, populated by
+                                         BuildExpertiseBars() into GraphExpertisePanel. Toggled
+                                         off by default; the toolbar button "📊 Expertise"
+                                         flips Visibility. Sits in Grid.Row="1" alongside the
+                                         2D/3D borders so it floats over the graph viewport. -->
+                                    <Border x:Name="GraphExpertiseHost" Grid.Row="1"
+                                            HorizontalAlignment="Right" VerticalAlignment="Top"
+                                            Margin="0,16,16,16" Width="320" MaxHeight="460"
+                                            CornerRadius="14" Padding="0"
+                                            Visibility="Collapsed" IsHitTestVisible="True">
+                                        <Border.Background>
+                                            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                                                <GradientStop Offset="0" Color="#55101820"/>
+                                                <GradientStop Offset="1" Color="#33060A10"/>
+                                            </LinearGradientBrush>
+                                        </Border.Background>
+                                        <Border.BorderBrush>
+                                            <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                                                <GradientStop Offset="0" Color="#55FFFFFF"/>
+                                                <GradientStop Offset="1" Color="#11FFFFFF"/>
+                                            </LinearGradientBrush>
+                                        </Border.BorderBrush>
+                                        <Border.BorderThickness>1</Border.BorderThickness>
+                                        <Border.Effect>
+                                            <DropShadowEffect BlurRadius="24" ShadowDepth="0"
+                                                              Color="#000000" Opacity="0.45"/>
+                                        </Border.Effect>
+                                        <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                                      HorizontalScrollBarVisibility="Disabled"
+                                                      Padding="16" CanContentScroll="False"
+                                                      PanningMode="VerticalOnly">
+                                            <StackPanel>
+                                                <Grid Margin="0,0,0,12">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock Text="EXPERTISE PROFILE" FontSize="11"
+                                                               FontWeight="SemiBold"
+                                                               Foreground="{StaticResource TextMutedBrush}"
+                                                               VerticalAlignment="Center"/>
+                                                    <Button Grid.Column="1" Content="&#x2715;"
+                                                            FontSize="11" Padding="6,2"
+                                                            Background="Transparent"
+                                                            BorderThickness="0"
+                                                            Foreground="{StaticResource TextMutedBrush}"
+                                                            Click="GraphExpertiseToggle_Click"
+                                                            ToolTip="Hide expertise overlay"/>
+                                                </Grid>
+                                                <StackPanel x:Name="GraphExpertisePanel"/>
+                                            </StackPanel>
+                                        </ScrollViewer>
                                     </Border>
 
                                     <!-- Selected Node Info — auto-hides after 15s idle, × closes, edit+save inline -->
@@ -1333,6 +1425,91 @@
                                         <Canvas x:Name="GrowthCanvas" Grid.Row="0" Margin="0,0,0,12"/>
                                         <StackPanel x:Name="GrowthLegend" Grid.Row="1" Orientation="Horizontal"
                                                     HorizontalAlignment="Center"/>
+                                    </Grid>
+                                </Border>
+                            </Grid>
+                        </Grid>
+
+                        <!-- ═══ TOKEN ECONOMY VIEW ═══
+                             Side-by-side comparison of "actual usage with brain" vs
+                             "projection without brain". Both lines are HEURISTIC
+                             estimates based on access-log.ndjson + tool-log.ndjson.
+                             We don't see real Anthropic API tokens. -->
+                        <Grid x:Name="TokensView" Visibility="Collapsed">
+                            <Grid Margin="24,16">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="*"/>
+                                </Grid.RowDefinitions>
+                                <StackPanel Margin="0,0,0,16">
+                                    <TextBlock Text="Token Economy" FontSize="24" FontWeight="Bold"
+                                               Foreground="{StaticResource TextPrimaryBrush}" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Per-hour comparison: actual tokens spent (with brain) vs projected without brain. Heuristic estimates from local logs — Anthropic's real API counts are not exposed to us."
+                                               FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"
+                                               TextWrapping="Wrap"/>
+                                </StackPanel>
+                                <!-- Top-line stat cards -->
+                                <Grid Grid.Row="1" Margin="0,0,0,16">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Border Grid.Column="0" Style="{StaticResource CardPanel}" Margin="0,0,8,0" Padding="16,12">
+                                        <StackPanel>
+                                            <TextBlock Text="ACTUAL SPENT" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                            <TextBlock x:Name="TokensActualText" Text="0" FontSize="22" FontWeight="Bold"
+                                                       Foreground="{StaticResource NeonCyanBrush}"
+                                                       FontFamily="{StaticResource MonoFont}"/>
+                                            <TextBlock Text="tokens, last 14 days" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                        </StackPanel>
+                                    </Border>
+                                    <Border Grid.Column="1" Style="{StaticResource CardPanel}" Margin="4,0,4,0" Padding="16,12">
+                                        <StackPanel>
+                                            <TextBlock Text="WITHOUT BRAIN (PROJECTION)" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                            <TextBlock x:Name="TokensProjectionText" Text="0" FontSize="22" FontWeight="Bold"
+                                                       Foreground="{StaticResource NeonPinkBrush}"
+                                                       FontFamily="{StaticResource MonoFont}"/>
+                                            <TextBlock Text="if no brain shortcuts" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                        </StackPanel>
+                                    </Border>
+                                    <Border Grid.Column="2" Style="{StaticResource CardPanel}" Margin="4,0,4,0" Padding="16,12">
+                                        <StackPanel>
+                                            <TextBlock Text="SAVED" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                            <TextBlock x:Name="TokensSavedText" Text="0" FontSize="22" FontWeight="Bold"
+                                                       Foreground="#5DFF9D"
+                                                       FontFamily="{StaticResource MonoFont}"/>
+                                            <TextBlock x:Name="TokensSavedPctText" Text="0%" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                        </StackPanel>
+                                    </Border>
+                                    <Border Grid.Column="3" Style="{StaticResource CardPanel}" Margin="8,0,0,0" Padding="16,12">
+                                        <StackPanel>
+                                            <TextBlock Text="CALLS" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                            <TextBlock x:Name="TokensCallsText" Text="0 / 0" FontSize="22" FontWeight="Bold"
+                                                       Foreground="{StaticResource TextPrimaryBrush}"
+                                                       FontFamily="{StaticResource MonoFont}"/>
+                                            <TextBlock Text="brain / other" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+                                <!-- Comparison chart -->
+                                <Border Grid.Row="2" Style="{StaticResource CardPanel}">
+                                    <Grid>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="*"/>
+                                            <RowDefinition Height="Auto"/>
+                                        </Grid.RowDefinitions>
+                                        <Canvas x:Name="TokensCanvas" Grid.Row="0" Margin="0,0,0,12"/>
+                                        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Center">
+                                            <Border Width="14" Height="3" Background="#5DFF9D" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                                            <TextBlock Text="actual (with brain)" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,16,0"/>
+                                            <Border Width="14" Height="3" Background="#FF6B9D" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                                            <TextBlock Text="projection (without brain)" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,16,0"/>
+                                            <Border Width="14" Height="3" Background="#FFC040" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                                            <TextBlock Text="bypass-mode hour" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}"/>
+                                        </StackPanel>
                                     </Grid>
                                 </Border>
                             </Grid>
@@ -2104,8 +2281,13 @@
                             </Border>
                         </StackPanel>
 
-                        <!-- Right: version. -->
-                        <TextBlock Grid.Column="2" x:Name="VersionText" Text="ObsidianX v2.0.0" FontSize="10"
+                        <!-- Right: version. Short SemVer only ("v2.0.40")
+                             so it fits in the status row alongside the
+                             other monospace chips. Full informational
+                             version + commit sha + remote latest live in
+                             the tooltip. Display-only — no click. -->
+                        <TextBlock Grid.Column="2" x:Name="VersionText" Text="v…" FontSize="10"
+                                   FontFamily="{StaticResource MonoFont}"
                                    Foreground="{StaticResource TextMutedBrush}" VerticalAlignment="Center"/>
                     </Grid>
                 </Border>

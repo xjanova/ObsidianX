@@ -1,0 +1,107 @@
+name: Build and Release
+
+# Triggers a build on every push to main (which is what happens after a PR
+# merge), and lets us kick one off manually from the Actions tab too.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Tagging + creating releases needs write access to the repo contents.
+permissions:
+  contents: write
+
+# Avoid two release builds racing if commits land back-to-back. Newer pushes
+# cancel older in-flight runs so we only ever publish the latest tip.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Need full history so `git rev-list --count` produces a stable,
+          # monotonically-increasing patch number.
+          fetch-depth: 0
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Derive version
+        id: ver
+        shell: bash
+        run: |
+          MAJOR=2
+          MINOR=0
+          # Patch = total commits on the branch. Always increments on every
+          # merge to main; never repeats.
+          PATCH=$(git rev-list --count HEAD)
+          SHA=$(git rev-parse --short HEAD)
+          VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}"         >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"         >> "$GITHUB_OUTPUT"
+          echo "## ObsidianX ${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- commit: \`${SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- tag: \`${TAG}\`"   >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore
+        run: dotnet restore ObsidianX.slnx
+
+      - name: Build
+        env:
+          BUILD_VERSION: ${{ steps.ver.outputs.version }}
+          BUILD_COMMIT:  ${{ steps.ver.outputs.sha }}
+        run: dotnet build ObsidianX.slnx -c Release --no-restore
+
+      - name: Publish (win-x64, self-contained)
+        env:
+          BUILD_VERSION: ${{ steps.ver.outputs.version }}
+          BUILD_COMMIT:  ${{ steps.ver.outputs.sha }}
+        run: |
+          dotnet publish ObsidianX.Client/ObsidianX.Client.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=false `
+            -o publish/win-x64
+
+      - name: Zip artifact
+        shell: bash
+        run: |
+          cd publish/win-x64
+          7z a "../../ObsidianX-${{ steps.ver.outputs.version }}-win-x64.zip" "."
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ObsidianX-${{ steps.ver.outputs.version }}-win-x64
+          path: ObsidianX-${{ steps.ver.outputs.version }}-win-x64.zip
+          retention-days: 30
+
+      - name: Create tag and GitHub Release
+        # Only publish a release for pushes to main — manual dispatches just
+        # produce the build artifact above. Stops bots from spamming releases
+        # while you're poking at the workflow.
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ObsidianX ${{ steps.ver.outputs.version }}
+          body: |
+            Auto-generated release from commit `${{ steps.ver.outputs.sha }}`.
+
+            The shipped binary's About card and bottom bar will display
+            `v${{ steps.ver.outputs.version }}+${{ steps.ver.outputs.sha }}`,
+            matching this tag.
+          files: ObsidianX-${{ steps.ver.outputs.version }}-win-x64.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true

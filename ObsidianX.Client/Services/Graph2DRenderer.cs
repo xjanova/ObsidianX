@@ -2,22 +2,26 @@ using System;
 using System.Collections.Generic;
 using System.Windows;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using System.Windows.Media.Media3D;
 using ObsidianX.Core.Models;
 
 namespace ObsidianX.Client.Services;
 
 /// <summary>
-/// Lightweight 2D fallback view for the knowledge graph. WPF's Viewport3D
-/// struggles past a few hundred nodes — every frame rebuilds meshes,
-/// re-allocates materials, and runs lighting math. DrawingContext is
-/// retained-mode 2D and skips all of that, which is several times faster
-/// for the common case.
+/// Canvas-style 2D graph view backed by a <see cref="WriteableBitmap"/>.
 ///
-/// Same `PhysicsEngine` instance powers both 2D and 3D views; only the
-/// projection layer differs. Z is dropped (orthographic) — the spread on
-/// the dashboard map is small enough that depth doesn't carry useful
-/// information, and orthographic is the fastest path.
+/// Why not <see cref="DrawingContext"/>? WPF's retained-mode 2D path
+/// allocates and re-tessellates geometry for every <c>DrawEllipse</c> and
+/// <c>DrawLine</c> call. With 450+ nodes and 2,700+ edges that turned into
+/// ~5 FPS on the Brain Graph view. Obsidian's own graph runs on HTML5
+/// Canvas — direct pixel writes, no scene graph — for exactly this reason.
+/// We do the same here: lock the back buffer, fill it with our own
+/// rasterizer (Bresenham line + filled circle with alpha blending),
+/// AddDirtyRect, blit.
+///
+/// Same <see cref="PhysicsEngine"/> drives both 2D and 3D views; only the
+/// projection layer differs. Z is dropped (orthographic).
 /// </summary>
 public class Graph2DRenderer : FrameworkElement
 {
@@ -30,36 +34,22 @@ public class Graph2DRenderer : FrameworkElement
     /// <summary>Pixels per world unit — bigger = zoomed in.</summary>
     public double Scale { get; set; } = 30;
 
+    /// <summary>
+    /// Live arcs to paint over the edges, owned by MainWindow. Each entry is
+    /// (sourceId, targetId, ageNormalized 0..1, tint).
+    /// </summary>
+    public List<(string srcId, string tgtId, double t, Color tint)>? Arcs { get; set; }
+
+
     private Color _accent = Color.FromRgb(0, 240, 255);
     private Color _secondary = Color.FromRgb(139, 92, 246);
 
     /// <summary>
     /// Optional category → color mapping. When set, nodes are filled by
-    /// their `KnowledgeCategory` so the user can scan the graph and see
-    /// at a glance which areas of the brain own which regions. When null,
-    /// every node uses the theme accent.
+    /// their <see cref="KnowledgeCategory"/> so the user can scan the
+    /// brain and see at a glance which areas own which regions.
     /// </summary>
     public Func<KnowledgeCategory, Color>? CategoryColorFn { get; set; }
-
-    // Frozen brushes/pens — created once per theme change, reused every
-    // frame. Allocating brushes inside OnRender for hundreds of nodes is
-    // the single biggest source of GC stalls in WPF 2D rendering.
-    private Brush _nodeBrush = Brushes.Cyan;
-    private Brush _selectedBrush = Brushes.Magenta;
-    private Brush _hotBrush = Brushes.Yellow;
-    private Pen _edgeWikiPen = new(Brushes.Cyan, 1);
-    private Pen _edgeAutoPen = new(Brushes.Magenta, 0.7);
-    private Pen _selectedRingPen = new(Brushes.Magenta, 1.6);
-
-    // Cache of frozen category brushes (keyed by category). Built lazily
-    // on first OnRender, invalidated when CategoryColorFn changes via
-    // SetTheme(). 24 categories × 1 brush each is cheap.
-    private readonly Dictionary<KnowledgeCategory, Brush> _categoryBrushCache = new();
-
-    public Graph2DRenderer()
-    {
-        RebuildBrushes();
-    }
 
     public static readonly DependencyProperty BackgroundProperty =
         DependencyProperty.Register(
@@ -76,41 +66,10 @@ public class Graph2DRenderer : FrameworkElement
     {
         _accent = accent;
         _secondary = secondary;
-        RebuildBrushes();
-        // Categorical brushes don't depend on theme, but they may have been
-        // built before CategoryColorFn was wired — clear so they rebuild.
-        _categoryBrushCache.Clear();
         InvalidateVisual();
     }
 
-    private Brush BrushForCategory(KnowledgeCategory c)
-    {
-        if (_categoryBrushCache.TryGetValue(c, out var b)) return b;
-        var color = CategoryColorFn?.Invoke(c) ?? _accent;
-        var fresh = new SolidColorBrush(color);
-        if (fresh.CanFreeze) fresh.Freeze();
-        _categoryBrushCache[c] = fresh;
-        return fresh;
-    }
-
-    private void RebuildBrushes()
-    {
-        _nodeBrush = Freeze(new SolidColorBrush(_accent));
-        _selectedBrush = Freeze(new SolidColorBrush(_secondary));
-        _hotBrush = Freeze(new SolidColorBrush(Color.FromRgb(255, 224, 64)));
-        _edgeWikiPen = Freeze(new Pen(
-            Freeze(new SolidColorBrush(Color.FromArgb(90, _accent.R, _accent.G, _accent.B))), 1.0));
-        _edgeAutoPen = Freeze(new Pen(
-            Freeze(new SolidColorBrush(Color.FromArgb(45, _secondary.R, _secondary.G, _secondary.B))), 0.6));
-        _selectedRingPen = Freeze(new Pen(_selectedBrush, 1.8));
-    }
-
-    private static T Freeze<T>(T f) where T : Freezable
-    {
-        if (f.CanFreeze && !f.IsFrozen) f.Freeze();
-        return f;
-    }
-
+    // ── Coordinate helpers ─────────────────────────────────────────
     public Point WorldToScreen(Point3D p) => new(
         ActualWidth / 2 + (p.X - ViewCenter.X) * Scale,
         ActualHeight / 2 - (p.Y - ViewCenter.Y) * Scale);
@@ -119,10 +78,7 @@ public class Graph2DRenderer : FrameworkElement
         (p.X - ActualWidth / 2) / Scale + ViewCenter.X,
         -(p.Y - ActualHeight / 2) / Scale + ViewCenter.Y);
 
-    /// <summary>
-    /// Frame all nodes in the viewport. Call after physics has placed
-    /// nodes and the element has a non-zero ActualWidth/Height.
-    /// </summary>
+    // ── Pre-frame setup ────────────────────────────────────────────
     public void FitToContent(double margin = 1.2)
     {
         if (Physics == null || Physics.Nodes.Count == 0) return;
@@ -148,10 +104,6 @@ public class Graph2DRenderer : FrameworkElement
         if (Scale > 200) Scale = 200;
     }
 
-    /// <summary>
-    /// Hit-test a screen point against drawn nodes. Returns the index of
-    /// the closest matching node within its hit radius, or null.
-    /// </summary>
     public int? HitTest(Point screenPoint)
     {
         if (Physics == null) return null;
@@ -164,7 +116,10 @@ public class Graph2DRenderer : FrameworkElement
             var dx = sp.X - screenPoint.X;
             var dy = sp.Y - screenPoint.Y;
             var d2 = dx * dx + dy * dy;
-            var r = NodeRadius(nodes[i]) + 4; // generous click area
+            // Generous click target: r + 12 px so dense clusters are
+            // still actionable. With 450 nodes packed into a 400 px
+            // sphere, the old r+4 rule made clicks bounce off gaps.
+            var r = NodeRadius(nodes[i]) + 12;
             if (d2 < r * r && d2 < bestD2)
             {
                 bestD2 = d2;
@@ -176,74 +131,442 @@ public class Graph2DRenderer : FrameworkElement
 
     private static double NodeRadius(PhysicsNode n)
     {
-        // Mirrors the 3D "size by Importance" feel — log of word count for
-        // gentle scaling, plus a kick from access intensity.
         var baseR = 3.0 + Math.Min(8.0, Math.Log(1 + n.WordCount) * 0.7);
         return baseR + n.AccessIntensity * 4.0;
     }
 
-    protected override void OnRender(DrawingContext dc)
+    // ── Bitmap state ────────────────────────────────────────────────
+    private WriteableBitmap? _bmp;
+    private readonly Dictionary<string, int> _idxBuf = new(512);
+    // Per-frame "which edges are blinking right now" lookup. Key is the
+    // canonical (lo-idx, hi-idx) tuple of the two node indices; value is
+    // the arc's age (0..1) plus the tint colour for the glow pass.
+    private readonly Dictionary<(int, int), (double t, Color tint)> _activeEdgeMap = new();
+    private readonly HashSet<int> _activeNodeSet = new();
+
+    /// <summary>Premultiplied BGRA32 packed as 0xAARRGGBB.</summary>
+    private static uint Premultiplied(byte a, byte r, byte g, byte b)
+    {
+        // For PixelFormats.Pbgra32 the components are stored as
+        // [B, G, R, A] in memory; treating as little-endian uint gives
+        // 0xAARRGGBB. Color values must be premultiplied by alpha.
+        var pa = a;
+        var pr = (byte)(r * a / 255);
+        var pg = (byte)(g * a / 255);
+        var pb = (byte)(b * a / 255);
+        return ((uint)pa << 24) | ((uint)pr << 16) | ((uint)pg << 8) | pb;
+    }
+
+    private static uint PackPbgra(Color c) => Premultiplied(c.A, c.R, c.G, c.B);
+    private static uint PackPbgra(byte a, Color c) => Premultiplied(a, c.R, c.G, c.B);
+
+    protected override unsafe void OnRender(DrawingContext dc)
     {
         base.OnRender(dc);
-        var w = ActualWidth;
-        var h = ActualHeight;
-        if (w <= 0 || h <= 0) return;
+        var dipW = ActualWidth;
+        var dipH = ActualHeight;
+        if (dipW <= 0 || dipH <= 0) return;
 
-        // Background paints first so off-screen culling areas stay dark.
-        if (Background != null)
-            dc.DrawRectangle(Background, null, new Rect(0, 0, w, h));
+        int pxW = Math.Max(1, (int)Math.Round(dipW));
+        int pxH = Math.Max(1, (int)Math.Round(dipH));
 
-        if (Physics == null) return;
-        var nodes = Physics.Nodes;
-        if (nodes.Count == 0) return;
+        if (_bmp == null || _bmp.PixelWidth != pxW || _bmp.PixelHeight != pxH)
+            _bmp = new WriteableBitmap(pxW, pxH, 96, 96, PixelFormats.Pbgra32, null);
 
-        // Cache id → index for O(1) edge resolution. Edges store endpoint
-        // ids as strings (matches the on-disk graph), but rendering needs
-        // the live PhysicsNode object — without the dict, every edge does
-        // a linear search through the node list.
-        var idx = new Dictionary<string, int>(nodes.Count);
-        for (int i = 0; i < nodes.Count; i++) idx[nodes[i].Id] = i;
-
-        // ── Edges ──────────────────────────────────────────────────────
-        // Drawn first so nodes overlap them. Off-screen culling is cheap
-        // and saves a lot when zoomed in on a corner of a big graph.
-        foreach (var e in Physics.Edges)
+        _bmp.Lock();
+        try
         {
-            if (!idx.TryGetValue(e.SourceId, out var si)) continue;
-            if (!idx.TryGetValue(e.TargetId, out var ti)) continue;
-            var s = WorldToScreen(nodes[si].Position);
-            var t = WorldToScreen(nodes[ti].Position);
-            if ((s.X < 0 && t.X < 0) || (s.X > w && t.X > w)) continue;
-            if ((s.Y < 0 && t.Y < 0) || (s.Y > h && t.Y > h)) continue;
-            var pen = e.IsAuto ? _edgeAutoPen : _edgeWikiPen;
-            dc.DrawLine(pen, s, t);
+            byte* buf = (byte*)_bmp.BackBuffer.ToPointer();
+            int stride = _bmp.BackBufferStride;
+
+            // ── Clear ──
+            // Default to fully TRANSPARENT so the parent Border's
+            // background (the starfield image brush) shows through.
+            // Only paint a solid colour if Background was explicitly set
+            // to a SolidColorBrush — that's the only case where the host
+            // wants us to own the backdrop.
+            uint clearPx = 0x00000000;
+            if (Background is SolidColorBrush sb)
+                clearPx = PackPbgra(sb.Color);
+            FillBuffer(buf, stride, pxW, pxH, clearPx);
+
+            if (Physics == null || Physics.Nodes.Count == 0)
+            {
+                _bmp.AddDirtyRect(new Int32Rect(0, 0, pxW, pxH));
+                _bmp.Unlock();
+                dc.DrawImage(_bmp, new Rect(0, 0, dipW, dipH));
+                return;
+            }
+
+            var nodes = Physics.Nodes;
+
+            // Reusable id → idx dictionary (no per-frame allocation).
+            _idxBuf.Clear();
+            for (int i = 0; i < nodes.Count; i++) _idxBuf[nodes[i].Id] = i;
+
+            // ── Active set from arcs ──
+            // Convert the Arcs list (which arrived as opaque tuples)
+            // into two fast lookups:
+            //   1. activeEdgeMap: which edges should blink white this frame
+            //   2. activeNodes:   which nodes should glow this frame
+            // Both rebuilt every frame because arcs can finish mid-frame
+            // and re-spawn on user clicks.
+            _activeEdgeMap.Clear();
+            _activeNodeSet.Clear();
+            if (Arcs != null)
+            {
+                foreach (var (srcId, tgtId, t, tint) in Arcs)
+                {
+                    if (t < 0 || t >= 1.0) continue;
+                    if (!_idxBuf.TryGetValue(srcId, out var si)) continue;
+                    if (!_idxBuf.TryGetValue(tgtId, out var ti)) continue;
+                    // Canonical key — edges are bidirectional in this view
+                    var key = si < ti ? (si, ti) : (ti, si);
+                    // If multiple arcs cover the same edge, keep the
+                    // brightest (lowest t, since brightness fades over t).
+                    if (!_activeEdgeMap.TryGetValue(key, out var prev) || t < prev.t)
+                        _activeEdgeMap[key] = (t, tint);
+                    _activeNodeSet.Add(si);
+                    _activeNodeSet.Add(ti);
+                }
+            }
+
+            // ── Edges ──
+            // Two-pass: dim edges first (bottom layer), then re-paint
+            // active edges in bright white pulses on top so the lit
+            // connections stand out against the dim web.
+            uint wikiEdge = PackPbgra(80, _accent);
+            uint autoEdge = PackPbgra(40, _secondary);
+            var edges = Physics.Edges;
+            for (int e = 0; e < edges.Count; e++)
+            {
+                var ed = edges[e];
+                if (!_idxBuf.TryGetValue(ed.SourceId, out var si)) continue;
+                if (!_idxBuf.TryGetValue(ed.TargetId, out var ti)) continue;
+                var s = WorldToScreen(nodes[si].Position);
+                var tgt = WorldToScreen(nodes[ti].Position);
+                if ((s.X < 0 && tgt.X < 0) || (s.X > pxW && tgt.X > pxW)) continue;
+                if ((s.Y < 0 && tgt.Y < 0) || (s.Y > pxH && tgt.Y > pxH)) continue;
+                BlendLine(buf, stride, pxW, pxH,
+                    (int)s.X, (int)s.Y, (int)tgt.X, (int)tgt.Y,
+                    ed.IsAuto ? autoEdge : wikiEdge);
+            }
+
+            // ── Nodes ──
+            // Two-pass paint: a translucent halo first, then the solid
+            // core on top. Mimics the 3D mode's emissive-glow look so
+            // balls don't read as "flat dots on a starfield" anymore.
+            // Pre-resolve fill colours per category to avoid repeated
+            // function calls inside the hot loop.
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                var n = nodes[i];
+                var p = WorldToScreen(n.Position);
+                if (p.X < -20 || p.X > pxW + 20 || p.Y < -20 || p.Y > pxH + 20) continue;
+
+                var lifeScale = n.BirthProgress * n.DeathProgress;
+                var radius = NodeRadius(n) * lifeScale;
+                if (radius < 0.5) continue;
+
+                Color baseColor;
+                if (n.AccessIntensity > 0.4) baseColor = Color.FromRgb(255, 224, 64);
+                else if (i == SelectedIndex) baseColor = _secondary;
+                else if (CategoryColorFn != null) baseColor = CategoryColorFn(n.Category);
+                else baseColor = _accent;
+
+                int cx = (int)p.X;
+                int cy = (int)p.Y;
+
+                // Active-node mega-halo: when this node sits at either
+                // end of a blinking edge, paint a bright wide glow ring
+                // first so it reads as "I'm the one firing right now".
+                bool isActive = _activeNodeSet.Contains(i);
+                if (isActive)
+                {
+                    FillCircle(buf, stride, pxW, pxH, cx, cy, radius + 8,
+                        PackPbgra(110, Color.FromRgb(255, 255, 255)));
+                    FillCircle(buf, stride, pxW, pxH, cx, cy, radius + 5,
+                        PackPbgra(160, baseColor));
+                }
+
+                // Outer halo — bigger, semi-transparent, blends with the
+                // starfield so each ball reads as a "lit" sphere rather
+                // than a flat sticker.
+                FillCircle(buf, stride, pxW, pxH, cx, cy, radius + 2.5,
+                    PackPbgra(70, baseColor));
+
+                // Solid core — slightly brightened to compensate for the
+                // halo dimming the eye's perception. Pure overwrite so
+                // there's no blend-fade in the centre.
+                Color coreColor = Color.FromRgb(
+                    (byte)Math.Min(255, baseColor.R + 25),
+                    (byte)Math.Min(255, baseColor.G + 25),
+                    (byte)Math.Min(255, baseColor.B + 25));
+                FillCircle(buf, stride, pxW, pxH, cx, cy, radius,
+                    PackPbgra(255, coreColor));
+
+                // Specular pip — small white dot offset toward the
+                // upper-left, like a glossy sphere highlight. Only on
+                // balls big enough to hold one (≥ 4 px radius) so dots
+                // don't get overwhelmed.
+                if (radius >= 4.0)
+                {
+                    int hx = cx - (int)(radius * 0.35);
+                    int hy = cy - (int)(radius * 0.35);
+                    FillCircle(buf, stride, pxW, pxH, hx, hy,
+                        Math.Max(1.0, radius * 0.22),
+                        PackPbgra(180, Color.FromRgb(255, 255, 255)));
+                }
+
+                if (i == SelectedIndex)
+                {
+                    // Halo ring — 1.6 px stroke approximated as a
+                    // thicker circle outline by drawing two concentric
+                    // circles and subtracting.
+                    StrokeCircle(buf, stride, pxW, pxH,
+                        cx, cy, radius + 3,
+                        PackPbgra(255, _secondary), thickness: 2);
+                }
+            }
+
+            // ── Active edge highlight pass ──
+            // Drawn AFTER nodes so the bright lit edges sit ON TOP of
+            // the balls — otherwise the dense cluster covers the lines
+            // entirely. User asked for thinner: just 2-pixel-tall bright
+            // line with NO transparency, no fat glow halo.
+            foreach (var (key, info) in _activeEdgeMap)
+            {
+                var (si, ti) = key;
+                var s = WorldToScreen(nodes[si].Position);
+                var tgt = WorldToScreen(nodes[ti].Position);
+                if ((s.X < 0 && tgt.X < 0) || (s.X > pxW && tgt.X > pxW)) continue;
+                if ((s.Y < 0 && tgt.Y < 0) || (s.Y > pxH && tgt.Y > pxH)) continue;
+
+                // Pulse: 3 blinks across the lifetime, never falling
+                // below 0.85 so the line stays solid-bright; a faint
+                // dip is enough to read as a blink without the line
+                // ghosting through the background.
+                double pulse = 0.85 + 0.15 * Math.Abs(Math.Sin(info.t * Math.PI * 3));
+                byte coreA = (byte)(255 * pulse);
+                uint corePx = PackPbgra(coreA, Color.FromRgb(255, 255, 255));
+
+                int x0 = (int)s.X, y0 = (int)s.Y;
+                int x1 = (int)tgt.X, y1 = (int)tgt.Y;
+                // Solid white line, 2 pixels tall — no glow halo.
+                BlendLine(buf, stride, pxW, pxH, x0, y0,     x1, y1,     corePx);
+                BlendLine(buf, stride, pxW, pxH, x0, y0 + 1, x1, y1 + 1, corePx);
+            }
+
+            _bmp.AddDirtyRect(new Int32Rect(0, 0, pxW, pxH));
+        }
+        finally
+        {
+            _bmp.Unlock();
         }
 
-        // ── Nodes ──────────────────────────────────────────────────────
-        for (int i = 0; i < nodes.Count; i++)
+        dc.DrawImage(_bmp, new Rect(0, 0, dipW, dipH));
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    //  Pixel-level rasterizers
+    // ────────────────────────────────────────────────────────────────
+
+    /// <summary>Solid fill — bgra is the literal pixel value.</summary>
+    private static unsafe void FillBuffer(byte* buf, int stride, int w, int h, uint bgra)
+    {
+        for (int y = 0; y < h; y++)
         {
-            var n = nodes[i];
-            var p = WorldToScreen(n.Position);
-            if (p.X < -20 || p.X > w + 20 || p.Y < -20 || p.Y > h + 20) continue;
-
-            var lifeScale = n.BirthProgress * n.DeathProgress;
-            var radius = NodeRadius(n) * lifeScale;
-            if (radius < 0.5) continue;
-
-            // Pick fill: hot (active access) > selected > category color
-            // (if mapping provided) > theme accent fallback. Categorical
-            // coloring lets the user "see" the brain's regions at a glance.
-            Brush fill = n.AccessIntensity > 0.4
-                ? _hotBrush
-                : (i == SelectedIndex
-                    ? _selectedBrush
-                    : (CategoryColorFn != null ? BrushForCategory(n.Category) : _nodeBrush));
-
-            dc.DrawEllipse(fill, null, p, radius, radius);
-
-            // Halo around the selected node so it pops without a hover-detail panel.
-            if (i == SelectedIndex)
-                dc.DrawEllipse(null, _selectedRingPen, p, radius + 3, radius + 3);
+            uint* row = (uint*)(buf + y * stride);
+            for (int x = 0; x < w; x++) row[x] = bgra;
         }
     }
+
+    /// <summary>
+    /// Filled circle, source-over alpha blending. Uses the implicit
+    /// equation x²+y² ≤ r² and only iterates the bounding box. The
+    /// "+0.5" anti-pattern (pretending we're sampling cell centers)
+    /// gives slightly nicer-looking small circles without true AA.
+    /// </summary>
+    private static unsafe void FillCircle(byte* buf, int stride, int w, int h,
+        int cx, int cy, double r, uint srcBgra)
+    {
+        if (r < 0.5) return;
+        int rInt = (int)Math.Ceiling(r);
+        int x0 = Math.Max(0, cx - rInt);
+        int x1 = Math.Min(w - 1, cx + rInt);
+        int y0 = Math.Max(0, cy - rInt);
+        int y1 = Math.Min(h - 1, cy + rInt);
+        double rSqr = r * r;
+
+        // Decode source PBGRA once.
+        byte sa = (byte)((srcBgra >> 24) & 0xFF);
+        if (sa == 0) return;
+
+        if (sa == 255)
+        {
+            // Opaque fast path — straight pixel write.
+            for (int y = y0; y <= y1; y++)
+            {
+                int dy = y - cy;
+                int dySqr = dy * dy;
+                uint* row = (uint*)(buf + y * stride);
+                for (int x = x0; x <= x1; x++)
+                {
+                    int dx = x - cx;
+                    if (dx * dx + dySqr > rSqr) continue;
+                    row[x] = srcBgra;
+                }
+            }
+            return;
+        }
+
+        // Translucent — source-over composite.
+        byte sr = (byte)((srcBgra >> 16) & 0xFF);
+        byte sg = (byte)((srcBgra >> 8) & 0xFF);
+        byte sb = (byte)(srcBgra & 0xFF);
+        int invA = 255 - sa;
+
+        for (int y = y0; y <= y1; y++)
+        {
+            int dy = y - cy;
+            int dySqr = dy * dy;
+            uint* row = (uint*)(buf + y * stride);
+            for (int x = x0; x <= x1; x++)
+            {
+                int dx = x - cx;
+                if (dx * dx + dySqr > rSqr) continue;
+                uint dst = row[x];
+                byte da = (byte)((dst >> 24) & 0xFF);
+                byte dr = (byte)((dst >> 16) & 0xFF);
+                byte dg = (byte)((dst >> 8) & 0xFF);
+                byte db = (byte)(dst & 0xFF);
+                byte ra = (byte)(sa + da * invA / 255);
+                byte rr = (byte)(sr + dr * invA / 255);
+                byte rg = (byte)(sg + dg * invA / 255);
+                byte rb = (byte)(sb + db * invA / 255);
+                row[x] = ((uint)ra << 24) | ((uint)rr << 16) | ((uint)rg << 8) | rb;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Stroked circle outline at the given thickness. Implemented as the
+    /// difference of two filled circles (outer minus inner) — cheap and
+    /// gives clean rings for the "selected node" halo.
+    /// </summary>
+    private static unsafe void StrokeCircle(byte* buf, int stride, int w, int h,
+        int cx, int cy, double r, uint srcBgra, double thickness)
+    {
+        if (r < 0.5 || thickness < 0.5) return;
+        int rInt = (int)Math.Ceiling(r + 0.5);
+        int x0 = Math.Max(0, cx - rInt);
+        int x1 = Math.Min(w - 1, cx + rInt);
+        int y0 = Math.Max(0, cy - rInt);
+        int y1 = Math.Min(h - 1, cy + rInt);
+        double outerSqr = r * r;
+        double innerR = r - thickness;
+        double innerSqr = innerR * innerR;
+
+        byte sa = (byte)((srcBgra >> 24) & 0xFF);
+        if (sa == 0) return;
+        byte sr = (byte)((srcBgra >> 16) & 0xFF);
+        byte sg = (byte)((srcBgra >> 8) & 0xFF);
+        byte sb = (byte)(srcBgra & 0xFF);
+        int invA = 255 - sa;
+        bool opaque = sa == 255;
+
+        for (int y = y0; y <= y1; y++)
+        {
+            int dy = y - cy;
+            int dySqr = dy * dy;
+            uint* row = (uint*)(buf + y * stride);
+            for (int x = x0; x <= x1; x++)
+            {
+                int dx = x - cx;
+                int dSqr = dx * dx + dySqr;
+                if (dSqr > outerSqr || dSqr < innerSqr) continue;
+                if (opaque)
+                {
+                    row[x] = srcBgra;
+                }
+                else
+                {
+                    uint dst = row[x];
+                    byte da = (byte)((dst >> 24) & 0xFF);
+                    byte dr = (byte)((dst >> 16) & 0xFF);
+                    byte dg = (byte)((dst >> 8) & 0xFF);
+                    byte db = (byte)(dst & 0xFF);
+                    byte ra = (byte)(sa + da * invA / 255);
+                    byte rr = (byte)(sr + dr * invA / 255);
+                    byte rg = (byte)(sg + dg * invA / 255);
+                    byte rb = (byte)(sb + db * invA / 255);
+                    row[x] = ((uint)ra << 24) | ((uint)rr << 16) | ((uint)rg << 8) | rb;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Bresenham line with per-pixel alpha blending. Single-pixel-wide;
+    /// good enough for graph edges where thickness wouldn't add much
+    /// visual info on a dense graph anyway. Skips early when the segment
+    /// is entirely off-screen.
+    /// </summary>
+    private static unsafe void BlendLine(byte* buf, int stride, int w, int h,
+        int x0, int y0, int x1, int y1, uint srcBgra)
+    {
+        byte sa = (byte)((srcBgra >> 24) & 0xFF);
+        if (sa == 0) return;
+
+        int dx = Math.Abs(x1 - x0);
+        int dy = Math.Abs(y1 - y0);
+        int sx = x0 < x1 ? 1 : -1;
+        int sy = y0 < y1 ? 1 : -1;
+        int err = dx - dy;
+
+        if (sa == 255)
+        {
+            while (true)
+            {
+                if ((uint)x0 < (uint)w && (uint)y0 < (uint)h)
+                {
+                    uint* row = (uint*)(buf + y0 * stride);
+                    row[x0] = srcBgra;
+                }
+                if (x0 == x1 && y0 == y1) break;
+                int e2 = 2 * err;
+                if (e2 > -dy) { err -= dy; x0 += sx; }
+                if (e2 < dx)  { err += dx; y0 += sy; }
+            }
+            return;
+        }
+
+        byte sr = (byte)((srcBgra >> 16) & 0xFF);
+        byte sg = (byte)((srcBgra >> 8) & 0xFF);
+        byte sb = (byte)(srcBgra & 0xFF);
+        int invA = 255 - sa;
+
+        while (true)
+        {
+            if ((uint)x0 < (uint)w && (uint)y0 < (uint)h)
+            {
+                uint* row = (uint*)(buf + y0 * stride);
+                uint dst = row[x0];
+                byte da = (byte)((dst >> 24) & 0xFF);
+                byte dr = (byte)((dst >> 16) & 0xFF);
+                byte dg = (byte)((dst >> 8) & 0xFF);
+                byte db = (byte)(dst & 0xFF);
+                byte ra = (byte)(sa + da * invA / 255);
+                byte rr = (byte)(sr + dr * invA / 255);
+                byte rg = (byte)(sg + dg * invA / 255);
+                byte rb = (byte)(sb + db * invA / 255);
+                row[x0] = ((uint)ra << 24) | ((uint)rr << 16) | ((uint)rg << 8) | rb;
+            }
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 > -dy) { err -= dy; x0 += sx; }
+            if (e2 < dx)  { err += dx; y0 += sy; }
+        }
+    }
+
 }
