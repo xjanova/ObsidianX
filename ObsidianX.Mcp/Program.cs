@@ -292,6 +292,20 @@ internal static class Program
                     {
                         ["limit"] = new JObject { ["type"] = "integer", ["default"] = 20 }
                     }
+                }),
+            Tool("brain_suggest_topics",
+                "Active learning loop — analyzes the search history in access-log.ndjson to find " +
+                "queries the user keeps asking but the brain doesn't answer well (sparse results " +
+                "OR no follow-up read). Returns topics worth writing a note about. Use periodically " +
+                "to spot knowledge gaps, or when the user asks 'what should I write next?'.",
+                new JObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JObject
+                    {
+                        ["windowDays"] = new JObject { ["type"] = "integer", ["description"] = "days of history to analyze (default 14)", ["default"] = 14 },
+                        ["limit"] = new JObject { ["type"] = "integer", ["default"] = 10 }
+                    }
                 })
         }
     });
@@ -328,6 +342,7 @@ internal static class Program
                 "brain_synthesize"          => BrainSynthesize(args),
                 "brain_suggest_links"       => BrainSuggestLinks(args),
                 "brain_find_contradictions" => BrainFindContradictions(args),
+                "brain_suggest_topics"      => BrainSuggestTopics(args),
                 _ => throw new InvalidOperationException($"unknown tool: {name}")
             };
 
@@ -1008,6 +1023,36 @@ internal static class Program
             ["checked"] = export.Nodes.Count,
             ["found"] = pairs.Count,
             ["pairs"] = new JArray(top)
+        };
+    }
+
+    /// <summary>
+    /// Active learning — surface queries the user keeps searching but the
+    /// brain answers poorly. See <see cref="QueryGapAnalyzer"/> for the
+    /// full heuristic. Pure read of access-log.ndjson; doesn't touch
+    /// brain-export.json so it stays cheap to call.
+    /// </summary>
+    private static JToken BrainSuggestTopics(JObject args)
+    {
+        var windowDays = args["windowDays"]?.ToObject<int>() ?? 14;
+        var limit = args["limit"]?.ToObject<int>() ?? 10;
+
+        var report = new QueryGapAnalyzer().Analyze(_vaultPath, windowDays, limit);
+
+        return new JObject
+        {
+            ["windowDays"] = report.WindowDays,
+            ["totalSearches"] = report.TotalSearches,
+            ["uniqueQueries"] = report.UniqueQueries,
+            ["suggestions"] = new JArray(report.Suggestions.Select(s => new JObject
+            {
+                ["query"] = s.Query,
+                ["searchCount"] = s.SearchCount,
+                ["avgResults"] = s.AvgResults,
+                ["followThroughRate"] = s.FollowThroughRate,
+                ["lastSearched"] = s.LastSearched.ToString("O"),
+                ["reason"] = s.Reason
+            }))
         };
     }
 
