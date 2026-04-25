@@ -206,6 +206,7 @@ public partial class MainWindow : Window
         ["Sharing"] = "SharingView",
         ["Growth"] = "GrowthView",
         ["Tokens"] = "TokensView",
+        ["Insights"] = "InsightsView",
         ["Settings"] = "SettingsView",
         ["Editor"] = "EditorView",
         ["Search"] = "SearchView"
@@ -3758,13 +3759,14 @@ public partial class MainWindow : Window
             if (view != null) view.Visibility = Visibility.Visible;
         }
 
-        Button[] navButtons = [NavDashboard, NavBrainGraph, NavNetwork, NavEditor, NavVault, NavSearch, NavClaude, NavGrowth, NavPeers, NavSharing, NavSettings];
+        Button[] navButtons = [NavDashboard, NavBrainGraph, NavNetwork, NavEditor, NavVault, NavSearch, NavClaude, NavGrowth, NavTokens, NavInsights, NavPeers, NavSharing, NavSettings];
         foreach (var nb in navButtons) nb.Style = (Style)FindResource("NavButton");
         btn.Style = (Style)FindResource("NavButtonActive");
 
         // Special rendering for specific views
         if (tag == "Growth") RenderGrowthChart();
         if (tag == "Tokens") RenderTokenEconomyChart();
+        if (tag == "Insights") RefreshInsights();
         if (tag == "Peers") RefreshPeersList();
         if (tag == "Editor") RefreshBacklinks();
         if (tag == "Search") SearchBox.Focus();
@@ -5535,6 +5537,134 @@ public partial class MainWindow : Window
         n >= 1_000_000 ? $"{n / 1_000_000.0:F1}M" :
         n >= 1_000     ? $"{n / 1_000.0:F1}k" :
         n.ToString("N0");
+
+    // ── Brain Insights (active learning loop) ──
+    private const int InsightsWindowDays = 14;
+
+    private void InsightsRefresh_Click(object sender, RoutedEventArgs e) => RefreshInsights();
+
+    private async void RefreshInsights()
+    {
+        if (InsightsList == null) return;
+
+        // QueryGapAnalyzer reads access-log.ndjson — same code path as
+        // brain_suggest_topics MCP tool. Run on a worker so the UI stays
+        // responsive even if the log is on slow storage.
+        ObsidianX.Core.Services.QueryGapAnalyzer.Report report;
+        try
+        {
+            report = await Task.Run(() =>
+                new ObsidianX.Core.Services.QueryGapAnalyzer()
+                    .Analyze(_vaultPath, InsightsWindowDays, limit: 30));
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Insights refresh failed: {ex}");
+            return;
+        }
+
+        InsightsWindowText.Text = $"{report.WindowDays} days";
+        InsightsSearchesText.Text = $"{report.TotalSearches} / {report.UniqueQueries}";
+        InsightsGapCountText.Text = report.Suggestions.Count.ToString();
+
+        InsightsList.Children.Clear();
+
+        if (report.Suggestions.Count == 0)
+        {
+            InsightsList.Children.Add(new TextBlock
+            {
+                Text = report.TotalSearches == 0
+                    ? "No search history yet — Insights will populate as Claude (or you) start using brain_search."
+                    : "No knowledge gaps detected. Either the brain has good coverage, or repeat searches all found what they wanted.",
+                FontSize = 13,
+                Foreground = (SolidColorBrush)FindResource("TextMutedBrush"),
+                FontStyle = FontStyles.Italic,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(8, 12, 8, 12)
+            });
+            return;
+        }
+
+        var textPrimary = (SolidColorBrush)FindResource("TextPrimaryBrush");
+        var textSecondary = (SolidColorBrush)FindResource("TextSecondaryBrush");
+        var textMuted = (SolidColorBrush)FindResource("TextMutedBrush");
+        var accent = (SolidColorBrush)FindResource("NeonCyanBrush");
+
+        foreach (var s in report.Suggestions)
+        {
+            var card = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(28, 255, 255, 255)),
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(14, 10, 14, 12),
+                Margin = new Thickness(0, 0, 0, 8)
+            };
+            var stack = new StackPanel();
+
+            // Top row — query text + search count badge.
+            var topRow = new Grid();
+            topRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            topRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            var query = new TextBlock
+            {
+                Text = s.Query,
+                FontSize = 15,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = textPrimary,
+                TextWrapping = TextWrapping.Wrap,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetColumn(query, 0);
+            topRow.Children.Add(query);
+
+            var badge = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(40, 165, 243, 252)),
+                CornerRadius = new CornerRadius(10),
+                Padding = new Thickness(8, 2, 8, 2),
+                VerticalAlignment = VerticalAlignment.Center,
+                Child = new TextBlock
+                {
+                    Text = $"× {s.SearchCount}",
+                    FontSize = 11,
+                    FontWeight = FontWeights.SemiBold,
+                    Foreground = accent
+                }
+            };
+            Grid.SetColumn(badge, 1);
+            topRow.Children.Add(badge);
+
+            stack.Children.Add(topRow);
+
+            // Reason line — what makes this a gap.
+            stack.Children.Add(new TextBlock
+            {
+                Text = s.Reason,
+                FontSize = 11,
+                Foreground = textSecondary,
+                Margin = new Thickness(0, 4, 0, 0),
+                TextWrapping = TextWrapping.Wrap
+            });
+
+            // Stats line — last searched + numeric breakdown.
+            var lastAge = (DateTime.UtcNow - s.LastSearched).TotalHours;
+            var ageStr = lastAge < 1 ? "just now"
+                : lastAge < 24 ? $"{(int)lastAge}h ago"
+                : $"{(int)(lastAge / 24)}d ago";
+            stack.Children.Add(new TextBlock
+            {
+                Text = $"avg {s.AvgResults:F1} hits · follow-through {s.FollowThroughRate * 100:F0}% · last searched {ageStr}",
+                FontSize = 10,
+                Foreground = textMuted,
+                FontFamily = (FontFamily)FindResource("MonoFont"),
+                Margin = new Thickness(0, 4, 0, 0)
+            });
+
+            card.Child = stack;
+            InsightsList.Children.Add(card);
+        }
+    }
 
     private void RenderGrowthChart()
     {
@@ -7499,7 +7629,7 @@ public partial class MainWindow : Window
             if (v != null) v.Visibility = Visibility.Collapsed;
         }
         EditorView.Visibility = Visibility.Visible;
-        Button[] navButtons = [NavDashboard, NavBrainGraph, NavNetwork, NavEditor, NavVault, NavSearch, NavClaude, NavGrowth, NavPeers, NavSharing, NavSettings];
+        Button[] navButtons = [NavDashboard, NavBrainGraph, NavNetwork, NavEditor, NavVault, NavSearch, NavClaude, NavGrowth, NavTokens, NavInsights, NavPeers, NavSharing, NavSettings];
         foreach (var nb in navButtons) nb.Style = (Style)FindResource("NavButton");
         NavEditor.Style = (Style)FindResource("NavButtonActive");
     }

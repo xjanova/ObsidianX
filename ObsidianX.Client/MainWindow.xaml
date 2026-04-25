@@ -291,6 +291,8 @@
                                             Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Growth"/>
                                     <Button x:Name="NavTokens" Content="&#x1F4B0;  Tokens"
                                             Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Tokens"/>
+                                    <Button x:Name="NavInsights" Content="&#x1F4A1;  Insights"
+                                            Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Insights"/>
 
                                     <TextBlock Text="NETWORK" FontSize="10" Foreground="{StaticResource TextMutedBrush}"
                                                Margin="22,24,0,12" FontWeight="SemiBold"/>
@@ -1511,6 +1513,78 @@
                                             <TextBlock Text="bypass-mode hour" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}"/>
                                         </StackPanel>
                                     </Grid>
+                                </Border>
+                            </Grid>
+                        </Grid>
+
+                        <!-- ═══ INSIGHTS VIEW ═══
+                             Active learning loop surfaced in the UI. Reads
+                             access-log.ndjson via QueryGapAnalyzer (same
+                             code as the brain_suggest_topics MCP tool) and
+                             lists queries the user kept asking but the
+                             brain didn't answer well — candidates for new
+                             notes. -->
+                        <Grid x:Name="InsightsView" Visibility="Collapsed">
+                            <Grid Margin="24,16">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="*"/>
+                                </Grid.RowDefinitions>
+                                <StackPanel Margin="0,0,0,16">
+                                    <TextBlock Text="Brain Insights" FontSize="24" FontWeight="Bold"
+                                               Foreground="{StaticResource TextPrimaryBrush}" Margin="0,0,0,4"/>
+                                    <TextBlock Text="Topics you keep searching for but the brain isn't answering well — candidates for a new note. Two signals: sparse results (brain doesn't have it) + low follow-through (results weren't useful)."
+                                               FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"
+                                               TextWrapping="Wrap"/>
+                                </StackPanel>
+                                <!-- Top-line stat cards -->
+                                <Grid Grid.Row="1" Margin="0,0,0,16">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Border Grid.Column="0" Style="{StaticResource CardPanel}" Margin="0,0,8,0" Padding="16,12">
+                                        <StackPanel>
+                                            <TextBlock Text="WINDOW" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                            <TextBlock x:Name="InsightsWindowText" Text="14 days" FontSize="22" FontWeight="Bold"
+                                                       Foreground="{StaticResource TextPrimaryBrush}"
+                                                       FontFamily="{StaticResource MonoFont}"/>
+                                            <TextBlock Text="of search history" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                        </StackPanel>
+                                    </Border>
+                                    <Border Grid.Column="1" Style="{StaticResource CardPanel}" Margin="4,0,4,0" Padding="16,12">
+                                        <StackPanel>
+                                            <TextBlock Text="SEARCHES / UNIQUE" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                            <TextBlock x:Name="InsightsSearchesText" Text="0 / 0" FontSize="22" FontWeight="Bold"
+                                                       Foreground="{StaticResource NeonCyanBrush}"
+                                                       FontFamily="{StaticResource MonoFont}"/>
+                                            <TextBlock Text="total / distinct queries" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                        </StackPanel>
+                                    </Border>
+                                    <Border Grid.Column="2" Style="{StaticResource CardPanel}" Margin="4,0,8,0" Padding="16,12">
+                                        <StackPanel>
+                                            <TextBlock Text="GAPS DETECTED" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                            <TextBlock x:Name="InsightsGapCountText" Text="0" FontSize="22" FontWeight="Bold"
+                                                       Foreground="#FFC040"
+                                                       FontFamily="{StaticResource MonoFont}"/>
+                                            <TextBlock Text="topics worth a note" FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                        </StackPanel>
+                                    </Border>
+                                    <Button Grid.Column="3" x:Name="InsightsRefreshBtn"
+                                            Content="↻  Refresh"
+                                            Style="{StaticResource NavButton}"
+                                            VerticalAlignment="Center"
+                                            Padding="14,8"
+                                            Click="InsightsRefresh_Click"/>
+                                </Grid>
+                                <!-- Suggestion list -->
+                                <Border Grid.Row="2" Style="{StaticResource CardPanel}">
+                                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                        <StackPanel x:Name="InsightsList" Margin="8"/>
+                                    </ScrollViewer>
                                 </Border>
                             </Grid>
                         </Grid>
