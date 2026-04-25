@@ -232,9 +232,13 @@ public class Graph2DRenderer : FrameworkElement
             }
 
             // ── Edges ──
-            // Two-pass: dim edges first (bottom layer), then re-paint
-            // active edges in bright white pulses on top so the lit
-            // connections stand out against the dim web.
+            // Three layers (back-to-front):
+            //   1. dim base — every edge at low alpha so the web is visible
+            //   2. trail glow — edges with AccessIntensity > 0 paint a
+            //      brighter cyan stroke whose alpha follows the intensity.
+            //      This is the persistent "trail" for recently-used edges
+            //      (plateau 2 s, then ~10 s fade — same scheme as nodes).
+            //   3. arc-flash highlight — drawn after nodes, see further down
             uint wikiEdge = PackPbgra(80, _accent);
             uint autoEdge = PackPbgra(40, _secondary);
             var edges = Physics.Edges;
@@ -247,9 +251,27 @@ public class Graph2DRenderer : FrameworkElement
                 var tgt = WorldToScreen(nodes[ti].Position);
                 if ((s.X < 0 && tgt.X < 0) || (s.X > pxW && tgt.X > pxW)) continue;
                 if ((s.Y < 0 && tgt.Y < 0) || (s.Y > pxH && tgt.Y > pxH)) continue;
-                BlendLine(buf, stride, pxW, pxH,
-                    (int)s.X, (int)s.Y, (int)tgt.X, (int)tgt.Y,
+                int sx = (int)s.X, sy = (int)s.Y, tx = (int)tgt.X, ty = (int)tgt.Y;
+
+                // Layer 1 — dim base (always on).
+                BlendLine(buf, stride, pxW, pxH, sx, sy, tx, ty,
                     ed.IsAuto ? autoEdge : wikiEdge);
+
+                // Layer 2 — persistent trail glow if recently active.
+                // Alpha curve: AccessIntensity ∈ [0..1] → extra alpha [0..150]
+                // on top of the dim base, in the bright white-on-cyan range.
+                if (ed.AccessIntensity > 0.05)
+                {
+                    byte glowA = (byte)(40 + ed.AccessIntensity * 150);
+                    uint glowPx = PackPbgra(glowA,
+                        Color.FromRgb(220, 245, 255));
+                    BlendLine(buf, stride, pxW, pxH, sx, sy, tx, ty, glowPx);
+                    // Second pixel-row stroke when intensity is in the
+                    // plateau range so the trail reads as a 2-px ribbon
+                    // before thinning out as it fades.
+                    if (ed.AccessIntensity > 0.45)
+                        BlendLine(buf, stride, pxW, pxH, sx, sy + 1, tx, ty + 1, glowPx);
+                }
             }
 
             // ── Nodes ──

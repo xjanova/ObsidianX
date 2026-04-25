@@ -7261,15 +7261,35 @@ public partial class MainWindow : Window
         if (_arcs.Count > 256)
             _arcs.RemoveAll(a => (now - a.StartedAt).TotalSeconds > ArcLifetimeSec);
 
+        // Throttle: when MCP fires a 5-result search, the access-log poll
+        // bumps the same node 5× within ~milliseconds. Without throttling
+        // we'd spawn 5 × 12 = 60 arcs over the same edges and the visual
+        // would flicker as overlapping arcs interfere. Skip arc spawn if
+        // this node fired a burst within the last ArcSpawnThrottleMs —
+        // edge intensity (set below) still updates so the persistent
+        // glow trail extends regardless.
+        if (_lastArcSpawnByNode.TryGetValue(nodeId, out var lastSpawn)
+            && (now - lastSpawn).TotalMilliseconds < ArcSpawnThrottleMs)
+        {
+            BumpEdgesIncident(physics, nodeId, now);
+            return;
+        }
+        _lastArcSpawnByNode[nodeId] = now;
+
         int spawned = 0;
         foreach (var e in physics.Edges)
         {
-            if (spawned >= 12) break;
             string? otherId =
                 e.SourceId == nodeId ? e.TargetId :
                 e.TargetId == nodeId ? e.SourceId : null;
             if (otherId == null) continue;
 
+            // Always bump edge intensity (even past the 12-arc cap) so the
+            // glow trail covers every incident edge, not just the first 12.
+            e.AccessIntensity = Math.Min(1.0, e.AccessIntensity + 0.8);
+            e.LastAccessedAt = now;
+
+            if (spawned >= 12) continue;
             _arcs.Add(new ElectricArc
             {
                 Physics = physics,
@@ -7282,18 +7302,36 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>Bump the persistent glow on every edge incident to a node
+    /// without spawning new electric arcs. Used when arc spawn is throttled
+    /// so the trail still extends for repeat hits.</summary>
+    private static void BumpEdgesIncident(PhysicsEngine physics, string nodeId, DateTime now)
+    {
+        foreach (var e in physics.Edges)
+        {
+            if (e.SourceId != nodeId && e.TargetId != nodeId) continue;
+            e.AccessIntensity = Math.Min(1.0, e.AccessIntensity + 0.4);
+            e.LastAccessedAt = now;
+        }
+    }
+
+    private const double ArcSpawnThrottleMs = 250.0;
+    private readonly Dictionary<string, DateTime> _lastArcSpawnByNode = new();
+
     /// <summary>
     /// Two-stage pulse decay so users actually have time to see what happened:
     ///   stage 1 — first 2.0 s after a hit: HOLD intensity at ≥ 0.55 (above the
     ///             "hot" threshold of 0.4) so the bright yellow core stays
     ///             visible long enough for the eye to lock on
-    ///   stage 2 — after that: exponential decay with 3.5 s half-life so the
-    ///             trail lingers but doesn't hang around forever
+    ///   stage 2 — after that: exponential decay with 2.9 s half-life so the
+    ///             trail fades from PulseHoldFloor (0.55) down to the visibility
+    ///             floor (0.05) over ~10 s — total visible window 2 s + 10 s = 12 s
     /// Half-life alone (2.5 s) gave a sub-1 s window above the hot threshold,
     /// which is why MCP pulses felt like flicker.
     /// </summary>
     private const double PulseHoldSeconds = 2.0;
     private const double PulseHoldFloor = 0.55;
+    private const double PulseDecayHalfLife = 2.9;
     /// <summary>
     /// Decide whether the 2D view needs a repaint this frame. Returns true
     /// if the graph still has kinetic energy, any node is in a lifecycle
@@ -7355,8 +7393,10 @@ public partial class MainWindow : Window
 
     private static void DecayPulses(PhysicsEngine physics, double dt)
     {
-        var factor = Math.Pow(0.5, dt / 3.5);
+        var factor = Math.Pow(0.5, dt / PulseDecayHalfLife);
         var now = DateTime.UtcNow;
+
+        // Nodes — same plateau + fade pattern.
         foreach (var n in physics.Nodes)
         {
             if (n.AccessIntensity <= 0.001) { n.AccessIntensity = 0; continue; }
@@ -7368,6 +7408,23 @@ public partial class MainWindow : Window
             else
             {
                 n.AccessIntensity *= factor;
+            }
+        }
+
+        // Edges — same scheme so a recently-used connection glows for the
+        // same 2 s plateau then fades over ~10 s, instead of relying on the
+        // 2.4 s ElectricArc flash alone (which read as flicker on bursts).
+        foreach (var ed in physics.Edges)
+        {
+            if (ed.AccessIntensity <= 0.001) { ed.AccessIntensity = 0; continue; }
+            var ageSec = (now - ed.LastAccessedAt).TotalSeconds;
+            if (ageSec < PulseHoldSeconds)
+            {
+                if (ed.AccessIntensity < PulseHoldFloor) ed.AccessIntensity = PulseHoldFloor;
+            }
+            else
+            {
+                ed.AccessIntensity *= factor;
             }
         }
     }

@@ -94,6 +94,13 @@ public class PhysicsEdge
     public string RelationType { get; set; } = "wiki-link";
     public bool IsAuto => RelationType.StartsWith("auto", StringComparison.Ordinal);
 
+    /// <summary>Activity glow — bumped when an arc fires along this edge,
+    /// decayed by the same plateau+fade scheme as PhysicsNode.AccessIntensity.
+    /// Lets the renderer paint a persistent "trail" along recently-used
+    /// edges, separate from the short-lived ElectricArc flash.</summary>
+    public double AccessIntensity { get; set; }
+    public DateTime LastAccessedAt { get; set; } = DateTime.MinValue;
+
     /// <summary>Edge formation animation — null = pre-existing.</summary>
     public DateTime? BirthAt { get; set; }
 
