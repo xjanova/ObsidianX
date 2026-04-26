@@ -53,6 +53,18 @@ public sealed class CoPilotOrchestrator
     /// pegging the disk.</summary>
     public TimeSpan VerdictPollInterval { get; init; } = TimeSpan.FromSeconds(3);
 
+    /// <summary>Optional. Self-improvement loop's CAPTURE side. When set,
+    /// any task that ends with status=Done after at least one revise
+    /// round triggers extraction of generalisable lessons saved as
+    /// markdown notes under Notes/Coding-Lessons/. Future tasks pick
+    /// these up via the Injector.</summary>
+    public LessonExtractor? Extractor { get; init; }
+
+    /// <summary>Optional. Self-improvement loop's INJECT side. Before
+    /// the first worker call, look up brain lessons matching the user's
+    /// spec and prepend them to the worker's lessons[] payload.</summary>
+    public LessonInjector? Injector { get; init; }
+
     public OrchestrationOptions Options { get; init; } = new();
 
     /// <summary>Run one orchestrated task end-to-end. Always returns a
@@ -110,6 +122,26 @@ public sealed class CoPilotOrchestrator
             return new TaskRunResult { TaskId = taskId, Status = TaskRunStatus.Failed, Started = started, Ended = DateTime.UtcNow, Error = ex.Message };
         }
 
+        // ─── Phase 1.5 (Phase 1D inject): brain-derived lessons ───────
+        // Pull prior lessons matching this spec from the brain. Prepend
+        // them to the worker's lessons[] payload — they ride alongside
+        // any revise notes the reviewer accumulates within this run.
+        IReadOnlyList<string> brainLessons = Array.Empty<string>();
+        if (Injector != null)
+        {
+            try
+            {
+                brainLessons = Injector.SuggestForSpec(userSpec);
+                if (brainLessons.Count > 0)
+                    progress?.Report(new LessonsInjected(DateTime.UtcNow, brainLessons.Count));
+            }
+            catch
+            {
+                // Injection is best-effort; never fail a task on it.
+                brainLessons = Array.Empty<string>();
+            }
+        }
+
         // ─── Phase 2 + 3: worker codes, optional reviewer in a loop ───
         //
         // When ReviewQueue is configured, this loop runs until:
@@ -122,6 +154,7 @@ public sealed class CoPilotOrchestrator
         // exits as soon as the worker returns — preserving the original
         // Phase 1B behaviour for callers that opted out.
         var revisionLessons = new List<string>();
+        var rounds = new List<RoundRecord>(); // for lesson extraction post-Done
         string workerOutput = "";
         ReviewItem? lastVerdict = null;
         int round = 1;
@@ -137,10 +170,17 @@ public sealed class CoPilotOrchestrator
             {
                 progress?.Report(new WorkerStarted(DateTime.UtcNow, cluadeSessionId, round));
                 int remainingMs = Math.Max(5_000, (int)Math.Min(int.MaxValue, (Options.MaxWallClock - sw.Elapsed).TotalMilliseconds));
+
+                // Combine brain-derived lessons (constant for the whole
+                // task) with this run's revise notes (grow per round).
+                // Brain lessons go FIRST so the worker reads timeless
+                // guidance before this run's specific corrections.
+                var combined = brainLessons.Concat(revisionLessons).ToList();
+
                 workerOutput = await Worker.WriteCodeAsync(
                     cluadeSessionId,
                     workerSpec,
-                    lessons: revisionLessons.Count > 0 ? revisionLessons : null,
+                    lessons: combined.Count > 0 ? combined : null,
                     contextFiles: plan.Files,
                     workingDirectory: workingDirectory,
                     timeoutMs: remainingMs,
@@ -162,7 +202,12 @@ public sealed class CoPilotOrchestrator
 
             // ─── Review (optional) ───────────────────────────────────
             if (ReviewQueue is null)
-                break; // Phase 1B behaviour — done after worker
+            {
+                // No review path — record this round (with no verdict
+                // notes since there's no reviewer) and exit.
+                rounds.Add(new RoundRecord(round, workerOutput, null));
+                break;
+            }
 
             try
             {
@@ -207,6 +252,10 @@ public sealed class CoPilotOrchestrator
             }
 
             lastVerdict = verdict;
+            // Capture this round's full record now that we know the
+            // reviewer's verdict notes — the lesson extractor needs the
+            // pair (output, verdict) per round to learn from.
+            rounds.Add(new RoundRecord(round, workerOutput, verdict.VerdictNotes));
             progress?.Report(new ReviewVerdict(DateTime.UtcNow, verdict.Verdict ?? verdict.Status, verdict.VerdictNotes, round));
 
             string verdictKind = (verdict.Verdict ?? verdict.Status ?? "").ToLowerInvariant();
@@ -233,6 +282,31 @@ public sealed class CoPilotOrchestrator
         }
 
         sw.Stop();
+
+        // ─── Phase 4 (Phase 1D capture): extract lessons ─────────────
+        // Only meaningful when there was at least one revise round —
+        // a single approved round has no negative example to learn from.
+        // Best-effort: extraction failure must not change the run's
+        // success status.
+        if (Extractor != null && rounds.Count >= 2)
+        {
+            try
+            {
+                var finalNotes = lastVerdict?.VerdictNotes ?? "";
+                var saved = await Extractor.ExtractAndSaveAsync(taskId, plan, rounds, finalNotes, ct);
+                if (saved.Count > 0)
+                {
+                    progress?.Report(new LessonsCaptured(DateTime.UtcNow, saved.Count, saved.Select(s => s.Path).ToList()));
+                }
+            }
+            catch (Exception ex)
+            {
+                // Don't surface as OrchestratorError — that would imply
+                // the run failed. Just log a soft notice.
+                progress?.Report(new LessonsCaptured(DateTime.UtcNow, 0, [$"extraction failed: {ex.Message}"]));
+            }
+        }
+
         progress?.Report(new OrchestratorFinished(DateTime.UtcNow, TaskRunStatus.Done));
         return new TaskRunResult
         {
@@ -473,5 +547,13 @@ public sealed record ReviewSubmitted(DateTime Ts, string TaskId, int Round) : Or
 /// with verdict colour-coded + notes. <c>Verdict</c> is one of approved /
 /// revise / rejected.</summary>
 public sealed record ReviewVerdict(DateTime Ts, string Verdict, string? Notes, int Round) : OrchestrationEvent(Ts);
+/// <summary>Brain-derived lessons were prepended to the worker prompt.
+/// Surfaces as a small status bubble so the user knows the worker is
+/// running with prior corrections in scope.</summary>
+public sealed record LessonsInjected(DateTime Ts, int Count) : OrchestrationEvent(Ts);
+/// <summary>Lesson extractor finished — surfaces a celebratory bubble
+/// when new generalisable lessons land in Notes/Coding-Lessons/.
+/// <c>Count</c> = files written (0 means nothing generalisable found).</summary>
+public sealed record LessonsCaptured(DateTime Ts, int Count, IReadOnlyList<string> Paths) : OrchestrationEvent(Ts);
 public sealed record OrchestratorError(DateTime Ts, string Phase, string Message) : OrchestrationEvent(Ts);
 public sealed record OrchestratorFinished(DateTime Ts, TaskRunStatus Status) : OrchestrationEvent(Ts);

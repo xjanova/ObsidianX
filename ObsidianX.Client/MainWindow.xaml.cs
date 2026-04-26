@@ -4316,6 +4316,16 @@ public partial class MainWindow : Window
             // (no reviewer), we'd null this out — for the comprehensive
             // flow, every Co-Pilot Arena task goes through review.
             ReviewQueue = new ReviewQueueClient(_vaultPath),
+            // Self-improvement loop (Phase 1D). Both sides plug in here:
+            //   • Injector reads existing #coding-lesson notes from the
+            //     brain-export and prepends matching ones to the worker's
+            //     lessons[].
+            //   • Extractor takes the round-record + reviewer notes after
+            //     a successful run with revisions and asks the local LLM
+            //     to distil generalisable principles into new lesson notes.
+            //  Both are best-effort — failures don't abort the orchestration.
+            Injector = new LessonInjector(_vaultPath),
+            Extractor = new LessonExtractor(_vaultPath, CallLocalLlmRawAsync),
             VerdictPollInterval = TimeSpan.FromSeconds(3),
             // Bigger wall-clock for review-enabled runs because the
             // reviewer is human-paced and may take a few minutes to read
@@ -4333,22 +4343,33 @@ public partial class MainWindow : Window
 
     private async Task<InternPlan> PlanWithLocalInternAsync(string userSpec, CancellationToken ct)
     {
-        // Match what AskClaude_Click does — read backend + model from the
-        // dropdowns, send via the local server's /api/ai/chat endpoint.
-        // We deliberately don't stream: we need the whole reply before we
-        // can parse the plan JSON.
+        var raw = await CallLocalLlmRawAsync(
+            CoPilotOrchestrator.BuildPlannerPrompt(userSpec), ct);
+        return InternPlan.ParseFromLlm(raw);
+    }
+
+    /// <summary>
+    /// Send a raw prompt to <c>/api/ai/chat</c> using the user's
+    /// currently selected backend + model. Used by both the planner
+    /// (round-tripped through <see cref="CoPilotOrchestrator.BuildPlannerPrompt"/>)
+    /// and the lesson extractor (its own structured prompt). Centralised
+    /// here so timeout, backend selection, and HTTP plumbing stay in
+    /// one place.
+    /// </summary>
+    private async Task<string> CallLocalLlmRawAsync(string prompt, CancellationToken ct)
+    {
         var backend = (AiBackendCombo?.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "ollama";
         var model = (AiModelCombo?.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "llama3.2:3b";
 
-        // 4-minute ceiling on the intern step. Thinking models like
+        // 4-minute ceiling on each LLM call. Thinking models like
         // deepseek-r1 routinely run 90-180s on planning prompts; a 2-min
         // timeout was too tight and aborted a perfectly-healthy planner
         // run during smoke testing. The orchestrator's own MaxWallClock
-        // (5 min total) still bounds the whole pipeline.
+        // (20 min total when review is on) still bounds the whole pipeline.
         using var http = BuildLocalHttpClient(TimeSpan.FromMinutes(4));
         var payload = Newtonsoft.Json.JsonConvert.SerializeObject(new
         {
-            message = CoPilotOrchestrator.BuildPlannerPrompt(userSpec),
+            message = prompt,
             backend,
             model,
         });
@@ -4361,8 +4382,7 @@ public partial class MainWindow : Window
         resp.EnsureSuccessStatusCode();
         var json = await resp.Content.ReadAsStringAsync(ct);
         var obj = Newtonsoft.Json.Linq.JObject.Parse(json);
-        var raw = obj["reply"]?.ToString() ?? "";
-        return InternPlan.ParseFromLlm(raw);
+        return obj["reply"]?.ToString() ?? "";
     }
 
     private async void SendToArena_Click(object sender, RoutedEventArgs e)
@@ -4490,6 +4510,33 @@ public partial class MainWindow : Window
                         : rv.Notes;
                     AppendArenaBubble(kind, $"{emoji} Reviewer · {rv.Verdict} (round {rv.Round})",
                         body, taskId: null);
+                    break;
+                }
+            case LessonsInjected li:
+                AppendArenaBubble(BubbleKind.Status, "📚 Lessons injected",
+                    $"Pulled {li.Count} prior lesson{(li.Count == 1 ? "" : "s")} from the brain " +
+                    $"(#coding-lesson notes matching the spec) and prepended to the worker's prompt. " +
+                    "The worker reads them as guidance before its own iteration.",
+                    taskId: null);
+                break;
+            case LessonsCaptured lc:
+                {
+                    if (lc.Count > 0)
+                    {
+                        var fileList = string.Join("\n", lc.Paths.Select(p => "  • " + p));
+                        AppendArenaBubble(BubbleKind.Intern, $"💡 Captured {lc.Count} lesson{(lc.Count == 1 ? "" : "s")}",
+                            $"The reviewer-driven revisions taught the system something generalisable. " +
+                            $"Saved as #coding-lesson note{(lc.Count == 1 ? "" : "s")}:\n{fileList}\n\n" +
+                            "Next similar task will inject these automatically.",
+                            taskId: null);
+                    }
+                    else if (lc.Paths.Count > 0)
+                    {
+                        // Soft-failure path: extractor reported 0 lessons
+                        // but logged a reason in Paths[0].
+                        AppendArenaBubble(BubbleKind.Status, "📚 Lesson extraction skipped",
+                            lc.Paths[0], taskId: null);
+                    }
                     break;
                 }
             case OrchestratorError err:
