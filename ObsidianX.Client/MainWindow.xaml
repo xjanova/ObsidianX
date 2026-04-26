@@ -284,7 +284,10 @@
                                             Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Vault"/>
                                     <Button x:Name="NavSearch" Content="&#x1F50D;  Search"
                                             Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Search"/>
-                                    <Button x:Name="NavClaude" Content="&#x1F916;  Claude AI"
+                                    <!-- Renamed from "Claude AI" → "AI Chat" in Phase 0 of the
+                                         Co-Pilot Arena rollout. Tag="Claude" stays so all
+                                         existing Nav_Click routing in code-behind keeps working. -->
+                                    <Button x:Name="NavClaude" Content="&#x1F4AC;  AI Chat"
                                             Style="{StaticResource NavButton}" Click="Nav_Click" Tag="Claude"/>
 
                                     <Button x:Name="NavGrowth" Content="&#x1F4C8;  Growth"
@@ -686,6 +689,16 @@
                                                     Padding="10,3" FontSize="10"
                                                     Click="GraphExpertiseToggle_Click" Margin="0,0,6,0"
                                                     ToolTip="Toggle the expertise profile overlay"/>
+                                            <!-- Live brain-activity overlay. Tails ~/.claude/tool-log.ndjson
+                                                 and shows what the brain is reading / writing right now,
+                                                 colour-coded by op kind. Mirrors the expertise overlay's
+                                                 glassmorphism style but pinned to the LEFT of the graph. -->
+                                            <Button x:Name="GraphActivityToggleBtn"
+                                                    Content="&#x1F4E1; Activity"
+                                                    Style="{StaticResource NeonButton}"
+                                                    Padding="10,3" FontSize="10"
+                                                    Click="GraphActivityToggle_Click" Margin="0,0,6,0"
+                                                    ToolTip="Toggle the live brain-activity overlay (reads/writes/tool calls)"/>
                                             <!-- Token savings gauge — hover for breakdown by op.
                                                  Runs Compute() on the access-log every ~5s and shows
                                                  net saved tokens. Click to toggle bypass (pauses the
@@ -887,6 +900,182 @@
                                                         Stretch="UniformToFill" Opacity="0.35"/>
                                         </Border.Background>
                                         <services:Graph2DRenderer x:Name="FullGraph2D"/>
+                                    </Border>
+
+                                    <!-- Glassmorphism Activity overlay for Brain Graph view.
+                                         Tails the tool-log NDJSON + indexer events; shows the
+                                         brain's live read/write/tool ops, colour-coded. Pinned
+                                         LEFT (mirror of the Expertise overlay on the right).
+                                         Toggled by the "📡 Activity" toolbar button. -->
+                                    <Border x:Name="GraphActivityHost" Grid.Row="1"
+                                            HorizontalAlignment="Left" VerticalAlignment="Stretch"
+                                            Margin="16,16,0,16" Width="380" MaxHeight="760"
+                                            CornerRadius="14" Padding="0"
+                                            Visibility="Collapsed" IsHitTestVisible="True">
+                                        <Border.Background>
+                                            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                                                <GradientStop Offset="0" Color="#55101820"/>
+                                                <GradientStop Offset="1" Color="#33060A10"/>
+                                            </LinearGradientBrush>
+                                        </Border.Background>
+                                        <Border.BorderBrush>
+                                            <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                                                <GradientStop Offset="0" Color="#55FFFFFF"/>
+                                                <GradientStop Offset="1" Color="#11FFFFFF"/>
+                                            </LinearGradientBrush>
+                                        </Border.BorderBrush>
+                                        <Border.BorderThickness>1</Border.BorderThickness>
+                                        <Border.Effect>
+                                            <DropShadowEffect BlurRadius="24" ShadowDepth="0"
+                                                              Color="#000000" Opacity="0.45"/>
+                                        </Border.Effect>
+                                        <Grid>
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto"/>      <!-- 0: title -->
+                                                <RowDefinition Height="Auto"/>      <!-- 1: filter bar -->
+                                                <RowDefinition Height="Auto"/>      <!-- 2: compact summary (capped) -->
+                                                <RowDefinition Height="Auto"/>      <!-- 3: console section header -->
+                                                <RowDefinition Height="*"/>         <!-- 4: console feed (scroll) -->
+                                                <RowDefinition Height="Auto"/>      <!-- 5: footer -->
+                                            </Grid.RowDefinitions>
+                                            <!-- Header row: title + close button -->
+                                            <Grid Grid.Row="0" Margin="16,14,16,8">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                                    <Ellipse x:Name="ActivityPulse" Width="8" Height="8"
+                                                             Fill="#5DFF9D" Margin="0,0,8,0"
+                                                             VerticalAlignment="Center">
+                                                        <Ellipse.Effect>
+                                                            <DropShadowEffect BlurRadius="10" ShadowDepth="0"
+                                                                              Color="#5DFF9D" Opacity="0.9"/>
+                                                        </Ellipse.Effect>
+                                                    </Ellipse>
+                                                    <TextBlock Text="BRAIN ACTIVITY" FontSize="11"
+                                                               FontWeight="SemiBold"
+                                                               Foreground="{StaticResource TextMutedBrush}"
+                                                               VerticalAlignment="Center"/>
+                                                </StackPanel>
+                                                <Button Grid.Column="1" Content="&#x2715;"
+                                                        FontSize="11" Padding="6,2"
+                                                        Background="Transparent"
+                                                        BorderThickness="0"
+                                                        Foreground="{StaticResource TextMutedBrush}"
+                                                        Click="GraphActivityToggle_Click"
+                                                        ToolTip="Hide activity overlay"/>
+                                            </Grid>
+                                            <!-- Filter bar: read | write | other  +  per-second rate -->
+                                            <StackPanel Grid.Row="1" Orientation="Horizontal"
+                                                        Margin="16,0,16,8">
+                                                <CheckBox x:Name="ActivityFilterRead" Content="📖 read"
+                                                          IsChecked="True" FontSize="10"
+                                                          Foreground="#5DFF9D" Margin="0,0,8,0"
+                                                          Click="GraphActivityFilterChanged"/>
+                                                <CheckBox x:Name="ActivityFilterWrite" Content="✏ write"
+                                                          IsChecked="True" FontSize="10"
+                                                          Foreground="#FFB347" Margin="0,0,8,0"
+                                                          Click="GraphActivityFilterChanged"/>
+                                                <CheckBox x:Name="ActivityFilterOther" Content="🔧 other"
+                                                          IsChecked="False" FontSize="10"
+                                                          Foreground="{StaticResource TextMutedBrush}"
+                                                          Margin="0,0,8,0"
+                                                          Click="GraphActivityFilterChanged"/>
+                                                <TextBlock x:Name="ActivityRateText"
+                                                           Text="0/min"
+                                                           FontSize="10"
+                                                           FontFamily="{StaticResource MonoFont}"
+                                                           Foreground="{StaticResource TextMutedBrush}"
+                                                           VerticalAlignment="Center"
+                                                           HorizontalAlignment="Right"/>
+                                            </StackPanel>
+                                            <!-- Compact summary (capped to ~30 most recent, newest on top).
+                                                 Good for at-a-glance "what's the brain busy with right now?" -->
+                                            <ScrollViewer Grid.Row="2"
+                                                          MaxHeight="180"
+                                                          VerticalScrollBarVisibility="Auto"
+                                                          HorizontalScrollBarVisibility="Disabled"
+                                                          Padding="8,0,8,4" CanContentScroll="False"
+                                                          PanningMode="VerticalOnly">
+                                                <StackPanel x:Name="GraphActivityPanel"/>
+                                            </ScrollViewer>
+
+                                            <!-- Section divider + collapse toggle for the detailed console.
+                                                 The console is the "live tail" — chronological, monospace,
+                                                 sticky-bottom auto-scroll. Cap at 300 lines for perf. -->
+                                            <Grid Grid.Row="3" Margin="16,8,16,4">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                                    <TextBlock Text="📜 DETAILED CONSOLE" FontSize="10"
+                                                               FontWeight="SemiBold"
+                                                               Foreground="{StaticResource TextMutedBrush}"
+                                                               VerticalAlignment="Center"/>
+                                                    <TextBlock x:Name="ActivityConsoleCount"
+                                                               Text="0 lines"
+                                                               FontSize="9"
+                                                               FontFamily="{StaticResource MonoFont}"
+                                                               Foreground="{StaticResource TextMutedBrush}"
+                                                               VerticalAlignment="Center" Margin="8,0,0,0"
+                                                               Opacity="0.7"/>
+                                                </StackPanel>
+                                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                                    <CheckBox x:Name="ActivityConsoleStickyBottom"
+                                                              Content="📌 stick to bottom"
+                                                              IsChecked="True" FontSize="9"
+                                                              Foreground="{StaticResource TextMutedBrush}"
+                                                              VerticalAlignment="Center" Margin="0,0,8,0"
+                                                              ToolTip="When checked, new lines auto-scroll into view. Uncheck to read history without being yanked back."/>
+                                                    <Button x:Name="ActivityConsolePauseBtn"
+                                                            Content="⏸ Pause"
+                                                            FontSize="9" Padding="6,2"
+                                                            Background="Transparent" BorderThickness="0"
+                                                            Foreground="{StaticResource TextMutedBrush}"
+                                                            Click="GraphActivityConsolePause_Click"
+                                                            ToolTip="Pause the live tail (file polling stops; resume to catch up)"/>
+                                                </StackPanel>
+                                            </Grid>
+                                            <!-- The console itself. ScrollViewer wraps a StackPanel that we
+                                                 APPEND to (no full rebuild per tick, no virtualization
+                                                 needed for 300 cap). ScrollChanged tracks whether the user
+                                                 has detached from the bottom so we don't yank them back. -->
+                                            <Border Grid.Row="4" Margin="14,0,14,4" CornerRadius="6"
+                                                    Background="#0D000208" BorderThickness="1"
+                                                    BorderBrush="#22FFFFFF">
+                                                <ScrollViewer x:Name="GraphActivityConsoleScroll"
+                                                              VerticalScrollBarVisibility="Auto"
+                                                              HorizontalScrollBarVisibility="Disabled"
+                                                              Padding="6,4,6,4"
+                                                              CanContentScroll="False"
+                                                              PanningMode="VerticalOnly"
+                                                              ScrollChanged="GraphActivityConsoleScroll_Changed">
+                                                    <StackPanel x:Name="GraphActivityConsolePanel"/>
+                                                </ScrollViewer>
+                                            </Border>
+                                            <!-- Footer: clear + path tooltip -->
+                                            <Grid Grid.Row="5" Margin="14,4,14,12">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <Button Content="Clear" FontSize="9" Padding="6,2"
+                                                        Background="Transparent" BorderThickness="0"
+                                                        Foreground="{StaticResource TextMutedBrush}"
+                                                        Click="GraphActivityClear_Click"
+                                                        ToolTip="Clear the displayed log (does not touch the file)"/>
+                                                <TextBlock Grid.Column="2"
+                                                           Text="~/.claude/tool-log.ndjson"
+                                                           FontSize="9"
+                                                           FontFamily="{StaticResource MonoFont}"
+                                                           Foreground="{StaticResource TextMutedBrush}"
+                                                           VerticalAlignment="Center"
+                                                           ToolTip="Source of brain tool-call activity"/>
+                                            </Grid>
+                                        </Grid>
                                     </Border>
 
                                     <!-- Glassmorphism Expertise overlay for Brain Graph view.
@@ -1118,7 +1307,7 @@
                             </Grid>
                         </Grid>
 
-                        <!-- Claude AI View -->
+                        <!-- AI Chat View (formerly "Claude AI") -->
                         <Grid x:Name="ClaudeView" Visibility="Collapsed">
                             <Grid Margin="24,16">
                                 <Grid.RowDefinitions>
@@ -1127,8 +1316,80 @@
                                     <RowDefinition Height="Auto"/>
                                 </Grid.RowDefinitions>
                                 <StackPanel Margin="0,0,0,16">
-                                    <TextBlock Text="AI Brain Assistant" FontSize="24" FontWeight="Bold"
-                                               Foreground="{StaticResource TextPrimaryBrush}" Margin="0,0,0,4"/>
+                                    <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                                        <TextBlock Text="AI Chat" FontSize="24" FontWeight="Bold"
+                                                   Foreground="{StaticResource TextPrimaryBrush}"/>
+                                        <!-- Mode selector. Solo = today's behaviour (one model
+                                             talks to the user). Co-Pilot Arena = orchestrated
+                                             via the CluadeX bridge (named pipe \\.\pipe\cluadex-mcp).
+                                             Both items are now selectable; the bridge tester
+                                             below validates connectivity before sending. -->
+                                        <ComboBox x:Name="AiChatModeCombo" Width="220" FontSize="11" Margin="20,4,0,0"
+                                                  VerticalAlignment="Center" SelectedIndex="0"
+                                                  ToolTip="Solo: chat with one model. Co-Pilot Arena: delegate to CluadeX worker via named pipe.">
+                                            <ComboBoxItem Content="Solo (one model)"/>
+                                            <ComboBoxItem Content="🤝 Co-Pilot Arena (CluadeX bridge)"/>
+                                        </ComboBox>
+                                    </StackPanel>
+                                    <!-- ─── CluadeX bridge tester ───────────────────────────
+                                         Smoke-test the named-pipe connection before sending a
+                                         real task. Status dot reflects last ping; "Ping" hits
+                                         the server's `ping` method (no agent run, cheap), and
+                                         "Send test prompt" runs cluadex.write_code with a tiny
+                                         spec so the user can verify a chat session pops up in
+                                         CluadeX's UI. The chip is hidden when CluadeX isn't
+                                         installed (auth-token file missing). -->
+                                    <Border x:Name="CluadeXBridgePanel"
+                                            Background="#220B0B1A"
+                                            BorderBrush="{StaticResource NeonCyanBrush}"
+                                            BorderThickness="1" CornerRadius="8"
+                                            Margin="0,8,0,0" Padding="12,8">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Orientation="Horizontal" Grid.Column="0"
+                                                        VerticalAlignment="Center">
+                                                <Ellipse x:Name="CluadeXBridgeDot" Width="8" Height="8"
+                                                         Fill="#664444" Margin="0,0,8,0"
+                                                         VerticalAlignment="Center"/>
+                                                <TextBlock Text="🌉 CluadeX bridge" FontSize="11"
+                                                           FontWeight="SemiBold"
+                                                           Foreground="{StaticResource NeonCyanBrush}"
+                                                           VerticalAlignment="Center" Margin="0,0,10,0"/>
+                                            </StackPanel>
+                                            <TextBlock Grid.Column="1"
+                                                       x:Name="CluadeXBridgeStatusText"
+                                                       Text="not connected — click Ping to probe \\.\pipe\cluadex-mcp"
+                                                       FontSize="10"
+                                                       Foreground="{StaticResource TextSecondaryBrush}"
+                                                       VerticalAlignment="Center" TextWrapping="Wrap"/>
+                                            <StackPanel Grid.Column="2" Orientation="Horizontal">
+                                                <Button x:Name="CluadeXBridgePingBtn"
+                                                        Content="📡 Ping"
+                                                        Style="{StaticResource NeonButton}"
+                                                        Padding="10,3" FontSize="10"
+                                                        Click="CluadeXBridgePing_Click"
+                                                        Margin="0,0,6,0"
+                                                        ToolTip="Send a no-op ping to verify the CluadeX named-pipe is reachable + auth token matches"/>
+                                                <Button x:Name="CluadeXBridgeAlignBtn"
+                                                        Content="🎯 Align"
+                                                        Style="{StaticResource NeonButton}"
+                                                        Padding="10,3" FontSize="10"
+                                                        Click="CluadeXBridgeAlign_Click"
+                                                        Margin="0,0,6,0"
+                                                        ToolTip="Force CluadeX to load the same provider+model as ObsidianX — frees the previous GGUF weights from VRAM if needed"/>
+                                                <Button x:Name="CluadeXBridgeTestBtn"
+                                                        Content="🧪 Test prompt"
+                                                        Style="{StaticResource NeonButton}"
+                                                        Padding="10,3" FontSize="10"
+                                                        Click="CluadeXBridgeTest_Click"
+                                                        ToolTip="Send a tiny test spec via cluadex.write_code — a new chat session should pop up in CluadeX's UI"/>
+                                            </StackPanel>
+                                        </Grid>
+                                    </Border>
                                     <TextBlock x:Name="ClaudeViewStatus" Text="Checking..." FontSize="12"
                                                Foreground="{StaticResource TextSecondaryBrush}"/>
                                     <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
@@ -1286,7 +1547,7 @@
                                     <ScrollViewer VerticalScrollBarVisibility="Auto">
                                         <TextBlock x:Name="ClaudeOutput" TextWrapping="Wrap" FontSize="13"
                                                    Foreground="{StaticResource TextPrimaryBrush}"
-                                                   Text="Welcome to ObsidianX + Claude AI.&#x0A;&#x0A;Your vault is Claude's 'second brain'. Type below to ask Claude about your knowledge..."/>
+                                                   Text="Welcome to ObsidianX AI Chat.&#x0A;&#x0A;Solo mode: chat with the selected model (Ollama / NIM / OpenRouter / DeepSeek), grounded on your vault.&#x0A;&#x0A;Co-Pilot Arena (Phase 1) will let a local model and Claude collaborate on tasks here, with both wired into the brain MCP."/>
                                     </ScrollViewer>
                                 </Border>
                                 <Grid Grid.Row="2">

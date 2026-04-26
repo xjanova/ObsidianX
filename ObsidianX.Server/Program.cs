@@ -4,6 +4,13 @@ using ObsidianX.Core.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Force-enable static web assets in any environment (Development OR
+// Production). WebApplication.CreateBuilder only auto-enables this in
+// Development, which would mean the bundled wwwroot/index.html dashboard
+// 404s when the server is launched with no ASPNETCORE_ENVIRONMENT
+// (the default for a self-launched native EXE).
+builder.WebHost.UseStaticWebAssets();
+
 builder.Services.AddSignalR();
 builder.Services.AddCors(options =>
 {

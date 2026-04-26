@@ -144,6 +144,24 @@ public class Graph2DRenderer : FrameworkElement
     private readonly Dictionary<(int, int), (double t, Color tint)> _activeEdgeMap = new();
     private readonly HashSet<int> _activeNodeSet = new();
 
+    // ─── Node-glow fade-out (per-frame ageing keyed by node ID) ────────
+    // When a node is hit by an arc we set its remaining fade time to
+    // NodeFadeDurationSec. Each subsequent frame we subtract the wall-clock
+    // delta so the halo dims gracefully instead of blinking off the moment
+    // the arc finishes. Keyed by Id (string) — physics index is unstable
+    // when nodes are added/removed between frames.
+    private readonly Dictionary<string, double> _nodeFadeRemaining = new(64);
+    private DateTime _lastFadeTickUtc = DateTime.UtcNow;
+    /// <summary>How long after an arc-touch the halo takes to fully fade.
+    /// 1.2s reads as "I just lit up" without leaving stale ghosts on busy
+    /// graphs where 5+ arcs fire per second.</summary>
+    private const double NodeFadeDurationSec = 1.2;
+
+    /// <summary>True while at least one node is mid-fade. The MainWindow's
+    /// per-frame redraw gate consults this so an idle physics graph still
+    /// gets InvalidateVisual'd until every halo has fully dimmed.</summary>
+    public bool HasActiveFade => _nodeFadeRemaining.Count > 0;
+
     /// <summary>Premultiplied BGRA32 packed as 0xAARRGGBB.</summary>
     private static uint Premultiplied(byte a, byte r, byte g, byte b)
     {
@@ -213,6 +231,14 @@ public class Graph2DRenderer : FrameworkElement
             // and re-spawn on user clicks.
             _activeEdgeMap.Clear();
             _activeNodeSet.Clear();
+
+            // Wall-clock delta for fade-out. Clamped at 0.5s so a frame
+            // stall (e.g. window minimised then restored) doesn't snap
+            // every halo to zero in one frame.
+            var nowUtc = DateTime.UtcNow;
+            double dt = Math.Min(0.5, (nowUtc - _lastFadeTickUtc).TotalSeconds);
+            _lastFadeTickUtc = nowUtc;
+
             if (Arcs != null)
             {
                 foreach (var (srcId, tgtId, t, tint) in Arcs)
@@ -228,6 +254,28 @@ public class Graph2DRenderer : FrameworkElement
                         _activeEdgeMap[key] = (t, tint);
                     _activeNodeSet.Add(si);
                     _activeNodeSet.Add(ti);
+                }
+            }
+
+            // ─── Fade-out bookkeeping ──────────────────────────────────
+            // Refresh fade timer for any node currently touched by a live
+            // arc, then decay every tracked entry by the wall-clock delta.
+            // Removed when remaining ≤ 0 so the dictionary never grows
+            // unbounded on long sessions.
+            foreach (var idx in _activeNodeSet)
+            {
+                if (idx >= 0 && idx < nodes.Count)
+                    _nodeFadeRemaining[nodes[idx].Id] = NodeFadeDurationSec;
+            }
+            if (_nodeFadeRemaining.Count > 0)
+            {
+                // Snapshot keys because we can't mutate a dictionary while iterating.
+                var snapshot = _nodeFadeRemaining.Keys.ToArray();
+                foreach (var id in snapshot)
+                {
+                    var rem = _nodeFadeRemaining[id] - dt;
+                    if (rem <= 0) _nodeFadeRemaining.Remove(id);
+                    else _nodeFadeRemaining[id] = rem;
                 }
             }
 
@@ -299,16 +347,31 @@ public class Graph2DRenderer : FrameworkElement
                 int cx = (int)p.X;
                 int cy = (int)p.Y;
 
-                // Active-node mega-halo: when this node sits at either
-                // end of a blinking edge, paint a bright wide glow ring
-                // first so it reads as "I'm the one firing right now".
-                bool isActive = _activeNodeSet.Contains(i);
-                if (isActive)
+                // Active-node mega-halo with smooth fade-out.
+                // While an arc is touching this node we paint at full
+                // intensity. After the arc ends we keep painting for up
+                // to NodeFadeDurationSec, scaling the halo's alpha by the
+                // remaining fade ratio. The radius bonus also shrinks
+                // proportionally so a "dimming + retreating" cue reads
+                // naturally rather than the halo just thinning in place.
+                if (_nodeFadeRemaining.TryGetValue(n.Id, out var fadeRem))
                 {
-                    FillCircle(buf, stride, pxW, pxH, cx, cy, radius + 8,
-                        PackPbgra(110, Color.FromRgb(255, 255, 255)));
-                    FillCircle(buf, stride, pxW, pxH, cx, cy, radius + 5,
-                        PackPbgra(160, baseColor));
+                    // 0 = invisible, 1 = freshly active. Square the curve
+                    // so the halo lingers visibly then drops off quickly
+                    // at the tail (looks more organic than linear).
+                    double fade = fadeRem / NodeFadeDurationSec;
+                    fade = fade * fade;
+                    if (fade > 0.01)
+                    {
+                        byte outerA = (byte)(110 * fade);
+                        byte innerA = (byte)(160 * fade);
+                        double outerR = radius + 3.0 + 5.0 * fade;
+                        double innerR = radius + 2.0 + 3.0 * fade;
+                        FillCircle(buf, stride, pxW, pxH, cx, cy, outerR,
+                            PackPbgra(outerA, Color.FromRgb(255, 255, 255)));
+                        FillCircle(buf, stride, pxW, pxH, cx, cy, innerR,
+                            PackPbgra(innerA, baseColor));
+                    }
                 }
 
                 // Outer halo — bigger, semi-transparent, blends with the

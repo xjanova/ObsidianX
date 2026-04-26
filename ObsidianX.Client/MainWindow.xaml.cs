@@ -427,7 +427,10 @@ public partial class MainWindow : Window
                 // a static graph which is what made the stutter feel "always
                 // there" — now the dispatcher can yield and other UI work
                 // (e.g. typing in editor) gets responsive.
-                if (Needs2DRedraw(_dashPhysics, arcs))
+                // Also redraw while any node halo is mid-fade so the
+                // smooth dim-out animation can finish even after every
+                // arc has ended.
+                if (Needs2DRedraw(_dashPhysics, arcs) || DashGraph2D.HasActiveFade)
                     DashGraph2D.InvalidateVisual();
             }
             else
@@ -444,7 +447,7 @@ public partial class MainWindow : Window
                 FullGraph2D.SelectedIndex = _selectedNodeGraph;
                 var arcs = BuildArcSnapshot(_graphPhysics);
                 FullGraph2D.Arcs = arcs;
-                if (Needs2DRedraw(_graphPhysics, arcs))
+                if (Needs2DRedraw(_graphPhysics, arcs) || FullGraph2D.HasActiveFade)
                     FullGraph2D.InvalidateVisual();
             }
             else
@@ -3612,6 +3615,750 @@ public partial class MainWindow : Window
                 nowVisible ? "NeonButtonFilled" : "NeonButton");
     }
 
+    // ─── Brain Activity overlay ─────────────────────────────────────────
+    // Shows a live tail of brain ops (reads/writes/other tool calls) on the
+    // LEFT of the brain-graph viewport. Source of truth is the PostToolUse
+    // hook log at ~/.claude/tool-log.ndjson — a JSON Lines file that the
+    // hook in settings.json appends to on every tool invocation.
+    //
+    // Design notes:
+    //   • Polls the file size every 1.5s and reads only the new bytes →
+    //     no growing memory footprint, no full rescan.
+    //   • Caps the displayed list at MaxActivityRows. Older entries are
+    //     dropped from the UI (file is untouched; rotation is a separate
+    //     punch-list item).
+    //   • Filters (read/write/other) are applied at *render* time so
+    //     toggling them is instant and doesn't lose history.
+
+    private static readonly string ToolLogPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".claude", "tool-log.ndjson");
+    private long _activityFileOffset;
+    private DispatcherTimer? _activityTimer;
+    private readonly System.Collections.Generic.LinkedList<ActivityEntry> _activityEntries = new();
+    private const int MaxActivityRows = 120;
+
+    // ─── Console feed (chronological tail, sticky-bottom auto-scroll) ───
+    // Max child elements in GraphActivityConsolePanel. Tested at 300 with no
+    // visible jank up to ~30 entries/sec; if it lags on slower hardware,
+    // drop to 200 or switch to ListBox virtualisation.
+    private const int MaxConsoleRows = 300;
+    /// <summary>Append-only watermark — count of activity entries that have
+    /// already been rendered into the console panel. New entries past this
+    /// index are streamed in without rebuilding existing rows.</summary>
+    private int _consoleSyncedCount;
+    /// <summary>True when the user is at (or within tolerance of) the bottom
+    /// of the console scroll. Drives the sticky-bottom auto-scroll behaviour.</summary>
+    private bool _consoleAtBottom = true;
+    /// <summary>True when the user clicked Pause — the dispatcher timer is
+    /// stopped so no new lines are drained until they unpause.</summary>
+    private bool _consolePaused;
+
+    /// <summary>One row in the brain-activity overlay. Kept in a linked list so
+    /// trimming the oldest entry is O(1).</summary>
+    private sealed class ActivityEntry
+    {
+        public DateTime Ts;
+        public string Tool = "";
+        public string Mode = "";
+        public ActivityKind Kind;
+    }
+
+    private enum ActivityKind { Read, Write, Other }
+
+    /// <summary>Heuristic: classify a tool name into read/write/other. Brain-prefixed
+    /// tools take priority because the user cares mostly about brain ops.</summary>
+    private static ActivityKind ClassifyTool(string tool)
+    {
+        if (string.IsNullOrEmpty(tool)) return ActivityKind.Other;
+        // Brain-specific (highest priority for this overlay)
+        if (tool.StartsWith("brain_search", StringComparison.OrdinalIgnoreCase)
+            || tool.StartsWith("brain_get_", StringComparison.OrdinalIgnoreCase)
+            || tool.StartsWith("brain_list", StringComparison.OrdinalIgnoreCase)
+            || tool.StartsWith("brain_stats", StringComparison.OrdinalIgnoreCase)
+            || tool.StartsWith("brain_expertise", StringComparison.OrdinalIgnoreCase)
+            || tool.StartsWith("brain_semantic", StringComparison.OrdinalIgnoreCase)
+            || tool.StartsWith("brain_synthesize", StringComparison.OrdinalIgnoreCase)
+            || tool.StartsWith("brain_suggest", StringComparison.OrdinalIgnoreCase)
+            || tool.StartsWith("brain_find_", StringComparison.OrdinalIgnoreCase))
+            return ActivityKind.Read;
+        if (tool.StartsWith("brain_create", StringComparison.OrdinalIgnoreCase)
+            || tool.StartsWith("brain_append", StringComparison.OrdinalIgnoreCase)
+            || tool.StartsWith("brain_remember", StringComparison.OrdinalIgnoreCase)
+            || tool.StartsWith("brain_import", StringComparison.OrdinalIgnoreCase))
+            return ActivityKind.Write;
+        // Generic file/edit tools — nice context, but not brain ops
+        if (tool.Equals("Read", StringComparison.OrdinalIgnoreCase)
+            || tool.Equals("Glob", StringComparison.OrdinalIgnoreCase)
+            || tool.Equals("Grep", StringComparison.OrdinalIgnoreCase))
+            return ActivityKind.Read;
+        if (tool.Equals("Write", StringComparison.OrdinalIgnoreCase)
+            || tool.Equals("Edit", StringComparison.OrdinalIgnoreCase)
+            || tool.Equals("NotebookEdit", StringComparison.OrdinalIgnoreCase))
+            return ActivityKind.Write;
+        return ActivityKind.Other;
+    }
+
+    private void GraphActivityToggle_Click(object sender, RoutedEventArgs e)
+    {
+        if (GraphActivityHost == null) return;
+        var nowVisible = GraphActivityHost.Visibility != Visibility.Visible;
+        GraphActivityHost.Visibility = nowVisible ? Visibility.Visible : Visibility.Collapsed;
+        if (GraphActivityToggleBtn != null)
+            GraphActivityToggleBtn.Style = (Style)FindResource(
+                nowVisible ? "NeonButtonFilled" : "NeonButton");
+
+        if (nowVisible) StartActivityWatcher();
+        else StopActivityWatcher();
+    }
+
+    private void StartActivityWatcher()
+    {
+        // Seed with the existing log so the user sees recent ops immediately
+        // rather than an empty panel until the next tool call fires.
+        try
+        {
+            if (File.Exists(ToolLogPath))
+            {
+                using var fs = new FileStream(ToolLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var sr = new StreamReader(fs);
+                // Tail roughly the last 32 KB so we get ~50-200 recent entries
+                // without re-reading the whole file on every overlay open.
+                if (fs.Length > 32 * 1024) fs.Seek(-32 * 1024, SeekOrigin.End);
+                string? line;
+                while ((line = sr.ReadLine()) != null)
+                    TryAppendEntry(line);
+                _activityFileOffset = fs.Position;
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"activity-seed: {ex.Message}");
+        }
+        RenderActivity();
+        // Seed the console too — append everything we already have, then
+        // jump-scroll to the end so the user lands on the freshest line.
+        AppendConsoleNewEntries(forceJumpToEnd: true);
+
+        _activityTimer ??= new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1500) };
+        _activityTimer.Tick -= ActivityTimer_Tick;
+        _activityTimer.Tick += ActivityTimer_Tick;
+        _activityTimer.Start();
+    }
+
+    private void StopActivityWatcher()
+    {
+        _activityTimer?.Stop();
+    }
+
+    private void ActivityTimer_Tick(object? sender, EventArgs e)
+    {
+        if (_consolePaused) return;
+        try
+        {
+            if (!File.Exists(ToolLogPath)) return;
+            using var fs = new FileStream(ToolLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            // File may have been rotated/truncated externally — reset if so.
+            if (fs.Length < _activityFileOffset) _activityFileOffset = 0;
+            if (fs.Length == _activityFileOffset)
+            {
+                UpdateActivityRate();
+                return;
+            }
+            fs.Seek(_activityFileOffset, SeekOrigin.Begin);
+            using var sr = new StreamReader(fs);
+            string? line;
+            bool dirty = false;
+            while ((line = sr.ReadLine()) != null)
+            {
+                if (TryAppendEntry(line)) dirty = true;
+            }
+            _activityFileOffset = fs.Position;
+            if (dirty)
+            {
+                RenderActivity();
+                AppendConsoleNewEntries();
+                PulseActivityDot();
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"activity-tick: {ex.Message}");
+        }
+    }
+
+    /// <summary>Parse one NDJSON line, push to the front of the linked list.
+    /// Returns true if a new entry was actually appended (false on parse fail).</summary>
+    private bool TryAppendEntry(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return false;
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(line);
+            var root = doc.RootElement;
+            string tool = root.TryGetProperty("tool", out var t) ? t.GetString() ?? "" : "";
+            string mode = root.TryGetProperty("mode", out var m) ? m.GetString() ?? "" : "";
+            DateTime ts = DateTime.UtcNow;
+            if (root.TryGetProperty("ts", out var tsEl) && tsEl.ValueKind == System.Text.Json.JsonValueKind.String)
+                DateTime.TryParse(tsEl.GetString(), out ts);
+            var entry = new ActivityEntry { Ts = ts, Tool = tool, Mode = mode, Kind = ClassifyTool(tool) };
+            _activityEntries.AddFirst(entry);
+            while (_activityEntries.Count > MaxActivityRows) _activityEntries.RemoveLast();
+            return true;
+        }
+        catch
+        {
+            // Tolerate malformed lines (partial writes mid-flush).
+            return false;
+        }
+    }
+
+    private void RenderActivity()
+    {
+        if (GraphActivityPanel == null) return;
+        GraphActivityPanel.Children.Clear();
+
+        bool wantRead = ActivityFilterRead?.IsChecked == true;
+        bool wantWrite = ActivityFilterWrite?.IsChecked == true;
+        bool wantOther = ActivityFilterOther?.IsChecked == true;
+
+        foreach (var entry in _activityEntries)
+        {
+            bool show = entry.Kind switch
+            {
+                ActivityKind.Read => wantRead,
+                ActivityKind.Write => wantWrite,
+                _ => wantOther,
+            };
+            if (!show) continue;
+            GraphActivityPanel.Children.Add(BuildActivityRow(entry));
+        }
+
+        UpdateActivityRate();
+    }
+
+    private System.Windows.Controls.Border BuildActivityRow(ActivityEntry entry)
+    {
+        var (icon, color) = entry.Kind switch
+        {
+            ActivityKind.Read => ("📖", "#5DFF9D"),    // green
+            ActivityKind.Write => ("✏", "#FFB347"),     // orange
+            _ => ("🔧", "#888AA0"),                     // gray
+        };
+        var local = entry.Ts.ToLocalTime();
+        var ago = (DateTime.Now - local).TotalSeconds;
+        string agoText = ago switch
+        {
+            < 5 => "now",
+            < 60 => $"{(int)ago}s",
+            < 3600 => $"{(int)(ago / 60)}m",
+            _ => $"{(int)(ago / 3600)}h",
+        };
+
+        var border = new System.Windows.Controls.Border
+        {
+            CornerRadius = new System.Windows.CornerRadius(4),
+            Padding = new System.Windows.Thickness(8, 4, 8, 4),
+            Margin = new System.Windows.Thickness(0, 1, 0, 1),
+            Background = new System.Windows.Media.SolidColorBrush(
+                System.Windows.Media.Color.FromArgb(0x18, 0xFF, 0xFF, 0xFF)),
+        };
+        var grid = new System.Windows.Controls.Grid();
+        grid.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = System.Windows.GridLength.Auto });
+        grid.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = new System.Windows.GridLength(1, System.Windows.GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = System.Windows.GridLength.Auto });
+
+        var iconBlock = new System.Windows.Controls.TextBlock
+        {
+            Text = icon, FontSize = 11,
+            Margin = new System.Windows.Thickness(0, 0, 6, 0),
+            VerticalAlignment = System.Windows.VerticalAlignment.Center,
+        };
+        var nameBlock = new System.Windows.Controls.TextBlock
+        {
+            Text = entry.Tool, FontSize = 11,
+            FontFamily = (System.Windows.Media.FontFamily)FindResource("MonoFont"),
+            Foreground = (System.Windows.Media.Brush)
+                new System.Windows.Media.BrushConverter().ConvertFromString(color)!,
+            TextTrimming = System.Windows.TextTrimming.CharacterEllipsis,
+            VerticalAlignment = System.Windows.VerticalAlignment.Center,
+        };
+        var agoBlock = new System.Windows.Controls.TextBlock
+        {
+            Text = agoText, FontSize = 9,
+            FontFamily = (System.Windows.Media.FontFamily)FindResource("MonoFont"),
+            Foreground = (System.Windows.Media.Brush)FindResource("TextMutedBrush"),
+            VerticalAlignment = System.Windows.VerticalAlignment.Center,
+        };
+        System.Windows.Controls.Grid.SetColumn(iconBlock, 0);
+        System.Windows.Controls.Grid.SetColumn(nameBlock, 1);
+        System.Windows.Controls.Grid.SetColumn(agoBlock, 2);
+        grid.Children.Add(iconBlock);
+        grid.Children.Add(nameBlock);
+        grid.Children.Add(agoBlock);
+        border.Child = grid;
+        // Tooltip shows the full record (including mode + exact ts) without
+        // crowding the row when the user wants to scan quickly.
+        border.ToolTip = $"{entry.Tool}\nmode: {entry.Mode}\nts: {local:HH:mm:ss.fff}";
+        return border;
+    }
+
+    /// <summary>Per-minute rate over the last 60s (counts visible kinds only).</summary>
+    private void UpdateActivityRate()
+    {
+        if (ActivityRateText == null) return;
+        var cutoff = DateTime.UtcNow.AddSeconds(-60);
+        int count = 0;
+        bool wantRead = ActivityFilterRead?.IsChecked == true;
+        bool wantWrite = ActivityFilterWrite?.IsChecked == true;
+        bool wantOther = ActivityFilterOther?.IsChecked == true;
+        foreach (var e in _activityEntries)
+        {
+            if (e.Ts < cutoff) break; // entries are time-ordered (newest first)
+            bool include = e.Kind switch
+            {
+                ActivityKind.Read => wantRead,
+                ActivityKind.Write => wantWrite,
+                _ => wantOther,
+            };
+            if (include) count++;
+        }
+        ActivityRateText.Text = $"{count}/min";
+    }
+
+    private void PulseActivityDot()
+    {
+        if (ActivityPulse == null) return;
+        // Quick fade to white-ish then back to brand green — a 400ms flicker
+        // so the user notices new activity even if they're scrolling.
+        var anim = new System.Windows.Media.Animation.ColorAnimation
+        {
+            From = (System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#FFFFFF"),
+            To = (System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#5DFF9D"),
+            Duration = new System.Windows.Duration(TimeSpan.FromMilliseconds(400)),
+        };
+        var brush = new System.Windows.Media.SolidColorBrush();
+        ActivityPulse.Fill = brush;
+        brush.BeginAnimation(System.Windows.Media.SolidColorBrush.ColorProperty, anim);
+    }
+
+    private void GraphActivityFilterChanged(object sender, RoutedEventArgs e) => RenderActivity();
+
+    private void GraphActivityClear_Click(object sender, RoutedEventArgs e)
+    {
+        _activityEntries.Clear();
+        RenderActivity();
+        // Reset console state too — otherwise the next append would think
+        // entries N..M are "new" and skip everything up to that.
+        if (GraphActivityConsolePanel != null) GraphActivityConsolePanel.Children.Clear();
+        _consoleSyncedCount = 0;
+        UpdateConsoleCount();
+    }
+
+    // ─── CluadeX bridge tester ──────────────────────────────────────────
+    // Lazily-initialised single client + launcher so the same connection
+    // can be reused across Ping → Test prompt → real Co-Pilot runs
+    // without re-handshaking. Both are disposed when the window closes.
+    private ObsidianX.Core.Services.CluadeXClient? _cluadeXBridge;
+    private ObsidianX.Core.Services.CluadeXLauncher? _cluadeXLauncher;
+
+    private ObsidianX.Core.Services.CluadeXClient EnsureCluadeXBridge()
+    {
+        if (_cluadeXBridge != null) return _cluadeXBridge;
+        _cluadeXLauncher = new ObsidianX.Core.Services.CluadeXLauncher
+        {
+            // Surface launcher progress on the bridge status line so the
+            // user sees "Downloading…", "Extracting…", "Starting…" instead
+            // of staring at a frozen button.
+            OnProgress = msg => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (CluadeXBridgeStatusText != null)
+                    CluadeXBridgeStatusText.Text = "🛠 " + msg;
+            })),
+        };
+        var client = new ObsidianX.Core.Services.CluadeXClient();
+        // Wire the auto-launch hook: when the client can't find the pipe
+        // or the auth-token file, the launcher kicks in to find / install
+        // / start CluadeX. autoInstall=true so the first-run experience
+        // doesn't require a manual install step.
+        client.OnNeedLaunch = async ct =>
+        {
+            try
+            {
+                await _cluadeXLauncher.EnsureRunningAsync(autoInstall: true, ct);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"CluadeXLauncher failed: {ex.Message}");
+                return false;
+            }
+        };
+        _cluadeXBridge = client;
+        return _cluadeXBridge;
+    }
+
+    /// <summary>Drop tag suffixes and quant markers so two model names
+    /// like "qwen2.5:7b" and "qwen2.5-7b-instruct-q4_k_m" can be matched
+    /// against each other for the alignment check.</summary>
+    private static string NormalizeModelName(string raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return "";
+        var s = raw.ToLowerInvariant();
+        // Drop common GGUF quant tails (Q4_K_M etc.)
+        int dash = s.LastIndexOf('-');
+        while (dash >= 0 && (s.Substring(dash + 1).StartsWith("q") || s.Substring(dash + 1).StartsWith("it")))
+        {
+            s = s.Substring(0, dash);
+            dash = s.LastIndexOf('-');
+        }
+        // Strip ":tag" Ollama suffix
+        int colon = s.IndexOf(':');
+        if (colon > 0) s = s.Substring(0, colon);
+        return s.Replace("-instruct", "").Replace("_", "-").Trim();
+    }
+
+    /// <summary>Tear down the bridge cleanly on window close so we don't
+    /// leak a named-pipe handle.</summary>
+    private async Task DisposeCluadeXBridgeAsync()
+    {
+        try
+        {
+            if (_cluadeXBridge != null) await _cluadeXBridge.DisposeAsync();
+        }
+        catch { /* best-effort */ }
+        _cluadeXBridge = null;
+    }
+
+    private async void CluadeXBridgePing_Click(object sender, RoutedEventArgs e)
+    {
+        if (CluadeXBridgePingBtn != null) CluadeXBridgePingBtn.IsEnabled = false;
+        try
+        {
+            var bridge = EnsureCluadeXBridge();
+            CluadeXBridgeStatusText.Text = "pinging…";
+            CluadeXBridgeDot.Fill = new System.Windows.Media.SolidColorBrush(
+                System.Windows.Media.Color.FromRgb(0xCC, 0xCC, 0x44));
+            bool ok = await bridge.PingAsync();
+            if (!ok)
+            {
+                CluadeXBridgeDot.Fill = new System.Windows.Media.SolidColorBrush(
+                    System.Windows.Media.Color.FromRgb(0xAA, 0x44, 0x44));
+                CluadeXBridgeStatusText.Text = "✗ ping failed — is CluadeX running with the bridge chip showing?";
+                return;
+            }
+
+            // Pipe is alive — also fetch the active model so the user
+            // sees model alignment status in one click. Compare against
+            // ObsidianX's currently-selected backend + model so we can
+            // flag the mismatch the user warned us about explicitly:
+            // running two different models on one GPU is the canonical
+            // way to OOM CUDA, and we'd rather refuse than silently
+            // double the VRAM pressure.
+            string modelLine = "";
+            bool mismatch = false;
+            try
+            {
+                var info = await bridge.GetActiveModelAsync();
+
+                // Read what THIS app would use as the intern model.
+                string obsBackend = (AiBackendCombo?.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "ollama";
+                string obsModel = (AiModelCombo?.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "";
+
+                bool oom = info.VramUsedMB.HasValue && info.VramTotalMB.HasValue
+                           && info.VramTotalMB > 0
+                           && (double)info.VramUsedMB.Value / info.VramTotalMB.Value > 0.92;
+                string vram = (info.VramUsedMB.HasValue && info.VramTotalMB.HasValue)
+                    ? $" · VRAM {info.VramUsedMB.Value / 1024.0:F1}/{info.VramTotalMB.Value / 1024.0:F1} GB"
+                    : "";
+
+                // Heuristic match: same provider AND model name share enough.
+                // Ollama models often have ":tag" suffixes (e.g. qwen2.5:7b);
+                // GGUF names include quant suffixes (Q4_K_M). Strip those
+                // before comparing so "qwen2.5:7b" vs "qwen2.5-7b-instruct"
+                // still flags as similar enough.
+                bool sameProvider = info.Provider.Equals(obsBackend, StringComparison.OrdinalIgnoreCase);
+                bool sameModel = !string.IsNullOrEmpty(info.Model) &&
+                                 !string.IsNullOrEmpty(obsModel) &&
+                                 NormalizeModelName(info.Model)
+                                     .Contains(NormalizeModelName(obsModel), StringComparison.OrdinalIgnoreCase);
+                mismatch = !(sameProvider && sameModel);
+
+                string verdict = mismatch
+                    ? $"  ⚠ MISMATCH — ObsidianX={obsBackend}/{obsModel}, CluadeX={info.Identity}. " +
+                      "Both use the same GPU; running two models = VRAM OOM. " +
+                      "Align in CluadeX's Models tab before delegating tasks."
+                    : "  ✓ aligned with ObsidianX intern";
+                string oomFlag = oom ? "  ⚠ VRAM near full" : "";
+                modelLine = $" · loaded {info.Identity}{vram}{oomFlag}{verdict}";
+                if (!info.Ready) modelLine += "  ⚠ provider not ready";
+            }
+            catch (Exception modelEx)
+            {
+                modelLine = $" · (model probe failed: {modelEx.Message})";
+            }
+
+            // Colour-code: green = healthy + aligned, orange = healthy but
+            // mismatched (still usable but warned), keeps the dot informative.
+            CluadeXBridgeDot.Fill = mismatch
+                ? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0xFF, 0xB3, 0x47))
+                : new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x4F, 0xFF, 0xE2));
+            CluadeXBridgeStatusText.Text = "✓ pipe alive" + modelLine;
+        }
+        catch (Exception ex)
+        {
+            CluadeXBridgeDot.Fill = new System.Windows.Media.SolidColorBrush(
+                System.Windows.Media.Color.FromRgb(0xAA, 0x44, 0x44));
+            CluadeXBridgeStatusText.Text = $"✗ {ex.Message}";
+        }
+        finally
+        {
+            if (CluadeXBridgePingBtn != null) CluadeXBridgePingBtn.IsEnabled = true;
+        }
+    }
+
+    /// <summary>
+    /// Force CluadeX to switch its provider+model to match what
+    /// ObsidianX has selected. The user explicitly asked for this:
+    /// "ให้ obsidianx บังคับ cluadex โหลดโมเดลให้ตรงกับตัวเองได้เลย".
+    /// Reads the AiBackendCombo + AiModelCombo selections, sends them to
+    /// CluadeX via the set_model MCP tool, and reports the verdict on
+    /// the bridge status line.
+    /// </summary>
+    private async void CluadeXBridgeAlign_Click(object sender, RoutedEventArgs e)
+    {
+        if (CluadeXBridgeAlignBtn != null) CluadeXBridgeAlignBtn.IsEnabled = false;
+        try
+        {
+            var bridge = EnsureCluadeXBridge();
+
+            // Resolve target provider+model from the AI Chat dropdowns.
+            // Capitalise the first letter so "ollama" → "Ollama" matches
+            // the AiProviderType enum names CluadeX expects.
+            string obsBackendRaw = (AiBackendCombo?.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "ollama";
+            string obsModel = (AiModelCombo?.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "";
+            string provider = char.ToUpperInvariant(obsBackendRaw[0]) + obsBackendRaw[1..].ToLowerInvariant();
+
+            if (string.IsNullOrWhiteSpace(obsModel))
+            {
+                CluadeXBridgeStatusText.Text =
+                    "✗ Pick a model in the dropdown above first — alignment needs a target.";
+                CluadeXBridgeDot.Fill = new System.Windows.Media.SolidColorBrush(
+                    System.Windows.Media.Color.FromRgb(0xAA, 0x44, 0x44));
+                return;
+            }
+
+            CluadeXBridgeStatusText.Text = $"🎯 telling CluadeX to switch to {provider}:{obsModel}…";
+            CluadeXBridgeDot.Fill = new System.Windows.Media.SolidColorBrush(
+                System.Windows.Media.Color.FromRgb(0xCC, 0xCC, 0x44));
+
+            var result = await bridge.SetModelAsync(provider, obsModel);
+
+            if (result.Ok && result.Ready)
+            {
+                CluadeXBridgeDot.Fill = new System.Windows.Media.SolidColorBrush(
+                    System.Windows.Media.Color.FromRgb(0x4F, 0xFF, 0xE2));
+                string freed = result.FreedLocalWeights ? "  (released previous GGUF from VRAM)" : "";
+                CluadeXBridgeStatusText.Text =
+                    $"✓ aligned · CluadeX now on {result.Provider}:{result.Model}{freed}";
+            }
+            else
+            {
+                // The pipe call succeeded but the provider isn't ready.
+                // Common cause: switched to Ollama but the daemon isn't
+                // running, or to Anthropic but no API key. Surface the
+                // server's note verbatim — it's the most actionable hint.
+                // No prefix because result.Note already starts with
+                // "Switched to ... but ..." so the user gets one clean line.
+                CluadeXBridgeDot.Fill = new System.Windows.Media.SolidColorBrush(
+                    System.Windows.Media.Color.FromRgb(0xFF, 0xB3, 0x47));
+                CluadeXBridgeStatusText.Text = $"⚠ {result.Note}";
+            }
+        }
+        catch (Exception ex)
+        {
+            CluadeXBridgeDot.Fill = new System.Windows.Media.SolidColorBrush(
+                System.Windows.Media.Color.FromRgb(0xAA, 0x44, 0x44));
+            CluadeXBridgeStatusText.Text = $"✗ align failed: {ex.Message}";
+        }
+        finally
+        {
+            if (CluadeXBridgeAlignBtn != null) CluadeXBridgeAlignBtn.IsEnabled = true;
+        }
+    }
+
+    private async void CluadeXBridgeTest_Click(object sender, RoutedEventArgs e)
+    {
+        if (CluadeXBridgeTestBtn != null) CluadeXBridgeTestBtn.IsEnabled = false;
+        try
+        {
+            var bridge = EnsureCluadeXBridge();
+            CluadeXBridgeStatusText.Text = "🧪 sending test prompt — watch CluadeX's chat sidebar for a new session…";
+            string taskId = "smoketest-" + DateTime.Now.ToString("HHmmss");
+            // Tiny spec — just verifies the round-trip. A real Co-Pilot
+            // run would include the brain context and lessons.
+            string spec = "Reply with the single phrase 'CluadeX bridge OK' and nothing else.";
+            string reply = await bridge.WriteCodeAsync(taskId, spec, timeoutMs: 60_000);
+            // Truncate the reply for the status line (full version visible
+            // inside CluadeX's chat).
+            string preview = reply.Replace("\r", " ").Replace("\n", " ");
+            if (preview.Length > 120) preview = preview[..120] + "…";
+            CluadeXBridgeStatusText.Text = $"✓ replied: {preview}";
+            CluadeXBridgeDot.Fill = new System.Windows.Media.SolidColorBrush(
+                System.Windows.Media.Color.FromRgb(0x4F, 0xFF, 0xE2));
+        }
+        catch (Exception ex)
+        {
+            CluadeXBridgeDot.Fill = new System.Windows.Media.SolidColorBrush(
+                System.Windows.Media.Color.FromRgb(0xAA, 0x44, 0x44));
+            CluadeXBridgeStatusText.Text = $"✗ test failed: {ex.Message}";
+        }
+        finally
+        {
+            if (CluadeXBridgeTestBtn != null) CluadeXBridgeTestBtn.IsEnabled = true;
+        }
+    }
+
+    // ─── Console feed (chronological tail with sticky-bottom auto-scroll) ───
+    //
+    // Why an append-only design?
+    //   The compact summary above this rebuilds its visual tree on every
+    //   filter toggle / new entry — that's fine for ~30 rows. The console
+    //   targets ~30 entries/sec, so a full rebuild every 1.5s is wasteful
+    //   and visibly janks the scroll. Instead we maintain a watermark
+    //   (_consoleSyncedCount) and only construct visuals for entries that
+    //   haven't been rendered yet.
+    //
+    // Why not ListBox virtualization?
+    //   Cap is 300 entries. WPF can render 300 lightweight TextBlocks
+    //   without breaking a sweat. ListBox virtualization would buy us
+    //   memory but add complexity (ItemTemplate, ItemContainerStyle) and
+    //   has its own quirks with auto-scroll. Revisit if cap grows past
+    //   ~1000 or we add inline tool-result previews.
+
+    /// <summary>Drain any newly added activity entries into the console
+    /// panel. Honours sticky-bottom auto-scroll: only forces ScrollToEnd
+    /// if the user is already at the bottom (or the seed forces it).</summary>
+    private void AppendConsoleNewEntries(bool forceJumpToEnd = false)
+    {
+        if (GraphActivityConsolePanel == null || GraphActivityConsoleScroll == null) return;
+        int total = _activityEntries.Count;
+        if (total == _consoleSyncedCount) return;
+
+        // Newest is at .First, oldest at .Last. We want chronological order
+        // (oldest new entry first → newest at the bottom). The new entries
+        // are the ones at indices [0 .. (total - _consoleSyncedCount)) when
+        // we walk from the head. Collect them, then iterate in reverse so
+        // they're appended oldest-to-newest.
+        int newCount = total - _consoleSyncedCount;
+        var pending = new System.Collections.Generic.List<ActivityEntry>(newCount);
+        var node = _activityEntries.First;
+        for (int i = 0; i < newCount && node != null; i++, node = node.Next)
+            pending.Add(node.Value);
+        pending.Reverse();
+
+        // Snapshot stickiness BEFORE we mutate the visual tree — adding
+        // children can shift the offset and confuse the bottom check.
+        bool stickToBottom = forceJumpToEnd || (_consoleAtBottom && (ActivityConsoleStickyBottom?.IsChecked ?? true));
+
+        foreach (var entry in pending)
+        {
+            GraphActivityConsolePanel.Children.Add(BuildConsoleLine(entry));
+            // Trim oldest if over cap. Drop a chunk at a time (10) so we
+            // don't spend a tick removing one element per new arrival on
+            // a busy stream.
+            if (GraphActivityConsolePanel.Children.Count > MaxConsoleRows)
+            {
+                int over = GraphActivityConsolePanel.Children.Count - MaxConsoleRows;
+                int chunk = Math.Min(Math.Max(over, 10), GraphActivityConsolePanel.Children.Count);
+                for (int k = 0; k < chunk; k++)
+                    GraphActivityConsolePanel.Children.RemoveAt(0);
+            }
+        }
+        _consoleSyncedCount = total;
+        UpdateConsoleCount();
+
+        if (stickToBottom)
+        {
+            // Layout-pass guard: ScrollToEnd uses ExtentHeight which is
+            // computed during the next arrange. Defer one frame so the
+            // newly added children are measured before we scroll.
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                GraphActivityConsoleScroll?.ScrollToEnd();
+                _consoleAtBottom = true;
+            }), System.Windows.Threading.DispatcherPriority.ContextIdle);
+        }
+    }
+
+    /// <summary>Build one console row. Format:
+    /// <c>HH:mm:ss.fff  ICON  tool_name  (mode)</c> with mixed-color Runs
+    /// for cheap-but-readable hierarchy.</summary>
+    private System.Windows.Controls.TextBlock BuildConsoleLine(ActivityEntry entry)
+    {
+        var (icon, color) = entry.Kind switch
+        {
+            ActivityKind.Read => ("📖", "#5DFF9D"),
+            ActivityKind.Write => ("✏", "#FFB347"),
+            _ => ("🔧", "#9090A8"),
+        };
+        var local = entry.Ts.ToLocalTime();
+        var tb = new System.Windows.Controls.TextBlock
+        {
+            FontFamily = (System.Windows.Media.FontFamily)FindResource("MonoFont"),
+            FontSize = 11,
+            Margin = new System.Windows.Thickness(0, 0, 0, 1),
+            TextWrapping = System.Windows.TextWrapping.NoWrap,
+            TextTrimming = System.Windows.TextTrimming.CharacterEllipsis,
+        };
+        var mutedBrush = (System.Windows.Media.Brush)FindResource("TextMutedBrush");
+        var textBrush = (System.Windows.Media.Brush)FindResource("TextSecondaryBrush");
+        var accent = (System.Windows.Media.Brush)
+            new System.Windows.Media.BrushConverter().ConvertFromString(color)!;
+
+        tb.Inlines.Add(new System.Windows.Documents.Run($"{local:HH:mm:ss.fff} ")
+        { Foreground = mutedBrush });
+        tb.Inlines.Add(new System.Windows.Documents.Run($"{icon} ")
+        { Foreground = accent });
+        tb.Inlines.Add(new System.Windows.Documents.Run(entry.Tool)
+        { Foreground = accent, FontWeight = System.Windows.FontWeights.SemiBold });
+        if (!string.IsNullOrEmpty(entry.Mode))
+        {
+            tb.Inlines.Add(new System.Windows.Documents.Run($"  ({entry.Mode})")
+            { Foreground = textBrush, FontSize = 10 });
+        }
+        // Hover for full ISO timestamp + raw record details
+        tb.ToolTip = $"{entry.Tool}\nmode: {entry.Mode}\nts: {entry.Ts:O}";
+        return tb;
+    }
+
+    /// <summary>Track sticky-bottom state. WPF ScrollViewer uses
+    /// VerticalOffset + ViewportHeight ≈ ExtentHeight when at bottom.
+    /// Tolerance of 4px so 1-pixel rounding doesn't make us "leave" the
+    /// bottom by accident.</summary>
+    private void GraphActivityConsoleScroll_Changed(object sender, System.Windows.Controls.ScrollChangedEventArgs e)
+    {
+        if (sender is not System.Windows.Controls.ScrollViewer sv) return;
+        double bottomDelta = sv.ExtentHeight - (sv.VerticalOffset + sv.ViewportHeight);
+        _consoleAtBottom = bottomDelta < 4.0;
+    }
+
+    private void GraphActivityConsolePause_Click(object sender, RoutedEventArgs e)
+    {
+        _consolePaused = !_consolePaused;
+        if (ActivityConsolePauseBtn != null)
+            ActivityConsolePauseBtn.Content = _consolePaused ? "▶ Resume" : "⏸ Pause";
+        // While paused we keep the timer running but bail out at the top
+        // of Tick — keeps offset bookkeeping correct so resume catches up
+        // in one shot rather than re-reading the whole tail.
+    }
+
+    private void UpdateConsoleCount()
+    {
+        if (ActivityConsoleCount == null || GraphActivityConsolePanel == null) return;
+        ActivityConsoleCount.Text = $"{GraphActivityConsolePanel.Children.Count} lines";
+    }
+
     // ── Token-savings gauge + brain bypass ──
 
     /// <summary>
@@ -4006,6 +4753,10 @@ public partial class MainWindow : Window
 
         // Unsubscribe render loop
         CompositionTarget.Rendering -= OnRenderFrame;
+
+        // Tear down the CluadeX named-pipe bridge so we don't leak a
+        // pipe handle / reader / writer on app exit.
+        await DisposeCluadeXBridgeAsync();
 
         // Disconnect from network
         try { await _network.DisconnectAsync(); }
@@ -4718,14 +5469,54 @@ public partial class MainWindow : Window
             if (result.Graph != null)
             {
                 _graph = result.Graph;
+                // Physics diff is the only step the renderer NEEDS to see
+                // before the next frame — it's the canonical state for arc
+                // routing and node positions. Run it inline.
                 _dashPhysics.LoadFromGraphDiff(_graph);
                 _graphPhysics.LoadFromGraphDiff(_graph);
-                UpdateUI();
-                RefreshVaultTree();
+
                 var wikiEdges = _graph.Edges.Count(e => e.RelationType == "wiki-link");
                 var autoEdges = _graph.Edges.Count - wikiEdges;
                 StatusText.Text =
                     $"✅ Auto-ingest done · {_graph.TotalNodes} nodes · {wikiEdges} wiki · {autoEdges} auto-links{result.ExportMsg}";
+
+                // Defer the heavy UI rebuild (TreeView populate, expertise
+                // bars, stat text) to Background priority. These touch the
+                // visual tree in ways that briefly contend with the render
+                // loop — running them after the next layout pass means the
+                // 2D graph keeps painting smoothly through auto-ingest
+                // instead of "blinking" in sync with the status update.
+                //
+                // Heavier updates (TreeView and ExpertisePanel rebuilds)
+                // are also gated by visibility — there's no point rebuilding
+                // a TreeView the user can't see, and the rebuild is the
+                // single biggest source of perceptible jank during ingest.
+                _ = Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    bool vaultVisible = VaultView?.Visibility == Visibility.Visible;
+                    bool dashVisible = DashboardView?.Visibility == Visibility.Visible;
+                    bool graphVisible = BrainGraphView?.Visibility == Visibility.Visible;
+
+                    // Stat text refreshes are cheap (3 TextBlock updates);
+                    // always do them so the status bar reflects reality.
+                    StatNotes.Text = _graph.TotalNodes.ToString("N0");
+                    StatWords.Text = _graph.TotalWords.ToString("N0");
+                    StatLinks.Text = _graph.TotalEdges.ToString("N0");
+                    StatCategories.Text = _graph.ExpertiseMap.Count.ToString();
+                    VaultPathText.Text = _vaultPath;
+
+                    // Expertise bars: only rebuild the panel that's
+                    // currently on-screen. The other one will refresh when
+                    // the user navigates to it (it reads the same
+                    // _graph.ExpertiseMap so values stay correct).
+                    if (dashVisible || graphVisible) BuildExpertiseBars();
+
+                    // The vault tree rebuild is the hot spot — clearing +
+                    // rebuilding ~500 TreeViewItems takes 50-200ms which
+                    // shows up as a frame skip on the brain graph. Skip it
+                    // unless the user is actively looking at the explorer.
+                    if (vaultVisible) RefreshVaultTree();
+                }), System.Windows.Threading.DispatcherPriority.Background);
             }
             else
             {

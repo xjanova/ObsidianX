@@ -18,4 +18,11 @@
     <ProjectReference Include="..\ObsidianX.Core\ObsidianX.Core.csproj" />
   </ItemGroup>
 
+  <!-- Make sure the dashboard (wwwroot/index.html) ends up in bin/<cfg>/wwwroot
+       so it works even if the static-web-assets manifest is ignored or the
+       binary is run from a published location away from the source tree. -->
+  <ItemGroup>
+    <Content Update="wwwroot\**\*.*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
