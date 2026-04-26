@@ -1326,6 +1326,7 @@
                                              below validates connectivity before sending. -->
                                         <ComboBox x:Name="AiChatModeCombo" Width="220" FontSize="11" Margin="20,4,0,0"
                                                   VerticalAlignment="Center" SelectedIndex="0"
+                                                  SelectionChanged="AiChatMode_Changed"
                                                   ToolTip="Solo: chat with one model. Co-Pilot Arena: delegate to CluadeX worker via named pipe.">
                                             <ComboBoxItem Content="Solo (one model)"/>
                                             <ComboBoxItem Content="🤝 Co-Pilot Arena (CluadeX bridge)"/>
@@ -1543,22 +1544,109 @@
                                         </StackPanel>
                                     </Border>
                                 </StackPanel>
-                                <Border Grid.Row="1" Style="{StaticResource CardPanel}" Margin="0,0,0,12">
-                                    <ScrollViewer VerticalScrollBarVisibility="Auto">
-                                        <TextBlock x:Name="ClaudeOutput" TextWrapping="Wrap" FontSize="13"
-                                                   Foreground="{StaticResource TextPrimaryBrush}"
-                                                   Text="Welcome to ObsidianX AI Chat.&#x0A;&#x0A;Solo mode: chat with the selected model (Ollama / NIM / OpenRouter / DeepSeek), grounded on your vault.&#x0A;&#x0A;Co-Pilot Arena (Phase 1) will let a local model and Claude collaborate on tasks here, with both wired into the brain MCP."/>
-                                    </ScrollViewer>
-                                </Border>
+                                <!-- Body row holds two panels stacked Z-order; only one is
+                                     visible at a time depending on the AiChatModeCombo selection.
+                                     Solo = the simple text-based chat we've always had.
+                                     Co-Pilot Arena = bubble feed driven by CoPilotOrchestrator. -->
+                                <Grid Grid.Row="1" Margin="0,0,0,12">
+                                    <Border x:Name="SoloChatPanel" Style="{StaticResource CardPanel}">
+                                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                            <TextBlock x:Name="ClaudeOutput" TextWrapping="Wrap" FontSize="13"
+                                                       Foreground="{StaticResource TextPrimaryBrush}"
+                                                       Text="Welcome to ObsidianX AI Chat.&#x0A;&#x0A;Solo mode: chat with the selected model (Ollama / NIM / OpenRouter / DeepSeek), grounded on your vault.&#x0A;&#x0A;Co-Pilot Arena (Phase 1) will let a local model and Claude collaborate on tasks here, with both wired into the brain MCP."/>
+                                        </ScrollViewer>
+                                    </Border>
+                                    <!-- ─── Co-Pilot Arena ─────────────────────────────────────
+                                         Hidden by default, surfaced when the user picks the
+                                         🤝 mode. Three rows: header with working-directory input,
+                                         the bubble feed (intern plan / worker reply / errors),
+                                         and a budget gauge footer showing wall-clock + spend. -->
+                                    <Border x:Name="CoPilotArenaPanel" Visibility="Collapsed"
+                                            Style="{StaticResource CardPanel}">
+                                        <Grid>
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto"/>
+                                                <RowDefinition Height="*"/>
+                                                <RowDefinition Height="Auto"/>
+                                            </Grid.RowDefinitions>
+                                            <!-- Header: where the worker should run + reset feed -->
+                                            <Grid Grid.Row="0" Margin="0,0,0,10">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="Working dir" FontSize="10"
+                                                           Foreground="{StaticResource TextSecondaryBrush}"
+                                                           VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                                <TextBox Grid.Column="1" x:Name="ArenaWorkingDirBox"
+                                                         Style="{StaticResource NeonTextBox}" FontSize="11"
+                                                         FontFamily="{StaticResource MonoFont}"
+                                                         VerticalContentAlignment="Center"
+                                                         ToolTip="Repo path the CluadeX worker should run inside. Leave empty to use CluadeX's current dir."/>
+                                                <Button Grid.Column="2" x:Name="ArenaClearBtn"
+                                                        Content="Clear feed" Style="{StaticResource NeonButton}"
+                                                        Padding="10,3" FontSize="10" Margin="8,0,0,0"
+                                                        Click="ArenaClear_Click"
+                                                        ToolTip="Wipe the bubble feed. Worker history stays in CluadeX's codex.db."/>
+                                            </Grid>
+                                            <!-- Bubble feed. StackPanel children are appended in
+                                                 code-behind, matching the project's existing
+                                                 imperative-rendering style. -->
+                                            <Border Grid.Row="1" Background="#220B0B1A"
+                                                    BorderBrush="{StaticResource SurfaceLightBrush}"
+                                                    BorderThickness="1" CornerRadius="6">
+                                                <ScrollViewer x:Name="ArenaBubbleScroll" VerticalScrollBarVisibility="Auto"
+                                                              ScrollChanged="ArenaBubbleScroll_ScrollChanged"
+                                                              Padding="10">
+                                                    <StackPanel x:Name="ArenaBubbleFeed">
+                                                        <TextBlock x:Name="ArenaEmptyHint"
+                                                                   Text="🤝 Co-Pilot Arena is idle. Type a coding task below — the local intern will plan it and CluadeX will write the code in a visible session."
+                                                                   FontSize="12" FontStyle="Italic"
+                                                                   Foreground="{StaticResource TextMutedBrush}"
+                                                                   TextWrapping="Wrap" Margin="6,12,6,12"/>
+                                                    </StackPanel>
+                                                </ScrollViewer>
+                                            </Border>
+                                            <!-- Budget gauge: wall-clock + nominal USD ceiling.
+                                                 Updated as orchestrator events flow in. -->
+                                            <Grid Grid.Row="2" Margin="0,8,0,0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" x:Name="ArenaBudgetGauge"
+                                                           Text="idle"
+                                                           FontSize="10" FontFamily="{StaticResource MonoFont}"
+                                                           Foreground="{StaticResource TextMutedBrush}"
+                                                           VerticalAlignment="Center"/>
+                                                <Button Grid.Column="1" x:Name="ArenaCancelBtn"
+                                                        Content="✕ Stop" Style="{StaticResource NeonButton}"
+                                                        Padding="10,3" FontSize="10"
+                                                        IsEnabled="False" Click="ArenaCancel_Click"
+                                                        ToolTip="Cancel the running orchestration. Worker stops at its next checkpoint."/>
+                                            </Grid>
+                                        </Grid>
+                                    </Border>
+                                </Grid>
                                 <Grid Grid.Row="2">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="*"/>
                                         <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="Auto"/>
                                     </Grid.ColumnDefinitions>
                                     <TextBox x:Name="ClaudeInput" Style="{StaticResource NeonTextBox}"
-                                             KeyDown="ClaudeInput_KeyDown" Margin="0,0,8,0" VerticalContentAlignment="Center"/>
-                                    <Button Grid.Column="1" Content="Ask Claude" Style="{StaticResource NeonButtonFilled}"
+                                             KeyDown="ClaudeInput_KeyDown" Margin="0,0,8,0" VerticalContentAlignment="Center"
+                                             AcceptsReturn="True" TextWrapping="Wrap" MinHeight="36" MaxHeight="120"
+                                             VerticalScrollBarVisibility="Auto"/>
+                                    <Button Grid.Column="1" x:Name="AskClaudeBtn" Content="Ask Claude"
+                                            Style="{StaticResource NeonButtonFilled}"
                                             Click="AskClaude_Click"/>
+                                    <Button Grid.Column="2" x:Name="SendToArenaBtn" Content="🤝 Send to Arena"
+                                            Style="{StaticResource NeonButtonFilled}" Visibility="Collapsed"
+                                            Margin="8,0,0,0"
+                                            Click="SendToArena_Click"
+                                            ToolTip="Plan with the local intern, then delegate to CluadeX. A new chat session pops up in CluadeX's sidebar."/>
                                 </Grid>
                             </Grid>
                         </Grid>

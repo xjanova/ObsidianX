@@ -4219,6 +4219,421 @@ public partial class MainWindow : Window
         }
     }
 
+    // ─── Co-Pilot Arena ────────────────────────────────────────────────
+    //
+    // Phase 1B.3b — orchestrated Intern + Worker flow rendered as a bubble
+    // feed. The orchestrator lives in ObsidianX.Core (transport-agnostic);
+    // here we wire it to the running app's HTTP /api/ai/chat endpoint for
+    // the intern step and the existing bridge client for the worker step.
+    //
+    // Why bubble UI (not a single TextBlock like Solo mode)?
+    //   The user explicitly asked for visible chat per task and to be able
+    //   to "see what happened" — meaning each phase needs its own affordance:
+    //   the spec they sent, the intern's interpretation, the worker's reply,
+    //   any errors. Stacked bubbles give that auditing surface for free.
+    //
+    // Sticky-bottom scroll:
+    //   Mirrors the Brain Activity console panel — if the user has scrolled
+    //   up to read a past bubble, we don't yank them back down when a new
+    //   one arrives. Only auto-scroll when they're already pinned to bottom.
+
+    private CoPilotOrchestrator? _orchestrator;
+    private CancellationTokenSource? _orchestratorCts;
+    private bool _arenaScrollSticky = true;
+    private DateTime _arenaTaskStart = DateTime.MinValue;
+    private DispatcherTimer? _arenaBudgetTimer;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    private const int SW_RESTORE = 9;
+
+    /// <summary>Toggle which body panel is visible based on the mode combo.
+    /// Solo → ClaudeOutput card; Co-Pilot Arena → bubble feed. The two
+    /// "Send" buttons in the input row swap to match.</summary>
+    private void AiChatMode_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (SoloChatPanel == null || CoPilotArenaPanel == null) return; // pre-init
+        bool arena = AiChatModeCombo?.SelectedIndex == 1;
+        SoloChatPanel.Visibility = arena ? Visibility.Collapsed : Visibility.Visible;
+        CoPilotArenaPanel.Visibility = arena ? Visibility.Visible : Visibility.Collapsed;
+        if (AskClaudeBtn != null) AskClaudeBtn.Visibility = arena ? Visibility.Collapsed : Visibility.Visible;
+        if (SendToArenaBtn != null) SendToArenaBtn.Visibility = arena ? Visibility.Visible : Visibility.Collapsed;
+        if (ClaudeInput != null)
+            ClaudeInput.ToolTip = arena
+                ? "Describe a coding task. The local intern will refine it, then CluadeX will execute the plan in a visible session."
+                : "Ask the model anything. Brain context is grounded automatically.";
+    }
+
+    /// <summary>Lazily build the orchestrator. Planner = HTTP call to
+    /// /api/ai/chat on this app's own server (so it picks up whatever
+    /// backend the user has selected in the dropdowns); Worker = the
+    /// existing bridge client.</summary>
+    private CoPilotOrchestrator EnsureOrchestrator()
+    {
+        if (_orchestrator != null) return _orchestrator;
+        _orchestrator = new CoPilotOrchestrator
+        {
+            Worker = EnsureCluadeXBridge(),
+            Planner = PlanWithLocalInternAsync,
+            Options = new OrchestrationOptions
+            {
+                MaxWallClock = TimeSpan.FromMinutes(5),
+                MaxTurnsPerTask = 15,
+                MaxUsdPerTask = 0.20m,
+                MaxReviseRounds = 3,
+            },
+        };
+        return _orchestrator;
+    }
+
+    private async Task<InternPlan> PlanWithLocalInternAsync(string userSpec, CancellationToken ct)
+    {
+        // Match what AskClaude_Click does — read backend + model from the
+        // dropdowns, send via the local server's /api/ai/chat endpoint.
+        // We deliberately don't stream: we need the whole reply before we
+        // can parse the plan JSON.
+        var backend = (AiBackendCombo?.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "ollama";
+        var model = (AiModelCombo?.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "llama3.2:3b";
+
+        // 4-minute ceiling on the intern step. Thinking models like
+        // deepseek-r1 routinely run 90-180s on planning prompts; a 2-min
+        // timeout was too tight and aborted a perfectly-healthy planner
+        // run during smoke testing. The orchestrator's own MaxWallClock
+        // (5 min total) still bounds the whole pipeline.
+        using var http = BuildLocalHttpClient(TimeSpan.FromMinutes(4));
+        var payload = Newtonsoft.Json.JsonConvert.SerializeObject(new
+        {
+            message = CoPilotOrchestrator.BuildPlannerPrompt(userSpec),
+            backend,
+            model,
+        });
+        using var req = new HttpRequestMessage(HttpMethod.Post,
+            _serverUrl.Replace("/brain-hub", "") + "/api/ai/chat")
+        {
+            Content = new StringContent(payload, System.Text.Encoding.UTF8, "application/json"),
+        };
+        using var resp = await http.SendAsync(req, ct);
+        resp.EnsureSuccessStatusCode();
+        var json = await resp.Content.ReadAsStringAsync(ct);
+        var obj = Newtonsoft.Json.Linq.JObject.Parse(json);
+        var raw = obj["reply"]?.ToString() ?? "";
+        return InternPlan.ParseFromLlm(raw);
+    }
+
+    private async void SendToArena_Click(object sender, RoutedEventArgs e)
+    {
+        if (ClaudeInput == null) return;
+        string spec = ClaudeInput.Text.Trim();
+        if (string.IsNullOrWhiteSpace(spec)) return;
+
+        // Hide the empty-state hint as soon as we have something to show.
+        if (ArenaEmptyHint != null) ArenaEmptyHint.Visibility = Visibility.Collapsed;
+
+        ClaudeInput.Text = "";
+        if (SendToArenaBtn != null) SendToArenaBtn.IsEnabled = false;
+        if (ArenaCancelBtn != null) ArenaCancelBtn.IsEnabled = true;
+
+        string? workingDir = ArenaWorkingDirBox?.Text?.Trim();
+        if (string.IsNullOrWhiteSpace(workingDir)) workingDir = null;
+
+        AppendArenaBubble(BubbleKind.User, "👤 You", spec, taskId: null);
+
+        _orchestratorCts = new CancellationTokenSource();
+        _arenaTaskStart = DateTime.UtcNow;
+        StartArenaBudgetTicker();
+
+        var progress = new Progress<OrchestrationEvent>(OnOrchestratorEvent);
+        try
+        {
+            var orch = EnsureOrchestrator();
+            await orch.RunAsync(spec, workingDir, progress, _orchestratorCts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            AppendArenaBubble(BubbleKind.Error, "⏹ Cancelled",
+                "Orchestrator stopped by user.", taskId: null);
+        }
+        catch (Exception ex)
+        {
+            AppendArenaBubble(BubbleKind.Error, "⚠ Orchestrator crashed",
+                ex.Message, taskId: null);
+        }
+        finally
+        {
+            StopArenaBudgetTicker();
+            if (SendToArenaBtn != null) SendToArenaBtn.IsEnabled = true;
+            if (ArenaCancelBtn != null) ArenaCancelBtn.IsEnabled = false;
+            _orchestratorCts?.Dispose();
+            _orchestratorCts = null;
+        }
+    }
+
+    private void OnOrchestratorEvent(OrchestrationEvent ev)
+    {
+        // Always emit on the dispatcher — IProgress callbacks land on
+        // SynchronizationContext.Current which IS the dispatcher when
+        // captured on the UI thread, but be explicit for safety against
+        // future refactors that move the orchestrator off the UI thread.
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.BeginInvoke(new Action(() => OnOrchestratorEvent(ev)));
+            return;
+        }
+
+        switch (ev)
+        {
+            case TaskCreated tc:
+                if (ArenaBudgetGauge != null)
+                    ArenaBudgetGauge.Text = $"task {tc.TaskId} · planning…";
+                break;
+            case InternStarted:
+                AppendArenaBubble(BubbleKind.Status, "🧠 Intern thinking",
+                    "Local model is breaking the request into a plan…", taskId: null);
+                break;
+            case InternFinished f:
+                // Replace the "thinking" status bubble's body in place would
+                // be nice, but we keep things append-only for simplicity.
+                AppendArenaBubble(BubbleKind.Intern, "🧠 Intern plan",
+                    f.Plan.ToDisplay(), taskId: null);
+                break;
+            case WorkerStarted ws:
+                AppendArenaBubble(BubbleKind.Status, "🤖 Worker started",
+                    $"CluadeX is running task {ws.TaskId}. Watch the new session in CluadeX's sidebar.",
+                    taskId: ws.TaskId);
+                if (ArenaBudgetGauge != null)
+                    ArenaBudgetGauge.Text = $"task {ws.TaskId} · worker running…";
+                break;
+            case WorkerFinished wf:
+                AppendArenaBubble(BubbleKind.Worker, "🤖 CluadeX worker",
+                    TruncateForBubble(wf.Output), taskId: ExtractTaskIdFromGauge());
+                break;
+            case OrchestratorError err:
+                AppendArenaBubble(BubbleKind.Error, $"⚠ {err.Phase} error",
+                    err.Message, taskId: null);
+                break;
+            case OrchestratorFinished done:
+                if (ArenaBudgetGauge != null)
+                {
+                    var elapsed = DateTime.UtcNow - _arenaTaskStart;
+                    string verdict = done.Status switch
+                    {
+                        TaskRunStatus.Done => "✓ done",
+                        TaskRunStatus.Failed => "✗ failed",
+                        TaskRunStatus.TimedOut => "⏱ timed out",
+                        _ => done.Status.ToString().ToLowerInvariant(),
+                    };
+                    ArenaBudgetGauge.Text = $"{verdict} · elapsed {elapsed:mm\\:ss}";
+                }
+                break;
+        }
+    }
+
+    /// <summary>The Worker bubble gets an "Open in CluadeX" button bound to
+    /// the task id. We pull the id out of whatever we last wrote into the
+    /// budget gauge so the bubble carries it without us threading state
+    /// through the events further. Cheap, and the gauge is the canonical
+    /// "current task" label anyway.</summary>
+    private string? ExtractTaskIdFromGauge()
+    {
+        var t = ArenaBudgetGauge?.Text ?? "";
+        const string prefix = "task ";
+        int i = t.IndexOf(prefix, StringComparison.Ordinal);
+        if (i < 0) return null;
+        var rest = t[(i + prefix.Length)..];
+        int sp = rest.IndexOf(' ');
+        return sp > 0 ? rest[..sp] : rest;
+    }
+
+    private static string TruncateForBubble(string s, int max = 4000)
+    {
+        if (string.IsNullOrEmpty(s)) return "(empty reply)";
+        if (s.Length <= max) return s;
+        return s[..max] + $"\n\n…(truncated {s.Length - max} chars; full text in CluadeX session)";
+    }
+
+    private enum BubbleKind { User, Intern, Worker, Status, Error }
+
+    private void AppendArenaBubble(BubbleKind kind, string header, string body, string? taskId)
+    {
+        if (ArenaBubbleFeed == null) return;
+        if (ArenaEmptyHint != null) ArenaEmptyHint.Visibility = Visibility.Collapsed;
+
+        var (bg, border, headerBrush, align) = kind switch
+        {
+            BubbleKind.User =>     ("#26000033", "#4F4FFFE2", "#4FFFE2", HorizontalAlignment.Right),
+            BubbleKind.Intern =>   ("#26330080", "#4F9F7AEA", "#9F7AEA", HorizontalAlignment.Left),
+            BubbleKind.Worker =>   ("#26003322", "#4F4FFFE2", "#7CFFB0", HorizontalAlignment.Left),
+            BubbleKind.Status =>   ("#22444466", "#33888899", "#AAAACC", HorizontalAlignment.Left),
+            BubbleKind.Error =>    ("#33CC2244", "#AACC2244", "#FF8888", HorizontalAlignment.Stretch),
+            _ => ("#22000000", "#33888888", "#CCCCCC", HorizontalAlignment.Left),
+        };
+
+        var bubble = new Border
+        {
+            Background = (Brush)new BrushConverter().ConvertFromString(bg)!,
+            BorderBrush = (Brush)new BrushConverter().ConvertFromString(border)!,
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(8),
+            Padding = new Thickness(10, 6, 10, 8),
+            Margin = new Thickness(0, 0, 0, 8),
+            HorizontalAlignment = align,
+            MaxWidth = 720,
+        };
+
+        var stack = new StackPanel();
+
+        var headerRow = new DockPanel { LastChildFill = false, Margin = new Thickness(0, 0, 0, 4) };
+        var headerText = new TextBlock
+        {
+            Text = header,
+            FontSize = 11,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = (Brush)new BrushConverter().ConvertFromString(headerBrush)!,
+        };
+        DockPanel.SetDock(headerText, Dock.Left);
+        headerRow.Children.Add(headerText);
+
+        var ts = new TextBlock
+        {
+            Text = DateTime.Now.ToString("HH:mm:ss"),
+            FontSize = 9,
+            FontFamily = (System.Windows.Media.FontFamily)FindResource("MonoFont"),
+            Foreground = (Brush)FindResource("TextMutedBrush"),
+            Margin = new Thickness(12, 0, 0, 0),
+        };
+        DockPanel.SetDock(ts, Dock.Right);
+        headerRow.Children.Add(ts);
+        stack.Children.Add(headerRow);
+
+        var bodyText = new TextBlock
+        {
+            Text = body,
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = (Brush)FindResource("TextPrimaryBrush"),
+        };
+        // Worker output is often code/diff — switch to mono for readability.
+        if (kind == BubbleKind.Worker)
+            bodyText.FontFamily = (System.Windows.Media.FontFamily)FindResource("MonoFont");
+        stack.Children.Add(bodyText);
+
+        if (kind == BubbleKind.Worker && !string.IsNullOrEmpty(taskId))
+        {
+            var openBtn = new Button
+            {
+                Content = "🪟 Open in CluadeX",
+                Style = (Style)FindResource("NeonButton"),
+                Padding = new Thickness(8, 3, 8, 3),
+                FontSize = 10,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                Margin = new Thickness(0, 8, 0, 0),
+                Tag = taskId,
+                ToolTip = $"Bring CluadeX's window forward. Look for session [ObsidianX] {taskId} in its sidebar.",
+            };
+            openBtn.Click += OpenInCluadeX_Click;
+            stack.Children.Add(openBtn);
+        }
+
+        bubble.Child = stack;
+        ArenaBubbleFeed.Children.Add(bubble);
+
+        // Cap feed length so a long-running session doesn't grow unbounded.
+        // Keep last 200 bubbles — plenty for one orchestration round-trip.
+        const int maxBubbles = 200;
+        while (ArenaBubbleFeed.Children.Count > maxBubbles)
+            ArenaBubbleFeed.Children.RemoveAt(0);
+
+        if (_arenaScrollSticky)
+        {
+            // Defer to ContextIdle so the layout has measured the new bubble
+            // before we ask for ScrollToEnd — otherwise the first scroll
+            // computes against the pre-add content height and lags by one.
+            Dispatcher.BeginInvoke(new Action(() => ArenaBubbleScroll?.ScrollToEnd()),
+                DispatcherPriority.ContextIdle);
+        }
+    }
+
+    private void ArenaBubbleScroll_ScrollChanged(object sender, ScrollChangedEventArgs e)
+    {
+        if (sender is not ScrollViewer sv) return;
+        // Within ~16 px of the bottom counts as "pinned" — gives a small
+        // tolerance so a one-pixel overshoot during fast updates doesn't
+        // unstick auto-scroll.
+        _arenaScrollSticky = (sv.VerticalOffset + sv.ViewportHeight) >= (sv.ExtentHeight - 16);
+    }
+
+    private void ArenaClear_Click(object sender, RoutedEventArgs e)
+    {
+        if (ArenaBubbleFeed == null) return;
+        ArenaBubbleFeed.Children.Clear();
+        if (ArenaEmptyHint != null)
+        {
+            ArenaBubbleFeed.Children.Add(ArenaEmptyHint);
+            ArenaEmptyHint.Visibility = Visibility.Visible;
+        }
+        if (ArenaBudgetGauge != null) ArenaBudgetGauge.Text = "idle";
+        _arenaScrollSticky = true;
+    }
+
+    private void ArenaCancel_Click(object sender, RoutedEventArgs e)
+    {
+        try { _orchestratorCts?.Cancel(); }
+        catch { /* race with completion is fine */ }
+    }
+
+    /// <summary>Bring CluadeX's main window to the foreground so the user
+    /// can scroll to the [ObsidianX] task session in its sidebar. Doesn't
+    /// jump to a specific session — CluadeX would need a focus_session
+    /// MCP tool for that, future work.</summary>
+    private void OpenInCluadeX_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var procs = Process.GetProcessesByName("CluadeX");
+            if (procs.Length == 0)
+            {
+                if (ArenaBudgetGauge != null)
+                    ArenaBudgetGauge.Text = "(CluadeX process not running — was it closed?)";
+                return;
+            }
+            var p = procs[0];
+            var hwnd = p.MainWindowHandle;
+            if (hwnd == IntPtr.Zero) return;
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"OpenInCluadeX failed: {ex.Message}");
+        }
+    }
+
+    private void StartArenaBudgetTicker()
+    {
+        StopArenaBudgetTicker();
+        _arenaBudgetTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        _arenaBudgetTimer.Tick += (_, _) =>
+        {
+            if (ArenaBudgetGauge == null || _orchestratorCts == null) return;
+            var elapsed = DateTime.UtcNow - _arenaTaskStart;
+            // Append the live elapsed counter without clobbering the phase
+            // text the orchestrator events have set.
+            var current = ArenaBudgetGauge.Text;
+            int dot = current.IndexOf(" · ", StringComparison.Ordinal);
+            string head = dot > 0 ? current[..dot] : current;
+            ArenaBudgetGauge.Text = $"{head} · {elapsed:mm\\:ss} elapsed";
+        };
+        _arenaBudgetTimer.Start();
+    }
+
+    private void StopArenaBudgetTicker()
+    {
+        _arenaBudgetTimer?.Stop();
+        _arenaBudgetTimer = null;
+    }
+
     // ─── Console feed (chronological tail with sticky-bottom auto-scroll) ───
     //
     // Why an append-only design?
