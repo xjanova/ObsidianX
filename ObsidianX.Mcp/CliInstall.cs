@@ -33,6 +33,8 @@ internal static class CliInstall
         Console.WriteLine("  obsidianx-mcp                           Run as MCP server (default; spawned by Claude Code)");
         Console.WriteLine("  obsidianx-mcp <vault-path>              Run as MCP server with explicit vault path");
         Console.WriteLine("  obsidianx-mcp install [options]         Install brain-first rules + print MCP registration");
+        Console.WriteLine("  obsidianx-mcp register-claude [--vault] Re-register this binary with Claude Code (auto-includes");
+        Console.WriteLine("                                          OBSIDIANX_MCP_VERSION env so version shows in `claude mcp get`)");
         Console.WriteLine("  obsidianx-mcp --version | -v | version  Print version + binary path + build time");
         Console.WriteLine("  obsidianx-mcp help                      Show this help");
         Console.WriteLine();
@@ -95,7 +97,17 @@ internal static class CliInstall
         Console.WriteLine();
         Console.WriteLine("  Run this once to register the MCP server with Claude Code:");
         Console.WriteLine();
-        Console.WriteLine($"    claude mcp add obsidianx-brain \"{exePath}\" \"{vault}\"");
+        // Include OBSIDIANX_MCP_VERSION env so `claude mcp get obsidianx-brain`
+        // surfaces the version in its Environment: block — without this hack,
+        // Claude Code's CLI doesn't display the serverInfo.version that the
+        // MCP advertises during initialize.
+        Console.WriteLine($"    claude mcp add obsidianx-brain \"{exePath}\" \"{vault}\" \\");
+        Console.WriteLine($"      -e OBSIDIANX_VAULT=\"{vault}\" \\");
+        Console.WriteLine($"      -e OBSIDIANX_MCP_VERSION={Program.ServerVersion}");
+        Console.WriteLine();
+        Console.WriteLine("  Or let this binary do it for you (removes any existing registration first):");
+        Console.WriteLine();
+        Console.WriteLine($"    obsidianx-mcp register-claude");
         Console.WriteLine();
         Console.WriteLine("  Or add this to your project's .mcp.json:");
         Console.WriteLine();
@@ -107,7 +119,11 @@ internal static class CliInstall
                 {
                     ["command"] = exePath,
                     ["args"] = new JArray { vault },
-                    ["env"] = new JObject { ["OBSIDIANX_VAULT"] = vault }
+                    ["env"] = new JObject
+                    {
+                        ["OBSIDIANX_VAULT"] = vault,
+                        ["OBSIDIANX_MCP_VERSION"] = Program.ServerVersion
+                    }
                 }
             }
         };
@@ -239,6 +255,152 @@ internal static class CliInstall
         if (!string.IsNullOrWhiteSpace(env) && Directory.Exists(env))
             return Path.GetFullPath(env);
         return Path.GetFullPath(Environment.CurrentDirectory);
+    }
+
+    /// <summary>
+    /// One-shot `claude mcp` registration. Replaces any existing
+    /// "obsidianx-brain" entry with one that points at THIS exe and
+    /// carries OBSIDIANX_MCP_VERSION as an env var — that env var is
+    /// the only way to surface the running version in
+    /// `claude mcp get obsidianx-brain` output, because Claude Code's
+    /// CLI doesn't render the MCP `initialize.serverInfo.version`
+    /// that the server already advertises.
+    /// </summary>
+    public static async Task<int> RegisterClaudeAsync(string[] args)
+    {
+        string? vaultArg = null;
+        bool showHelp = false;
+        for (int i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--vault" when i + 1 < args.Length: vaultArg = args[++i]; break;
+                case "-h" or "--help" or "help": showHelp = true; break;
+            }
+        }
+        if (showHelp)
+        {
+            Console.WriteLine("Usage: obsidianx-mcp register-claude [--vault PATH]");
+            Console.WriteLine();
+            Console.WriteLine("Registers this binary with Claude Code by running the equivalent of:");
+            Console.WriteLine("  claude mcp remove obsidianx-brain -s local   (if it exists)");
+            Console.WriteLine("  claude mcp add obsidianx-brain <exe> <vault> -e OBSIDIANX_VAULT=<vault> -e OBSIDIANX_MCP_VERSION=<v>");
+            Console.WriteLine();
+            Console.WriteLine("The version env makes `claude mcp get` show the version under Environment:.");
+            return 0;
+        }
+
+        var vault = ResolveVault(vaultArg);
+        var exePath = ResolveSelfPath();
+        var pathQuality = ClassifyExePath(exePath);
+        Console.WriteLine($"obsidianx-mcp register-claude · v{Program.ServerVersion}");
+        Console.WriteLine($"  exe:   {exePath}");
+        Console.WriteLine($"  vault: {vault}");
+        Console.WriteLine();
+        if (pathQuality != ExePathQuality.Ok)
+        {
+            Console.WriteLine($"  ⚠  {DescribePathQuality(pathQuality)}");
+            Console.WriteLine("     Run this command from the published Release exe instead.");
+            return 2;
+        }
+        // Quietly remove any existing registration — ignore exit code because
+        // `claude mcp remove` fails when the name isn't registered, which is
+        // a fine no-op for fresh installs.
+        Console.WriteLine("[1/2] removing any existing obsidianx-brain registration...");
+        await RunClaudeAsync("mcp", "remove", "obsidianx-brain", "-s", "local").ConfigureAwait(false);
+        Console.WriteLine("[2/2] adding fresh registration with version env...");
+        var rc = await RunClaudeAsync(
+            "mcp", "add", "obsidianx-brain",
+            exePath, vault,
+            "-e", $"OBSIDIANX_VAULT={vault}",
+            "-e", $"OBSIDIANX_MCP_VERSION={Program.ServerVersion}"
+        ).ConfigureAwait(false);
+        if (rc != 0)
+        {
+            Console.WriteLine($"  ✗ `claude mcp add` exited with code {rc}. Run it manually:");
+            Console.WriteLine($"    claude mcp add obsidianx-brain \"{exePath}\" \"{vault}\" -e OBSIDIANX_VAULT=\"{vault}\" -e OBSIDIANX_MCP_VERSION={Program.ServerVersion}");
+            return rc;
+        }
+        Console.WriteLine();
+        Console.WriteLine($"✓ Done. Verify with `claude mcp get obsidianx-brain` — the");
+        Console.WriteLine($"  Environment block now shows OBSIDIANX_MCP_VERSION={Program.ServerVersion}.");
+        Console.WriteLine($"  Restart Claude Code to spawn a fresh MCP process from the new config.");
+        return 0;
+    }
+
+    /// <summary>
+    /// Run `claude <args...>` and forward stdout/stderr to the console.
+    /// `claude` ships as a Node CLI on Windows so the actual launcher is
+    /// `claude.cmd` (an npm-style batch shim). `Process.Start("claude")`
+    /// only auto-resolves `.exe` extensions, so we have to either:
+    ///   1. find the actual .cmd / .ps1 in PATH ourselves, OR
+    ///   2. spawn through cmd.exe /c so it does the lookup.
+    /// We pick (1) because cmd.exe quoting is fragile with paths
+    /// containing spaces or special characters. Falls back to plain
+    /// `claude` on non-Windows hosts where shells handle the lookup.
+    /// </summary>
+    private static async Task<int> RunClaudeAsync(params string[] args)
+    {
+        var launcher = ResolveClaudeLauncher();
+        if (launcher == null)
+        {
+            Console.WriteLine("    [error] `claude` binary not found in PATH. Install Claude Code first: https://docs.claude.com/en/docs/claude-code/quickstart");
+            return -2;
+        }
+        var psi = new System.Diagnostics.ProcessStartInfo(launcher)
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+        try
+        {
+            using var p = System.Diagnostics.Process.Start(psi)
+                          ?? throw new InvalidOperationException("failed to start claude");
+            var outTask = p.StandardOutput.ReadToEndAsync();
+            var errTask = p.StandardError.ReadToEndAsync();
+            await p.WaitForExitAsync().ConfigureAwait(false);
+            var stdout = await outTask.ConfigureAwait(false);
+            var stderr = await errTask.ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(stdout))
+                foreach (var line in stdout.Split('\n')) Console.WriteLine("    " + line.TrimEnd('\r'));
+            if (!string.IsNullOrWhiteSpace(stderr))
+                foreach (var line in stderr.Split('\n')) Console.WriteLine("    [err] " + line.TrimEnd('\r'));
+            return p.ExitCode;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"    [exception] {ex.Message}");
+            return -1;
+        }
+    }
+
+    /// <summary>
+    /// Find `claude` on the system. On Windows, npm-installed CLIs land
+    /// as `claude.cmd` in %APPDATA%/npm or similar; `Process.Start` won't
+    /// auto-resolve `.cmd` like a shell does. We walk PATH and test
+    /// candidates with the platform's known executable extensions.
+    /// </summary>
+    private static string? ResolveClaudeLauncher()
+    {
+        var isWindows = System.Runtime.InteropServices.RuntimeInformation
+            .IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
+        string[] extensions = isWindows
+            ? [".exe", ".cmd", ".bat", ".ps1", ""]
+            : ["", ".sh"];
+
+        var path = Environment.GetEnvironmentVariable("PATH") ?? "";
+        var sep = isWindows ? ';' : ':';
+        foreach (var dir in path.Split(sep, StringSplitOptions.RemoveEmptyEntries))
+        {
+            foreach (var ext in extensions)
+            {
+                var candidate = Path.Combine(dir.Trim(), "claude" + ext);
+                if (File.Exists(candidate)) return candidate;
+            }
+        }
+        return null;
     }
 
     private static string ResolveSelfPath()

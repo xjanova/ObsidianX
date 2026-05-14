@@ -68,6 +68,12 @@ internal static class Program
             Console.OutputEncoding = new UTF8Encoding(false);
             return await CliInstall.RunAsync(args.Skip(1).ToArray()).ConfigureAwait(false);
         }
+        if (args.Length > 0 && (args[0].Equals("register-claude", StringComparison.OrdinalIgnoreCase)
+                              || args[0].Equals("register", StringComparison.OrdinalIgnoreCase)))
+        {
+            Console.OutputEncoding = new UTF8Encoding(false);
+            return await CliInstall.RegisterClaudeAsync(args.Skip(1).ToArray()).ConfigureAwait(false);
+        }
         if (args.Length > 0 && (args[0] == "--version" || args[0] == "-v" || args[0].Equals("version", StringComparison.OrdinalIgnoreCase)))
         {
             Console.OutputEncoding = new UTF8Encoding(false);
