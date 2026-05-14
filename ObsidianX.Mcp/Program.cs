@@ -21,7 +21,39 @@ internal static class Program
 {
     private const string ProtocolVersion = "2025-06-18";
     private const string ServerName = "obsidianx-brain";
-    private const string ServerVersion = "2.3.0";
+    internal const string ServerVersion = "2.3.0";
+
+    /// <summary>
+    /// Build a one-line version string including the bound assembly's
+    /// InformationalVersion (which the SDK stamps with the git commit
+    /// hash via SourceLink, e.g. "2.3.0+37e74ec...") plus the binary
+    /// path so the user can confirm they're talking to the EXE they
+    /// think they are. Shared by `--version`, install banner, and
+    /// brain_stats so every surface reports the same thing.
+    /// </summary>
+    internal static string BuildVersionString()
+    {
+        var asm = System.Reflection.Assembly.GetExecutingAssembly();
+        var info = asm.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+                       .OfType<System.Reflection.AssemblyInformationalVersionAttribute>()
+                       .FirstOrDefault()?.InformationalVersion
+                  ?? ServerVersion;
+        var loc = asm.Location;
+        // InvariantCulture matters here — on Thai-locale machines (which
+        // is the default for this brain's owner), Buddhist Era year
+        // formatting otherwise renders 2026 as 2569 in the version banner.
+        var built = string.IsNullOrEmpty(loc)
+            ? "?"
+            : new FileInfo(loc).LastWriteTimeUtc.ToString(
+                "yyyy-MM-dd HH:mm 'UTC'",
+                System.Globalization.CultureInfo.InvariantCulture);
+        return $"obsidianx-mcp {info}\n  built: {built}\n  path:  {(string.IsNullOrEmpty(loc) ? "(unknown)" : loc)}";
+    }
+
+    private static void PrintVersion()
+    {
+        Console.WriteLine(BuildVersionString());
+    }
 
     private static string _vaultPath = ResolveVault(Environment.GetCommandLineArgs());
 
@@ -29,11 +61,18 @@ internal static class Program
     {
         // CLI subcommand dispatch — single binary, multiple modes.
         // `obsidianx-mcp install [--vault PATH]` runs the installer and exits;
+        // `obsidianx-mcp --version` prints the version and exits;
         // anything else (including no args) runs the MCP server.
         if (args.Length > 0 && args[0].Equals("install", StringComparison.OrdinalIgnoreCase))
         {
             Console.OutputEncoding = new UTF8Encoding(false);
             return await CliInstall.RunAsync(args.Skip(1).ToArray()).ConfigureAwait(false);
+        }
+        if (args.Length > 0 && (args[0] == "--version" || args[0] == "-v" || args[0].Equals("version", StringComparison.OrdinalIgnoreCase)))
+        {
+            Console.OutputEncoding = new UTF8Encoding(false);
+            PrintVersion();
+            return 0;
         }
         if (args.Length > 0 && (args[0] == "--help" || args[0] == "-h" || args[0] == "help"))
         {
@@ -842,8 +881,31 @@ internal static class Program
         }
         var total = hits + misses;
         var hitRate = total == 0 ? 0.0 : Math.Round((double)hits / total, 3);
+
+        // ServerInfo block — surfaces the running MCP version inline so a
+        // single brain_stats call answers "which build of the brain am I
+        // talking to?" without the user needing a CLI flag. The version
+        // mirrors what gets sent in the initialize handshake; the binary
+        // path lets the user verify they aren't pinned to a stale install.
+        var asm = System.Reflection.Assembly.GetExecutingAssembly();
+        var infoVer = asm.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+                          .OfType<System.Reflection.AssemblyInformationalVersionAttribute>()
+                          .FirstOrDefault()?.InformationalVersion
+                     ?? ServerVersion;
+        var binPath = asm.Location ?? "";
+        var binBuilt = string.IsNullOrEmpty(binPath) ? null : (DateTime?)new FileInfo(binPath).LastWriteTimeUtc;
+
         return new JObject
         {
+            ["serverInfo"] = new JObject
+            {
+                ["name"] = ServerName,
+                ["version"] = ServerVersion,
+                ["informationalVersion"] = infoVer,
+                ["protocolVersion"] = ProtocolVersion,
+                ["binaryPath"] = binPath,
+                ["binaryBuiltAt"] = binBuilt
+            },
             ["brainAddress"] = export.BrainAddress,
             ["displayName"] = export.DisplayName,
             ["generatedAt"] = export.GeneratedAt,

@@ -27,12 +27,13 @@ internal static class CliInstall
 {
     public static void PrintTopLevelHelp()
     {
-        Console.WriteLine("ObsidianX MCP — local-first brain for Claude Code");
+        Console.WriteLine("ObsidianX MCP " + Program.ServerVersion + " — local-first brain for Claude Code");
         Console.WriteLine();
         Console.WriteLine("Usage:");
         Console.WriteLine("  obsidianx-mcp                           Run as MCP server (default; spawned by Claude Code)");
         Console.WriteLine("  obsidianx-mcp <vault-path>              Run as MCP server with explicit vault path");
         Console.WriteLine("  obsidianx-mcp install [options]         Install brain-first rules + print MCP registration");
+        Console.WriteLine("  obsidianx-mcp --version | -v | version  Print version + binary path + build time");
         Console.WriteLine("  obsidianx-mcp help                      Show this help");
         Console.WriteLine();
         Console.WriteLine("`install` options:");
@@ -40,6 +41,10 @@ internal static class CliInstall
         Console.WriteLine("  --pull-models    Pull nomic-embed-text + gemma3:4b via local Ollama if reachable");
         Console.WriteLine("  --precompute     Run embedding precompute after install (slow first time, ~1-2 min for 600 notes)");
         Console.WriteLine("  --quiet          Suppress section headers; print just status lines");
+        Console.WriteLine();
+        Console.WriteLine("Inside Claude Code:");
+        Console.WriteLine("  Ask Claude for `brain_stats` — its `serverInfo` block shows the running");
+        Console.WriteLine("  version, binary path, and last-built timestamp.");
     }
 
     public static async Task<int> RunAsync(string[] args)
@@ -48,9 +53,10 @@ internal static class CliInstall
         if (opts.ShowHelp) { PrintInstallHelp(); return 0; }
 
         var vault = ResolveVault(opts.Vault);
-        Section(opts, "ObsidianX install");
-        Console.WriteLine($"  Vault:     {vault}");
+        Section(opts, "ObsidianX install · v" + Program.ServerVersion);
+        Console.WriteLine($"  MCP ver:   {Program.ServerVersion}");
         Console.WriteLine($"  Rules ver: {ClaudeBrainRulesInstaller.RuleVersion}");
+        Console.WriteLine($"  Vault:     {vault}");
         Console.WriteLine();
 
         // Step 1 — memory rules
@@ -69,6 +75,24 @@ internal static class CliInstall
         // Step 2 — MCP registration command (we print, user runs)
         Section(opts, "2/4  MCP registration in Claude Code");
         var exePath = ResolveSelfPath();
+        var pathQuality = ClassifyExePath(exePath);
+        if (pathQuality != ExePathQuality.Ok)
+        {
+            // Bad-path warning. Common case: user ran `dotnet run` from the
+            // project dir, so ResolveSelfPath returned a Debug/obj DLL.
+            // Registering that path makes the MCP launcher chase a target
+            // that disappears the moment the project is rebuilt. Tell the
+            // user to install from the published exe instead.
+            Console.WriteLine("  ⚠  WARNING: the resolved exe path looks unstable for production use.");
+            Console.WriteLine($"      path:   {exePath}");
+            Console.WriteLine($"      issue:  {DescribePathQuality(pathQuality)}");
+            Console.WriteLine("      fix:    run this command from the PUBLISHED exe instead, e.g.");
+            Console.WriteLine("              G:\\Obsidian\\ObsidianX\\ObsidianX.Mcp\\bin\\Release\\net9.0\\obsidianx-mcp.exe install");
+            Console.WriteLine("              or use `dotnet publish -c Release` first and run the publish-dir exe.");
+            Console.WriteLine();
+        }
+        Console.WriteLine($"  exe: {exePath}");
+        Console.WriteLine();
         Console.WriteLine("  Run this once to register the MCP server with Claude Code:");
         Console.WriteLine();
         Console.WriteLine($"    claude mcp add obsidianx-brain \"{exePath}\" \"{vault}\"");
@@ -226,6 +250,35 @@ internal static class CliInstall
         var exe = Path.ChangeExtension(loc, ".exe");
         return File.Exists(exe) ? exe : loc;
     }
+
+    /// <summary>
+    /// Categorise the resolved self-path to spot installs that will rot.
+    /// `bin/Debug` and `obj/` paths get rebuilt on every `dotnet build` and
+    /// disappear when the user runs `dotnet clean`, so registering them
+    /// with Claude Code leads to "MCP launcher points at a stale binary"
+    /// — exactly the bug session #4 spent half its time debugging.
+    /// </summary>
+    private enum ExePathQuality { Ok, Debug, Obj, Dll, NotFound }
+
+    private static ExePathQuality ClassifyExePath(string exePath)
+    {
+        if (string.IsNullOrEmpty(exePath)) return ExePathQuality.NotFound;
+        if (!File.Exists(exePath)) return ExePathQuality.NotFound;
+        var norm = exePath.Replace('\\', '/').ToLowerInvariant();
+        if (norm.Contains("/obj/")) return ExePathQuality.Obj;
+        if (norm.Contains("/bin/debug/")) return ExePathQuality.Debug;
+        if (norm.EndsWith(".dll")) return ExePathQuality.Dll;
+        return ExePathQuality.Ok;
+    }
+
+    private static string DescribePathQuality(ExePathQuality q) => q switch
+    {
+        ExePathQuality.Debug    => "this is a Debug build — get overwritten on next `dotnet build`. Use Release or publish output.",
+        ExePathQuality.Obj      => "this is in obj/ — intermediate output, gets wiped on `dotnet clean`. Use Release or publish output.",
+        ExePathQuality.Dll      => "this is a .dll without a sibling .exe — Claude Code can't launch it directly; use `dotnet publish` to produce a standalone exe.",
+        ExePathQuality.NotFound => "the resolved path doesn't exist on disk.",
+        _                       => "unknown"
+    };
 
     private static string? ComputeMemoryDir(string vault)
     {
