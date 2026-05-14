@@ -27,11 +27,41 @@ internal static class Program
 
     public static async Task<int> Main(string[] args)
     {
+        // CLI subcommand dispatch — single binary, multiple modes.
+        // `obsidianx-mcp install [--vault PATH]` runs the installer and exits;
+        // anything else (including no args) runs the MCP server.
+        if (args.Length > 0 && args[0].Equals("install", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.OutputEncoding = new UTF8Encoding(false);
+            return await CliInstall.RunAsync(args.Skip(1).ToArray()).ConfigureAwait(false);
+        }
+        if (args.Length > 0 && (args[0] == "--help" || args[0] == "-h" || args[0] == "help"))
+        {
+            Console.OutputEncoding = new UTF8Encoding(false);
+            CliInstall.PrintTopLevelHelp();
+            return 0;
+        }
+
         // stdin/stdout must be UTF-8, no BOM; stderr is free for logs.
         Console.InputEncoding = new UTF8Encoding(false);
         Console.OutputEncoding = new UTF8Encoding(false);
 
         Log($"Starting MCP server · vault={_vaultPath}");
+
+        // Self-install brain-first memory rules into the user's Claude
+        // Code project memory dir, idempotently. Mirrors what
+        // ObsidianX.Client does on first launch — but Client may not be
+        // running yet (or may not be installed at all on a CLI-only
+        // machine). MCP is the universal entry point: every Claude
+        // Code session boots the MCP exe, so we wire policy here.
+        try
+        {
+            var result = ClaudeBrainRulesInstaller.EnsureInstalled(_vaultPath);
+            if (result is ClaudeBrainRulesInstaller.InstallResult.InstalledFresh
+                       or ClaudeBrainRulesInstaller.InstallResult.Upgraded)
+                Log($"brain rules: {result} (v{ClaudeBrainRulesInstaller.RuleVersion})");
+        }
+        catch (Exception ex) { Log($"brain rules install failed: {ex.Message}"); }
 
         // If ObsidianX client isn't running, bring it up. The MCP server
         // is spawned by Claude Desktop / Claude Code on first connection,
@@ -99,25 +129,28 @@ internal static class Program
             ["resources"] = new JObject()
         },
         ["instructions"] =
-            "This is xman's personal brain (ObsidianX), a living knowledge graph that grows over time.\n\n" +
-            "AUTO-JOURNAL — The server AUTOMATICALLY logs every tool call you make to " +
-            ".obsidianx/sessions/<date>.md. You never need to say 'I searched for X' — the brain is " +
-            "already tracking it. Focus your writes on SUBSTANCE, not bookkeeping.\n\n" +
-            "READING: brain_search (keyword), brain_get_note (full content by id), brain_expertise " +
-            "(owner's domains ranked), brain_list (category/tag filter), brain_stats (overview). " +
-            "ALWAYS prefer citing the owner's notes over generic answers — they represent actual " +
-            "first-hand knowledge.\n\n" +
-            "WRITING (proactively — this is how the brain gets smarter):\n" +
-            "• brain_create_note — full standalone note with YAML frontmatter. Use when you solved a " +
-            "  non-trivial problem, discovered a reusable technique, or the user says 'remember this' / " +
-            "  'save' / 'add a note' / 'จำไว้' / 'บันทึก'. Pick a folder like Notes/Claude-Sessions, " +
-            "  Programming, AI, Debugging, etc.\n" +
-            "• brain_append_note — add content to an existing note (id from brain_search).\n" +
-            "• brain_remember — ultra-lightweight one-liner to today's session journal. Use for small " +
-            "  in-progress thoughts that don't warrant a standalone note. Perfect for 'oh interesting, " +
-            "  so <library> behaves like <X>' mid-debugging.\n\n" +
-            "Rule of thumb: if you just spent > 2 tool calls figuring something out and the answer " +
-            "is non-trivial, SAVE IT. Every good answer should leave a trace in the vault."
+            "This is the owner's personal brain (ObsidianX) — a LIVING knowledge graph of 600+ notes, 1M+ words, 3,600+ wiki-links. It is NOT optional context. It is your primary memory.\n\n" +
+            "AUTO-JOURNAL — The server AUTOMATICALLY logs every tool call you make to .obsidianx/sessions/<date>.md. You NEVER need to narrate 'I searched for X' — the brain is already tracking it. Focus your output on substance.\n\n" +
+            "═══ HARD RULES ═══════════════════════════════════════════════\n\n" +
+            "BEFORE ANSWERING any non-trivial prompt:\n" +
+            "  1. Run brain_search with 2-4 keywords from the prompt.\n" +
+            "  2. If 0 hits: retry with brain_semantic_search (Ollama embeddings — finds notes with no keyword overlap, works for natural-language Thai).\n" +
+            "  3. Cite note titles you actually read. Citing proves the brain was consulted.\n" +
+            "  Skip ONLY for: trivial Q (<60 chars), prompt with explicit file path, generic framework knowledge.\n\n" +
+            "AFTER any answer that took > 2 tool calls AND produced a non-trivial insight:\n" +
+            "  → IMMEDIATELY call brain_create_note (full note) OR brain_remember (one-liner).\n" +
+            "  → Do NOT ask the user 'should I save this?'. Save by default. The user has explicitly opted into proactive saves (see project memory rules).\n" +
+            "  → If a note on the same topic exists, prefer brain_append_note over creating a duplicate.\n\n" +
+            "AT SESSION END (when user says 'พรุ่งนี้คุยต่อ' / 'save session' / 'handoff' / 'พักก่อน'):\n" +
+            "  → Write a #session-handoff note in Notes/Claude-Sessions/ with: branch, files touched, what shipped, what's pending, gotchas, deploy steps, open questions.\n" +
+            "  → The SessionStart hook auto-injects the most recent #session-handoff into the next Claude's context — a good handoff means the next session starts at full context.\n\n" +
+            "═══ TOOL MENU ════════════════════════════════════════════════\n\n" +
+            "READ:  brain_search (keyword) · brain_semantic_search (embeddings) · brain_get_note · brain_get_backlinks · brain_list · brain_stats · brain_expertise · brain_synthesize (top-K bundle) · brain_suggest_links · brain_find_contradictions (LLM-verified) · brain_suggest_topics (gap analysis)\n" +
+            "WRITE: brain_create_note · brain_append_note · brain_remember · brain_import_path\n" +
+            "REVIEW QUEUE: submit_for_review · fetch_review_queue · post_review_verdict (Co-Pilot Arena bridge)\n\n" +
+            "═══ HONESTY ═════════════════════════════════════════════════\n\n" +
+            "When a tool returns mode='keyword-fallback' or 'legacy-heuristic', the smart path degraded — tell the user briefly and suggest precompute. When mode='semantic' or 'llm-verified', that's the real thing.\n\n" +
+            "Citing the owner's notes ALWAYS beats a generic answer — these notes represent first-hand experience the model otherwise has no access to."
     });
 
     // ───────────── tools/list ─────────────
@@ -127,25 +160,30 @@ internal static class Program
         ["tools"] = new JArray
         {
             Tool("brain_search",
-                "Full-text search across brain notes. Returns top matches with title, category, tags, and preview.",
+                "Full-text search across brain notes. Returns top matches with title, category, tags, and a short preview (200 chars by default — pass preview_chars to override or compact:true to drop preview entirely for cheap triage).",
                 new JObject
                 {
                     ["type"] = "object",
                     ["properties"] = new JObject
                     {
                         ["query"] = new JObject { ["type"] = "string", ["description"] = "search keyword or phrase" },
-                        ["limit"] = new JObject { ["type"] = "integer", ["description"] = "max results (default 10)", ["default"] = 10 }
+                        ["limit"] = new JObject { ["type"] = "integer", ["description"] = "max results (default 10)", ["default"] = 10 },
+                        ["preview_chars"] = new JObject { ["type"] = "integer", ["description"] = "max chars per preview (default 200, set 0 for full preview)", ["default"] = 200 },
+                        ["compact"] = new JObject { ["type"] = "boolean", ["description"] = "if true, drop preview/path/category; return id+title+score+tags only", ["default"] = false }
                     },
                     ["required"] = new JArray { "query" }
                 }),
             Tool("brain_get_note",
-                "Fetch the full content of a single note by its id (from brain_search / brain_list).",
+                "Fetch a note by id. By default returns FULL content (can be 5-20k tokens). For token efficiency: pass truncate:N to cap content at N chars, OR section:'## Heading' to return only that section, OR metadata_only:true to skip content entirely.",
                 new JObject
                 {
                     ["type"] = "object",
                     ["properties"] = new JObject
                     {
-                        ["id"] = new JObject { ["type"] = "string" }
+                        ["id"] = new JObject { ["type"] = "string" },
+                        ["truncate"] = new JObject { ["type"] = "integer", ["description"] = "if >0, return only first N chars of content + truncated:true flag", ["default"] = 0 },
+                        ["section"] = new JObject { ["type"] = "string", ["description"] = "if set, return only the section under this heading (case-insensitive match on '# Heading' / '## Heading' etc.)" },
+                        ["metadata_only"] = new JObject { ["type"] = "boolean", ["description"] = "if true, omit content field entirely (id, title, path, tags, wordCount only)", ["default"] = false }
                     },
                     ["required"] = new JArray { "id" }
                 }),
@@ -242,14 +280,16 @@ internal static class Program
                 "Embedding-based semantic search — finds notes whose meaning is close to the query, " +
                 "even when no keywords overlap. Falls back to keyword search if Ollama is unreachable. " +
                 "Use this when the user asks an open-ended question or you need topical neighbors " +
-                "rather than exact-match hits.",
+                "rather than exact-match hits. Same preview_chars/compact options as brain_search.",
                 new JObject
                 {
                     ["type"] = "object",
                     ["properties"] = new JObject
                     {
                         ["query"] = new JObject { ["type"] = "string", ["description"] = "natural-language query" },
-                        ["limit"] = new JObject { ["type"] = "integer", ["default"] = 10 }
+                        ["limit"] = new JObject { ["type"] = "integer", ["default"] = 10 },
+                        ["preview_chars"] = new JObject { ["type"] = "integer", ["default"] = 200 },
+                        ["compact"] = new JObject { ["type"] = "boolean", ["default"] = false }
                     },
                     ["required"] = new JArray { "query" }
                 }),
@@ -282,15 +322,23 @@ internal static class Program
                     ["required"] = new JArray { "id" }
                 }),
             Tool("brain_find_contradictions",
-                "Scan the brain for note pairs that share keywords/topic but disagree (different " +
-                "categories, contradictory tags, or opposite framing). Returns suspicious pairs so " +
-                "the user can reconcile them. Best used periodically as a knowledge-hygiene check.",
+                "AI-verified contradiction scan. Phase 1 picks candidate pairs by SEMANTIC similarity " +
+                "(cosine 0.55-0.92 — same topic but not duplicates). Phase 2 asks a local Ollama model " +
+                "whether each pair makes ACTUAL contradictory factual claims and returns structured " +
+                "output: { topic, claimA, claimB, severity, explanation }. Falls back to a tag/category " +
+                "heuristic with mode='legacy-heuristic' when embeddings aren't built yet. Use periodically " +
+                "as a knowledge-hygiene check.",
                 new JObject
                 {
                     ["type"] = "object",
                     ["properties"] = new JObject
                     {
-                        ["limit"] = new JObject { ["type"] = "integer", ["default"] = 20 }
+                        ["limit"] = new JObject { ["type"] = "integer", ["default"] = 20, ["description"] = "max contradictions to return" },
+                        ["verify"] = new JObject { ["type"] = "boolean", ["default"] = true, ["description"] = "if false, return raw semantic candidates without LLM verification (faster, noisier)" },
+                        ["model"] = new JObject { ["type"] = "string", ["default"] = "gemma3:4b", ["description"] = "Ollama model used for verification (e.g. gemma3:4b, gemma3:4b, deepseek-r1:8b, gemma3:27b)" },
+                        ["minSim"] = new JObject { ["type"] = "number", ["default"] = 0.55, ["description"] = "minimum cosine similarity for candidates" },
+                        ["maxSim"] = new JObject { ["type"] = "number", ["default"] = 0.92, ["description"] = "maximum cosine similarity (above = duplicates, not contradictions)" },
+                        ["maxScan"] = new JObject { ["type"] = "integer", ["default"] = 30, ["description"] = "cap on candidate pairs sent to the LLM (budget control)" }
                     }
                 }),
             Tool("brain_suggest_topics",
@@ -306,6 +354,43 @@ internal static class Program
                         ["windowDays"] = new JObject { ["type"] = "integer", ["description"] = "days of history to analyze (default 14)", ["default"] = 14 },
                         ["limit"] = new JObject { ["type"] = "integer", ["default"] = 10 }
                     }
+                }),
+            Tool("brain_audit",
+                "Holistic brain health scan. Walks every note and reports issues across five categories: " +
+                "structural (missing frontmatter, broken wiki-links), content quality (stubs, untagged, " +
+                "uncategorized, wall-of-text), graph health (orphans, super-hubs, near-duplicates, " +
+                "stale notes), embedding freshness (missing/stale/orphan sidecars), and writes a single " +
+                "brainHealth score in [0,1]. Persists summary to .obsidianx/last-audit.json. Use this " +
+                "weekly OR when the user asks 'is my brain healthy?' / 'scan' / 'audit' / 'ตรวจสอบสมอง'.",
+                new JObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JObject
+                    {
+                        ["includeNearDupes"] = new JObject { ["type"] = "boolean", ["default"] = true, ["description"] = "Run O(n²) cosine pass for near-duplicate detection (skip on huge brains for speed)" },
+                        ["staleDays"] = new JObject { ["type"] = "integer", ["default"] = 90, ["description"] = "Notes not modified in this many days are flagged as stale" },
+                        ["dupeThreshold"] = new JObject { ["type"] = "number", ["default"] = 0.95, ["description"] = "Cosine similarity threshold for near-duplicate detection" },
+                        ["limit"] = new JObject { ["type"] = "integer", ["default"] = 15, ["description"] = "Max items per category in the report (counts are still total)" },
+                        ["structuralSample"] = new JObject { ["type"] = "integer", ["default"] = 200, ["description"] = "Number of (most-recent) notes to actually file-read for frontmatter/wiki-link checks" }
+                    }
+                }),
+            Tool("brain_apply_audit_fix",
+                "Apply (or preview) auto-fixes from the audit report. Kinds: " +
+                "'missing-embeddings' / 'stale-embeddings' (triggers EmbeddingService precompute, no LLM); " +
+                "'untagged' (asks Ollama for 3-5 tags per note from the body, dry-run by default); " +
+                "'uncategorized' (asks Ollama to pick a KnowledgeCategory, advisory only — applying needs a frontmatter edit). " +
+                "LLM-based kinds default to dryRun=true so you see what would change before any file is touched.",
+                new JObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JObject
+                    {
+                        ["kind"] = new JObject { ["type"] = "string", ["enum"] = new JArray { "missing-embeddings", "stale-embeddings", "untagged", "uncategorized" }, ["description"] = "Which audit fix to apply" },
+                        ["dryRun"] = new JObject { ["type"] = "boolean", ["default"] = true, ["description"] = "If true, show what would change without writing files" },
+                        ["model"] = new JObject { ["type"] = "string", ["default"] = "gemma3:4b", ["description"] = "Ollama model for LLM-based fixes" },
+                        ["limit"] = new JObject { ["type"] = "integer", ["default"] = 20, ["description"] = "Max notes to process in one call" }
+                    },
+                    ["required"] = new JArray { "kind" }
                 }),
             // ─── Co-Pilot Arena review queue (Phase 1C) ────────────────
             // Three tools that bridge the ObsidianX orchestrator and the
@@ -401,6 +486,8 @@ internal static class Program
                 "brain_suggest_links"       => BrainSuggestLinks(args),
                 "brain_find_contradictions" => BrainFindContradictions(args),
                 "brain_suggest_topics"      => BrainSuggestTopics(args),
+                "brain_audit"               => BrainAudit(args),
+                "brain_apply_audit_fix"     => BrainApplyAuditFix(args),
                 "submit_for_review"         => SubmitForReview(args),
                 "fetch_review_queue"        => FetchReviewQueue(args),
                 "post_review_verdict"       => PostReviewVerdict(args),
@@ -440,6 +527,8 @@ internal static class Program
     {
         var query = args["query"]?.ToString() ?? "";
         var limit = args["limit"]?.ToObject<int>() ?? 10;
+        var previewChars = args["preview_chars"]?.ToObject<int>() ?? 200;
+        var compact = args["compact"]?.ToObject<bool>() ?? false;
         if (string.IsNullOrWhiteSpace(query)) throw new ArgumentException("query is required");
 
         var export = LoadExport()
@@ -463,30 +552,75 @@ internal static class Program
         {
             ["query"] = query,
             ["count"] = matches.Count,
-            ["results"] = new JArray(matches.Select(x => new JObject
-            {
-                ["id"] = x.Node.Id,
-                ["title"] = x.Node.Title,
-                ["score"] = x.Score,
-                ["category"] = x.Node.PrimaryCategory,
-                ["tags"] = new JArray(x.Node.Tags),
-                ["path"] = x.Node.RelativePath,
-                ["preview"] = x.Node.Preview
-            }))
+            ["results"] = new JArray(matches.Select(x => BuildSearchResult(x.Node, x.Score, previewChars, compact)))
         };
+    }
+
+    private static JObject BuildSearchResult(NodeSummary n, double score, int previewChars, bool compact)
+    {
+        // Cap tags to avoid pathological notes (e.g. a CHANGELOG with 1000+ version
+        // numbers as tags) blowing up the response. 20 is enough for triage.
+        const int TagCap = 20;
+        var tags = n.Tags.Count > TagCap ? n.Tags.Take(TagCap).ToList() : (IList<string>)n.Tags;
+        var o = new JObject
+        {
+            ["id"] = n.Id,
+            ["title"] = n.Title,
+            ["score"] = score,
+            ["tags"] = new JArray(tags)
+        };
+        if (n.Tags.Count > TagCap) o["tagsTruncated"] = n.Tags.Count;
+        if (!compact)
+        {
+            o["category"] = n.PrimaryCategory;
+            o["path"] = n.RelativePath;
+            o["preview"] = TruncatePreview(n.Preview, previewChars);
+        }
+        return o;
+    }
+
+    private static string TruncatePreview(string? preview, int max)
+    {
+        if (string.IsNullOrEmpty(preview)) return "";
+        if (max <= 0 || preview.Length <= max) return preview;
+        var cut = preview[..max];
+        var lastSpace = cut.LastIndexOf(' ');
+        if (lastSpace > max - 60) cut = cut[..lastSpace];
+        return cut.TrimEnd() + "…";
+    }
+
+    private static string ExtractSection(string content, string heading)
+    {
+        if (string.IsNullOrEmpty(content) || string.IsNullOrEmpty(heading)) return "";
+        var trimmedHeading = heading.TrimStart('#').Trim();
+        var pattern = @"(?:^|\r?\n)(#{1,6})\s+" + Regex.Escape(trimmedHeading) + @"\s*(?:\r?\n|$)";
+        var m = Regex.Match(content, pattern, RegexOptions.IgnoreCase);
+        if (!m.Success) return $"[section '{heading}' not found]";
+        var start = m.Index + m.Length;
+        var level = m.Groups[1].Value.Length;
+        var rest = content[start..];
+        var nextPattern = @"(?:^|\r?\n)#{1," + level + @"}\s+";
+        var next = Regex.Match(rest, nextPattern);
+        var body = next.Success ? rest[..next.Index] : rest;
+        return body.Trim();
     }
 
     private static JToken BrainGetNote(JObject args)
     {
         var nodeId = args["id"]?.ToString() ?? throw new ArgumentException("id is required");
+        var truncate = args["truncate"]?.ToObject<int>() ?? 0;
+        var section = args["section"]?.ToString();
+        var metadataOnly = args["metadata_only"]?.ToObject<bool>() ?? false;
+
         var export = LoadExport() ?? throw new InvalidOperationException("no brain-export");
         var node = export.Nodes.FirstOrDefault(n => n.Id == nodeId)
             ?? throw new InvalidOperationException($"note not found: {nodeId}");
 
         var fullPath = Path.Combine(export.VaultPath, node.RelativePath);
-        var content = File.Exists(fullPath) ? File.ReadAllText(fullPath) : node.Preview;
+        var raw = File.Exists(fullPath) ? File.ReadAllText(fullPath) : node.Preview ?? "";
         LogAccess(node.Id, "get_note", node.Title);
-        return new JObject
+
+        var result = new JObject
         {
             ["id"] = node.Id,
             ["title"] = node.Title,
@@ -494,9 +628,33 @@ internal static class Program
             ["category"] = node.PrimaryCategory,
             ["tags"] = new JArray(node.Tags),
             ["wordCount"] = node.WordCount,
-            ["modifiedAt"] = node.ModifiedAt,
-            ["content"] = content
+            ["modifiedAt"] = node.ModifiedAt
         };
+
+        if (metadataOnly)
+        {
+            result["fullSize"] = raw.Length;
+            return result;
+        }
+
+        string content;
+        if (!string.IsNullOrWhiteSpace(section))
+        {
+            content = ExtractSection(raw, section!);
+            result["section"] = section;
+        }
+        else if (truncate > 0 && raw.Length > truncate)
+        {
+            content = raw[..truncate];
+            result["truncated"] = true;
+            result["fullSize"] = raw.Length;
+        }
+        else
+        {
+            content = raw;
+        }
+        result["content"] = content;
+        return result;
     }
 
     private static JToken BrainExpertise()
@@ -817,21 +975,15 @@ internal static class Program
         var node = export.Nodes.FirstOrDefault(n => n.Id == nodeId)
             ?? throw new InvalidOperationException($"note not found: {nodeId}");
 
+        var previewChars = args["preview_chars"]?.ToObject<int>() ?? 200;
+        var compact = args["compact"]?.ToObject<bool>() ?? false;
         var byId = export.Nodes.ToDictionary(n => n.Id, n => n);
         var backlinks = node.BacklinkIds
             .Where(byId.ContainsKey)
             .Select(id => byId[id])
             .OrderByDescending(n => n.Importance)
             .Take(limit)
-            .Select(n => new JObject
-            {
-                ["id"] = n.Id,
-                ["title"] = n.Title,
-                ["category"] = n.PrimaryCategory,
-                ["tags"] = new JArray(n.Tags),
-                ["path"] = n.RelativePath,
-                ["preview"] = n.Preview
-            });
+            .Select(n => BuildSearchResult(n, n.Importance, previewChars, compact));
         LogAccess(node.Id, "get_backlinks", node.Title);
         return new JObject
         {
@@ -857,6 +1009,8 @@ internal static class Program
     {
         var query = args["query"]?.ToString() ?? "";
         var limit = args["limit"]?.ToObject<int>() ?? 10;
+        var previewChars = args["preview_chars"]?.ToObject<int>() ?? 200;
+        var compact = args["compact"]?.ToObject<bool>() ?? false;
         if (string.IsNullOrWhiteSpace(query)) throw new ArgumentException("query is required");
         var export = LoadExport() ?? throw new InvalidOperationException("no brain-export");
 
@@ -906,16 +1060,7 @@ internal static class Program
             ["query"] = query,
             ["mode"] = mode,
             ["count"] = ranked.Count,
-            ["results"] = new JArray(ranked.Select(x => new JObject
-            {
-                ["id"] = x.node.Id,
-                ["title"] = x.node.Title,
-                ["score"] = Math.Round(x.score, 4),
-                ["category"] = x.node.PrimaryCategory,
-                ["tags"] = new JArray(x.node.Tags),
-                ["path"] = x.node.RelativePath,
-                ["preview"] = x.node.Preview
-            }))
+            ["results"] = new JArray(ranked.Select(x => BuildSearchResult(x.node, Math.Round(x.score, 4), previewChars, compact)))
         };
     }
 
@@ -983,6 +1128,7 @@ internal static class Program
     {
         var nodeId = args["id"]?.ToString() ?? throw new ArgumentException("id is required");
         var limit = args["limit"]?.ToObject<int>() ?? 8;
+        var previewChars = args["preview_chars"]?.ToObject<int>() ?? 200;
         var export = LoadExport() ?? throw new InvalidOperationException("no brain-export");
         var node = export.Nodes.FirstOrDefault(n => n.Id == nodeId)
             ?? throw new InvalidOperationException($"note not found: {nodeId}");
@@ -1031,23 +1177,140 @@ internal static class Program
                 ["similarity"] = Math.Round(x.s, 4),
                 ["category"] = x.n.PrimaryCategory,
                 ["sharedTags"] = new JArray(node.Tags.Intersect(x.n.Tags, StringComparer.OrdinalIgnoreCase)),
-                ["preview"] = x.n.Preview
+                ["preview"] = TruncatePreview(x.n.Preview, previewChars)
             }))
         };
     }
 
     /// <summary>
-    /// Knowledge-hygiene check. Heuristic: notes whose tags overlap
-    /// significantly but whose primary categories disagree → probably
-    /// either a miscategorisation or a topic that's drifted in two
-    /// directions. Pure keyword/tag for now; embeddings will refine
-    /// this once Batch 4's index is dense enough.
+    /// Knowledge-hygiene check that ACTUALLY checks. Two phases:
+    ///
+    ///   Phase 1 (semantic) — pick candidate pairs whose embeddings are
+    ///   close enough to share topic but not so close they're duplicates.
+    ///   Cosine in [minSim, maxSim] (default 0.55–0.92).
+    ///
+    ///   Phase 2 (LLM verify) — ask the local Ollama model whether the
+    ///   two notes ACTUALLY make contradictory factual claims, not just
+    ///   share tags. Returns structured output: topic, claimA, claimB,
+    ///   severity, explanation.
+    ///
+    /// Falls back to the old keyword/tag heuristic only when embeddings
+    /// aren't built yet, and labels the response mode honestly so the
+    /// caller can tell verified contradictions from raw candidates.
     /// </summary>
     private static JToken BrainFindContradictions(JObject args)
     {
         var limit = args["limit"]?.ToObject<int>() ?? 20;
+        var verify = args["verify"]?.ToObject<bool>() ?? true;
+        var model = args["model"]?.ToString() ?? "gemma3:4b";
+        var minSim = args["minSim"]?.ToObject<double>() ?? 0.55;
+        var maxSim = args["maxSim"]?.ToObject<double>() ?? 0.92;
+        var maxScan = args["maxScan"]?.ToObject<int>() ?? 30;
+
         var export = LoadExport() ?? throw new InvalidOperationException("no brain-export");
 
+        // Phase 0: pre-load embeddings — skip nodes without one.
+        var nodesWithEmb = new List<(NodeSummary node, float[] emb)>(export.Nodes.Count);
+        foreach (var n in export.Nodes)
+        {
+            var emb = LoadEmbedding(n.Id);
+            if (emb != null) nodesWithEmb.Add((n, emb));
+        }
+
+        if (nodesWithEmb.Count < 10)
+        {
+            // Embeddings not built yet → fall back to old heuristic but
+            // mark the mode honestly so callers don't trust it as verified.
+            return BrainFindContradictionsLegacy(export, limit);
+        }
+
+        // Phase 1: semantic candidate selection.
+        var candidates = new List<(NodeSummary a, NodeSummary b, double sim)>();
+        for (int i = 0; i < nodesWithEmb.Count; i++)
+        {
+            for (int j = i + 1; j < nodesWithEmb.Count; j++)
+            {
+                var sim = Cosine(nodesWithEmb[i].emb, nodesWithEmb[j].emb);
+                if (sim >= minSim && sim <= maxSim)
+                    candidates.Add((nodesWithEmb[i].node, nodesWithEmb[j].node, sim));
+            }
+        }
+        candidates.Sort((p, q) => q.sim.CompareTo(p.sim));
+        var top = candidates.Take(maxScan).ToList();
+
+        if (!verify)
+        {
+            return new JObject
+            {
+                ["mode"] = "semantic-candidates-only",
+                ["embeddedNotes"] = nodesWithEmb.Count,
+                ["candidatesTotal"] = candidates.Count,
+                ["pairs"] = new JArray(top.Take(limit).Select(c => new JObject
+                {
+                    ["a"] = NodeBrief(c.a),
+                    ["b"] = NodeBrief(c.b),
+                    ["similarity"] = Math.Round(c.sim, 3),
+                    ["note"] = "topic-similar but not LLM-verified — pass verify=true to confirm"
+                }))
+            };
+        }
+
+        // Phase 2: LLM verification.
+        var contradictions = new List<JObject>();
+        int scanned = 0;
+        foreach (var (a, b, sim) in top)
+        {
+            if (contradictions.Count >= limit) break;
+            scanned++;
+            var contentA = ReadNoteSnippet(export, a, 1500);
+            var contentB = ReadNoteSnippet(export, b, 1500);
+
+            var prompt = BuildContradictionPrompt(a, contentA, b, contentB);
+            var verdict = OllamaJsonChat(model, prompt);
+            if (verdict == null) continue;
+            if (verdict["hasContradiction"]?.ToObject<bool>() != true) continue;
+
+            contradictions.Add(new JObject
+            {
+                ["a"] = NodeBrief(a),
+                ["b"] = NodeBrief(b),
+                ["similarity"] = Math.Round(sim, 3),
+                ["topic"] = verdict["topic"]?.ToString() ?? "",
+                ["claimA"] = verdict["claimA"]?.ToString() ?? "",
+                ["claimB"] = verdict["claimB"]?.ToString() ?? "",
+                ["severity"] = verdict["severity"]?.ToString() ?? "moderate",
+                ["explanation"] = verdict["explanation"]?.ToString() ?? ""
+            });
+        }
+
+        return new JObject
+        {
+            ["mode"] = "llm-verified",
+            ["model"] = model,
+            ["embeddedNotes"] = nodesWithEmb.Count,
+            ["candidatesTotal"] = candidates.Count,
+            ["candidatesScanned"] = scanned,
+            ["contradictionsFound"] = contradictions.Count,
+            ["pairs"] = new JArray(contradictions)
+        };
+    }
+
+    private static JObject NodeBrief(NodeSummary n) => new()
+    {
+        ["id"] = n.Id,
+        ["title"] = n.Title,
+        ["category"] = n.PrimaryCategory,
+        ["path"] = n.RelativePath
+    };
+
+    /// <summary>
+    /// Legacy tag-overlap heuristic, retained as a fallback when the
+    /// brain has too few embeddings to do semantic candidate selection.
+    /// Honestly labelled with mode='legacy-heuristic' so callers know
+    /// it's a low-precision signal — not a verified contradiction.
+    /// </summary>
+    private static JToken BrainFindContradictionsLegacy(BrainExport export, int limit)
+    {
         var pairs = new List<(NodeSummary a, NodeSummary b, double overlap, string reason)>();
         for (int i = 0; i < export.Nodes.Count; i++)
         {
@@ -1058,8 +1321,6 @@ internal static class Program
                 if (a.PrimaryCategory == b.PrimaryCategory) continue;
                 var sharedTags = a.Tags.Intersect(b.Tags, StringComparer.OrdinalIgnoreCase).Count();
                 if (sharedTags < 2) continue;
-                // Intent: at least 2 tags AND a meaningful title-token
-                // overlap so we don't flag every "programming" pair.
                 var titleOverlap = TitleTokenOverlap(a, b);
                 if (titleOverlap < 1) continue;
                 var score = sharedTags * 0.6 + titleOverlap * 0.4;
@@ -1067,24 +1328,128 @@ internal static class Program
                     $"{sharedTags} shared tags but {a.PrimaryCategory} ↔ {b.PrimaryCategory}"));
             }
         }
-
-        var top = pairs
-            .OrderByDescending(p => p.overlap)
-            .Take(limit)
+        var top = pairs.OrderByDescending(p => p.overlap).Take(limit)
             .Select(p => new JObject
             {
-                ["a"] = new JObject { ["id"] = p.a.Id, ["title"] = p.a.Title, ["category"] = p.a.PrimaryCategory },
-                ["b"] = new JObject { ["id"] = p.b.Id, ["title"] = p.b.Title, ["category"] = p.b.PrimaryCategory },
+                ["a"] = NodeBrief(p.a),
+                ["b"] = NodeBrief(p.b),
                 ["overlap"] = Math.Round(p.overlap, 3),
                 ["reason"] = p.reason
             });
-
         return new JObject
         {
+            ["mode"] = "legacy-heuristic",
+            ["note"] = "embeddings not built yet — using tag/category heuristic. Run 'Precompute embeddings' in ObsidianX, then re-run for LLM-verified contradictions.",
             ["checked"] = export.Nodes.Count,
             ["found"] = pairs.Count,
             ["pairs"] = new JArray(top)
         };
+    }
+
+    private static string ReadNoteSnippet(BrainExport export, NodeSummary n, int maxChars)
+    {
+        try
+        {
+            var fullPath = Path.Combine(export.VaultPath, n.RelativePath);
+            if (!File.Exists(fullPath)) return n.Preview ?? "";
+            var content = File.ReadAllText(fullPath);
+            // Strip frontmatter so the LLM doesn't waste attention on YAML
+            if (content.StartsWith("---"))
+            {
+                var end = content.IndexOf("\n---", 3, StringComparison.Ordinal);
+                if (end > 0) content = content[(end + 4)..].TrimStart();
+            }
+            return content.Length <= maxChars
+                ? content
+                : content[..maxChars] + "\n\n[…note truncated for review]";
+        }
+        catch { return n.Preview ?? ""; }
+    }
+
+    private static string BuildContradictionPrompt(
+        NodeSummary a, string contentA, NodeSummary b, string contentB) =>
+        "You are reviewing two notes from a personal knowledge base for FACTUAL CONTRADICTIONS.\n\n" +
+        "Two notes share topic but might disagree. Decide if they ACTUALLY contradict each other.\n\n" +
+        "A contradiction means:\n" +
+        "  - Note A claims X is true (or recommends X)\n" +
+        "  - Note B claims X is false (or recommends NOT-X)\n" +
+        "  - On the same fact, technique, decision, configuration, command, or recommendation\n\n" +
+        "NOT contradictions:\n" +
+        "  - Different aspects of the same topic\n" +
+        "  - Same project where the later note explicitly REPLACES the earlier (that's an update, not a contradiction)\n" +
+        "  - Same fact described in different words\n" +
+        "  - Different scopes (general vs specific)\n" +
+        "  - Notes that complement each other or describe different layers\n\n" +
+        $"NOTE A: \"{a.Title}\"\nCategory: {a.PrimaryCategory}\nTags: {string.Join(", ", a.Tags)}\n---\n" +
+        contentA +
+        "\n---\n\n" +
+        $"NOTE B: \"{b.Title}\"\nCategory: {b.PrimaryCategory}\nTags: {string.Join(", ", b.Tags)}\n---\n" +
+        contentB +
+        "\n---\n\n" +
+        "Respond with ONLY JSON, no markdown fence, no commentary. Schema:\n" +
+        "{\n" +
+        "  \"hasContradiction\": true | false,\n" +
+        "  \"topic\":       \"<short topic if contradiction>\",\n" +
+        "  \"claimA\":      \"<one-sentence summary of A's position>\",\n" +
+        "  \"claimB\":      \"<one-sentence summary of B's position>\",\n" +
+        "  \"severity\":    \"high|moderate|low\",\n" +
+        "  \"explanation\": \"<why these contradict, 1-2 sentences>\"\n" +
+        "}\n" +
+        "If no contradiction: {\"hasContradiction\": false}";
+
+    /// <summary>
+    /// Best-effort POST /api/chat with format=json so Ollama returns
+    /// guaranteed-parseable JSON. Returns null on any failure (network,
+    /// model not pulled, malformed response). Caller treats null as
+    /// "skip this candidate" — never raised to user.
+    /// </summary>
+    private static JObject? OllamaJsonChat(string model, string prompt)
+    {
+        try
+        {
+            using var http = new System.Net.Http.HttpClient
+            {
+                Timeout = TimeSpan.FromSeconds(60)
+            };
+            var body = new JObject
+            {
+                ["model"] = model,
+                ["stream"] = false,
+                ["format"] = "json",
+                ["messages"] = new JArray { new JObject
+                {
+                    ["role"] = "user",
+                    ["content"] = prompt
+                }},
+                ["options"] = new JObject
+                {
+                    ["temperature"] = 0.1,
+                    ["num_predict"] = 500
+                }
+            }.ToString();
+
+            var resp = http.PostAsync("http://localhost:11434/api/chat",
+                new System.Net.Http.StringContent(body, System.Text.Encoding.UTF8, "application/json"))
+                .GetAwaiter().GetResult();
+            if (!resp.IsSuccessStatusCode) return null;
+
+            var raw = JObject.Parse(resp.Content.ReadAsStringAsync().GetAwaiter().GetResult());
+            var content = raw["message"]?["content"]?.ToString();
+            if (string.IsNullOrEmpty(content)) return null;
+
+            // Some models still wrap with code fences despite format=json — strip them.
+            content = content.Trim();
+            if (content.StartsWith("```"))
+            {
+                var firstNL = content.IndexOf('\n');
+                if (firstNL > 0) content = content[(firstNL + 1)..];
+                if (content.EndsWith("```"))
+                    content = content[..^3].TrimEnd();
+            }
+            try { return JObject.Parse(content); }
+            catch { return null; }
+        }
+        catch { return null; }
     }
 
     /// <summary>
@@ -1115,6 +1480,557 @@ internal static class Program
                 ["reason"] = s.Reason
             }))
         };
+    }
+
+    /// <summary>
+    /// Holistic brain health scan. Walks every note and reports issues across
+    /// five categories: structural (frontmatter, broken wiki-links), content
+    /// quality (stubs, untagged, uncategorized, wall-of-text), graph health
+    /// (orphans, super-hubs, near-duplicates, stale notes), embedding
+    /// freshness (missing, stale, orphan sidecars), and existing periodic
+    /// analyses. Computes a single <c>brainHealth</c> score in [0,1] from
+    /// weighted issue counts and writes the timestamp to
+    /// <c>.obsidianx/last-audit.json</c> so the Stop hook can remind the
+    /// user when the next audit is due.
+    /// </summary>
+    private static JToken BrainAudit(JObject args)
+    {
+        var includeNearDupes = args["includeNearDupes"]?.ToObject<bool>() ?? true;
+        var staleDays = args["staleDays"]?.ToObject<int>() ?? 90;
+        var perCategoryLimit = args["limit"]?.ToObject<int>() ?? 15;
+        var dupeThreshold = args["dupeThreshold"]?.ToObject<double>() ?? 0.95;
+        var structuralSampleSize = args["structuralSample"]?.ToObject<int>() ?? 200;
+
+        var export = LoadExport() ?? throw new InvalidOperationException("no brain-export");
+        var now = DateTime.UtcNow;
+
+        // ── 1. Structural issues (need to read each file — sample first N for cost)
+        var missingFrontmatter = new List<NodeSummary>();
+        var brokenWikiLinks = new List<(NodeSummary node, List<string> targets)>();
+        int structuralChecked = 0;
+        var titleSet = new HashSet<string>(export.Nodes.Select(n => n.Title), StringComparer.OrdinalIgnoreCase);
+        foreach (var n in export.Nodes.OrderByDescending(n => n.ModifiedAt).Take(structuralSampleSize))
+        {
+            structuralChecked++;
+            try
+            {
+                var fp = Path.Combine(export.VaultPath, n.RelativePath);
+                if (!File.Exists(fp)) continue;
+                var content = File.ReadAllText(fp);
+                if (!content.TrimStart().StartsWith("---", StringComparison.Ordinal))
+                    missingFrontmatter.Add(n);
+
+                // Broken wiki-link detection: extract [[X]] / [[X|alias]] / [[X#section]]
+                var matches = Regex.Matches(content, @"\[\[([^\]\r\n]+)\]\]");
+                var broken = new List<string>();
+                foreach (Match m in matches)
+                {
+                    var raw = m.Groups[1].Value;
+                    var target = raw.Split('|')[0].Split('#')[0].Trim();
+                    if (string.IsNullOrEmpty(target)) continue;
+                    if (target.Length < 2) continue;
+                    // Allow path-style targets — only flag pure title links that don't resolve.
+                    if (target.Contains('/') || target.Contains('\\')) continue;
+                    if (!titleSet.Contains(target)) broken.Add(target);
+                }
+                if (broken.Count > 0) brokenWikiLinks.Add((n, broken.Distinct().Take(5).ToList()));
+            }
+            catch { }
+        }
+
+        // ── 2. Content quality (cheap — uses NodeSummary fields)
+        var stubs = new List<NodeSummary>();
+        var untagged = new List<NodeSummary>();
+        var uncategorized = new List<NodeSummary>();
+        var wallOfText = new List<NodeSummary>();
+
+        // ── 3. Graph health (cheap)
+        var orphans = new List<NodeSummary>();
+        var superHubs = new List<NodeSummary>();
+        var staleNotes = new List<NodeSummary>();
+
+        foreach (var n in export.Nodes)
+        {
+            // Skip auto-imports for content quality (the user didn't author them).
+            var isImported = n.Tags.Any(t => t.Equals("imported", StringComparison.OrdinalIgnoreCase));
+
+            if (!isImported && n.WordCount < 100 && (n.Headings == null || n.Headings.Count == 0))
+                stubs.Add(n);
+            if (!isImported && n.Tags.Count(t => !t.Equals("imported", StringComparison.OrdinalIgnoreCase)) < 2)
+                untagged.Add(n);
+            if (!isImported && (n.PrimaryCategory == "Other" || string.IsNullOrEmpty(n.PrimaryCategory)))
+                uncategorized.Add(n);
+            if (n.WordCount > 500 && (n.Headings == null || n.Headings.Count == 0))
+                wallOfText.Add(n);
+
+            if (n.BacklinkIds.Count == 0 && n.LinkedNodeIds.Count == 0)
+                orphans.Add(n);
+            if (n.BacklinkIds.Count > 50)
+                superHubs.Add(n);
+            if ((now - n.ModifiedAt).TotalDays > staleDays)
+                staleNotes.Add(n);
+        }
+
+        // ── 4. Embeddings health
+        var embedDir = Path.Combine(export.VaultPath, ".obsidianx", "embeddings");
+        int missingEmb = 0, staleEmb = 0, orphanEmb = 0;
+        if (Directory.Exists(embedDir))
+        {
+            var nodeIds = new HashSet<string>(export.Nodes.Select(n => n.Id));
+            foreach (var bin in Directory.EnumerateFiles(embedDir, "*.bin"))
+            {
+                var binId = Path.GetFileNameWithoutExtension(bin);
+                if (!nodeIds.Contains(binId)) orphanEmb++;
+            }
+            foreach (var n in export.Nodes)
+            {
+                var binPath = Path.Combine(embedDir, n.Id + ".bin");
+                if (!File.Exists(binPath)) { missingEmb++; continue; }
+                if (File.GetLastWriteTimeUtc(binPath) < n.ModifiedAt) staleEmb++;
+            }
+        }
+        else missingEmb = export.Nodes.Count;
+
+        // ── 5. Near-duplicate detection (uses embeddings; can be expensive — cap)
+        var nearDupes = new List<(NodeSummary a, NodeSummary b, double sim)>();
+        if (includeNearDupes && missingEmb < export.Nodes.Count / 2)
+        {
+            var withEmb = new List<(NodeSummary node, float[] emb)>();
+            foreach (var n in export.Nodes)
+            {
+                var emb = LoadEmbedding(n.Id);
+                if (emb != null) withEmb.Add((n, emb));
+            }
+            // O(n²) — bounded at 611 nodes ≈ 187K pairs, fine on local CPU
+            for (int i = 0; i < withEmb.Count; i++)
+            {
+                for (int j = i + 1; j < withEmb.Count; j++)
+                {
+                    var sim = Cosine(withEmb[i].emb, withEmb[j].emb);
+                    if (sim > dupeThreshold) nearDupes.Add((withEmb[i].node, withEmb[j].node, sim));
+                }
+            }
+            nearDupes.Sort((a, b) => b.sim.CompareTo(a.sim));
+        }
+
+        // ── Brain health score (weighted, normalized)
+        var totalNotes = Math.Max(1, export.Nodes.Count);
+        // Each issue carries a weight reflecting cost-to-fix vs impact.
+        // Calibrated so a clean brain ≈ 1.0, a brain with 50% issues ≈ 0.5.
+        var weightedIssues =
+              stubs.Count * 0.30
+            + untagged.Count * 0.20
+            + uncategorized.Count * 0.30
+            + wallOfText.Count * 0.40
+            + orphans.Count * 0.40
+            + missingEmb * 0.50
+            + staleEmb * 0.20
+            + nearDupes.Count * 0.50
+            + missingFrontmatter.Count * 0.30
+            + brokenWikiLinks.Count * 0.40;
+        var maxIssueScore = totalNotes * 2.5; // upper bound when every issue type fires
+        var brainHealth = Math.Max(0.0, Math.Min(1.0, 1.0 - (weightedIssues / maxIssueScore)));
+
+        // ── Ranked actions — what to do next, sorted by severity
+        var actions = new JArray();
+        if (missingEmb > 0)
+            actions.Add(MakeAction("high", "missing-embeddings", $"{missingEmb} note(s) lack embeddings",
+                "obsidianx-mcp install --precompute  OR  brain_apply_audit_fix kind=missing-embeddings"));
+        if (staleEmb > 10)
+            actions.Add(MakeAction("medium", "stale-embeddings", $"{staleEmb} embedding(s) older than the source note",
+                "brain_apply_audit_fix kind=stale-embeddings"));
+        if (uncategorized.Count > totalNotes * 0.05)
+            actions.Add(MakeAction("medium", "uncategorized", $"{uncategorized.Count} note(s) under 'Other' category",
+                "brain_apply_audit_fix kind=uncategorized model=gemma3:4b dryRun=true"));
+        if (untagged.Count > totalNotes * 0.10)
+            actions.Add(MakeAction("medium", "untagged", $"{untagged.Count} note(s) with <2 tags",
+                "brain_apply_audit_fix kind=untagged model=gemma3:4b dryRun=true"));
+        if (brokenWikiLinks.Count > 0)
+            actions.Add(MakeAction("medium", "broken-wiki-links", $"{brokenWikiLinks.Count} note(s) link to titles that don't exist",
+                "(manual review — list under structural.brokenWikiLinks)"));
+        if (nearDupes.Count > 0)
+            actions.Add(MakeAction("low", "near-duplicates", $"{nearDupes.Count} pair(s) with cosine > {dupeThreshold} (consider merging)",
+                "(manual review — list under graphHealth.nearDupes)"));
+        if (orphans.Count > totalNotes * 0.20)
+            actions.Add(MakeAction("low", "orphans", $"{orphans.Count} note(s) have neither incoming nor outgoing links",
+                "brain_suggest_links id=<orphan-id>  OR consider archiving"));
+
+        // Persist last-audit timestamp so the Stop hook can remind us when due.
+        try
+        {
+            var auditDir = Path.Combine(export.VaultPath, ".obsidianx");
+            Directory.CreateDirectory(auditDir);
+            var summary = new JObject
+            {
+                ["scannedAt"] = now.ToString("O"),
+                ["brainHealth"] = Math.Round(brainHealth, 3),
+                ["issueCounts"] = new JObject
+                {
+                    ["stubs"] = stubs.Count,
+                    ["untagged"] = untagged.Count,
+                    ["uncategorized"] = uncategorized.Count,
+                    ["wallOfText"] = wallOfText.Count,
+                    ["orphans"] = orphans.Count,
+                    ["superHubs"] = superHubs.Count,
+                    ["stale"] = staleNotes.Count,
+                    ["nearDupes"] = nearDupes.Count,
+                    ["missingFrontmatter"] = missingFrontmatter.Count,
+                    ["brokenWikiLinks"] = brokenWikiLinks.Count,
+                    ["missingEmbeddings"] = missingEmb,
+                    ["staleEmbeddings"] = staleEmb,
+                    ["orphanEmbeddings"] = orphanEmb
+                }
+            };
+            File.WriteAllText(Path.Combine(auditDir, "last-audit.json"), summary.ToString(Formatting.Indented));
+        }
+        catch { /* best-effort persistence */ }
+
+        return new JObject
+        {
+            ["scannedAt"] = now.ToString("O"),
+            ["brainHealth"] = Math.Round(brainHealth, 3),
+            ["healthBand"] = brainHealth >= 0.85 ? "excellent"
+                            : brainHealth >= 0.70 ? "good"
+                            : brainHealth >= 0.50 ? "needs-attention"
+                            : "poor",
+            ["stats"] = new JObject
+            {
+                ["totalNotes"] = export.Nodes.Count,
+                ["embedded"] = export.Nodes.Count - missingEmb,
+                ["totalWords"] = export.Nodes.Sum(n => n.WordCount),
+                ["totalEdges"] = export.Nodes.Sum(n => n.LinkedNodeIds.Count)
+            },
+            ["contentQuality"] = new JObject
+            {
+                ["counts"] = new JObject
+                {
+                    ["stubs"] = stubs.Count,
+                    ["untagged"] = untagged.Count,
+                    ["uncategorized"] = uncategorized.Count,
+                    ["wallOfText"] = wallOfText.Count
+                },
+                ["stubs"] = AuditList(stubs, perCategoryLimit),
+                ["untagged"] = AuditList(untagged, perCategoryLimit),
+                ["uncategorized"] = AuditList(uncategorized, perCategoryLimit),
+                ["wallOfText"] = AuditList(wallOfText, perCategoryLimit)
+            },
+            ["graphHealth"] = new JObject
+            {
+                ["counts"] = new JObject
+                {
+                    ["orphans"] = orphans.Count,
+                    ["superHubs"] = superHubs.Count,
+                    ["staleNotes"] = staleNotes.Count,
+                    ["nearDupes"] = nearDupes.Count
+                },
+                ["orphans"] = AuditList(orphans, perCategoryLimit),
+                ["superHubs"] = AuditList(superHubs.OrderByDescending(n => n.BacklinkIds.Count).ToList(), perCategoryLimit),
+                ["staleNotes"] = AuditList(staleNotes.OrderBy(n => n.ModifiedAt).ToList(), perCategoryLimit),
+                ["nearDupes"] = new JArray(nearDupes.Take(perCategoryLimit).Select(d => new JObject
+                {
+                    ["a"] = NodeBrief(d.a),
+                    ["b"] = NodeBrief(d.b),
+                    ["similarity"] = Math.Round(d.sim, 3)
+                }))
+            },
+            ["embeddings"] = new JObject
+            {
+                ["missing"] = missingEmb,
+                ["stale"] = staleEmb,
+                ["orphanFiles"] = orphanEmb
+            },
+            ["structural"] = new JObject
+            {
+                ["sampledFromMostRecent"] = structuralChecked,
+                ["counts"] = new JObject
+                {
+                    ["missingFrontmatter"] = missingFrontmatter.Count,
+                    ["brokenWikiLinks"] = brokenWikiLinks.Count
+                },
+                ["missingFrontmatter"] = AuditList(missingFrontmatter, perCategoryLimit),
+                ["brokenWikiLinks"] = new JArray(brokenWikiLinks.Take(perCategoryLimit).Select(b => new JObject
+                {
+                    ["note"] = NodeBrief(b.node),
+                    ["brokenTargets"] = new JArray(b.targets)
+                }))
+            },
+            ["actions"] = actions
+        };
+    }
+
+    private static JArray AuditList(IEnumerable<NodeSummary> items, int limit) =>
+        new JArray(items.Take(limit).Select(NodeBrief));
+
+    private static JObject MakeAction(string severity, string kind, string message, string fixWith) => new()
+    {
+        ["severity"] = severity,
+        ["kind"] = kind,
+        ["message"] = message,
+        ["fixWith"] = fixWith
+    };
+
+    /// <summary>
+    /// Apply (or preview) auto-fixes from the audit. Three kinds:
+    ///   missing-embeddings / stale-embeddings → triggers EmbeddingService.PrecomputeMissingAsync.
+    ///   untagged → asks Ollama to suggest 3-5 tags from the note body. dry-run by default.
+    ///   uncategorized → asks Ollama to pick a KnowledgeCategory. dry-run by default.
+    /// LLM-based fixes default to dryRun=true so you see what would change before any
+    /// file is touched. Pass dryRun=false to apply.
+    /// </summary>
+    private static JToken BrainApplyAuditFix(JObject args)
+    {
+        var kind = args["kind"]?.ToString() ?? throw new ArgumentException("kind is required");
+        var dryRun = args["dryRun"]?.ToObject<bool>() ?? true;
+        var model = args["model"]?.ToString() ?? "gemma3:4b";
+        var limit = args["limit"]?.ToObject<int>() ?? 20;
+
+        var export = LoadExport() ?? throw new InvalidOperationException("no brain-export");
+
+        return kind switch
+        {
+            "missing-embeddings" or "stale-embeddings" => ApplyEmbeddingFix(export),
+            "untagged" => ApplyLlmTagSuggestions(export, model, limit, dryRun),
+            "uncategorized" => ApplyLlmCategorySuggestions(export, model, limit, dryRun),
+            _ => throw new ArgumentException($"unknown kind: {kind}. Try: missing-embeddings, stale-embeddings, untagged, uncategorized")
+        };
+    }
+
+    private static JToken ApplyEmbeddingFix(BrainExport export)
+    {
+        // Inline reimplementation of EmbeddingService.PrecomputeMissingAsync —
+        // gives us per-note diagnostics + skips the up-front 2s reachability
+        // probe (which can return false on a cold-started Ollama and silently
+        // make the whole pass a no-op). Per-call timeouts handle Ollama-down
+        // gracefully without poisoning the entire batch.
+        const int MaxChars = 4000;     // safe under nomic-embed-text's 8192-token window
+        var dir = Path.Combine(export.VaultPath, ".obsidianx", "embeddings");
+        Directory.CreateDirectory(dir);
+
+        int written = 0, skippedFresh = 0, failed = 0, skippedNoText = 0;
+        var failedIds = new JArray();
+
+        using var http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+
+        foreach (var n in export.Nodes)
+        {
+            var sidecar = Path.Combine(dir, n.Id + ".bin");
+            if (File.Exists(sidecar) && File.GetLastWriteTimeUtc(sidecar) >= n.ModifiedAt)
+            {
+                skippedFresh++;
+                continue;
+            }
+
+            string text;
+            try
+            {
+                var fp = string.IsNullOrEmpty(n.RelativePath) ? "" : Path.Combine(export.VaultPath, n.RelativePath);
+                if (string.IsNullOrEmpty(fp) || !File.Exists(fp))
+                {
+                    text = n.Title;
+                }
+                else
+                {
+                    var body = File.ReadAllText(fp);
+                    if (body.Length > MaxChars) body = body[..MaxChars];
+                    text = $"{n.Title}\n\n{body}";
+                }
+            }
+            catch { text = n.Title; }
+
+            if (string.IsNullOrWhiteSpace(text)) { skippedNoText++; continue; }
+
+            // POST to /api/embed with explicit UTF-8 byte body so Thai content
+            // doesn't get transcoded to '?' (the bug we hit during initial
+            // precompute via PowerShell).
+            float[]? vec = null;
+            try
+            {
+                var jsonBody = new JObject { ["model"] = "nomic-embed-text", ["input"] = text }.ToString();
+                var content = new System.Net.Http.StringContent(jsonBody, System.Text.Encoding.UTF8, "application/json");
+                var resp = http.PostAsync("http://localhost:11434/api/embed", content).GetAwaiter().GetResult();
+                if (resp.IsSuccessStatusCode)
+                {
+                    var json = JObject.Parse(resp.Content.ReadAsStringAsync().GetAwaiter().GetResult());
+                    var arr = (json["embeddings"] as JArray)?[0] as JArray;
+                    if (arr != null)
+                        vec = arr.Select(t => t.ToObject<float>()).ToArray();
+                }
+            }
+            catch { }
+
+            if (vec == null) { failed++; failedIds.Add(n.Id); continue; }
+
+            // Write float[] as little-endian bytes.
+            var bytes = new byte[vec.Length * 4];
+            Buffer.BlockCopy(vec, 0, bytes, 0, bytes.Length);
+            try
+            {
+                File.WriteAllBytes(sidecar, bytes);
+                written++;
+            }
+            catch { failed++; failedIds.Add(n.Id); }
+        }
+
+        return new JObject
+        {
+            ["kind"] = "embedding-precompute",
+            ["totalNotes"] = export.Nodes.Count,
+            ["written"] = written,
+            ["skippedFresh"] = skippedFresh,
+            ["skippedNoText"] = skippedNoText,
+            ["failed"] = failed,
+            ["failedIds"] = failedIds,
+            ["note"] = written == 0 && failed == 0
+                ? "Nothing to do — every note already has a fresh embedding."
+                : failed > 0
+                    ? $"Embedded {written}, but {failed} failed (likely Ollama timeout / oversized content). Re-run brain_audit to confirm."
+                    : $"Embedded {written} note(s). Re-run brain_audit to confirm 0 missing/stale."
+        };
+    }
+
+    private static JToken ApplyLlmTagSuggestions(BrainExport export, string model, int limit, bool dryRun)
+    {
+        var untagged = export.Nodes
+            .Where(n => !n.Tags.Any(t => t.Equals("imported", StringComparison.OrdinalIgnoreCase)))
+            .Where(n => n.Tags.Count(t => !t.Equals("imported", StringComparison.OrdinalIgnoreCase)) < 2)
+            .OrderByDescending(n => n.WordCount)
+            .Take(limit)
+            .ToList();
+
+        var results = new JArray();
+        foreach (var n in untagged)
+        {
+            var snippet = ReadNoteSnippet(export, n, 1200);
+            var prompt =
+                "Suggest 3-5 single-word or hyphenated lowercase tags for this Markdown note. " +
+                "Tags should reflect the SUBJECT (what the note is about), not generic ones like 'note' or 'markdown'. " +
+                "Reply with ONLY a JSON object: {\"tags\": [\"tag1\", \"tag2\", \"tag3\"]}\n\n" +
+                $"TITLE: {n.Title}\n\nCONTENT:\n{snippet}";
+            var verdict = OllamaJsonChat(model, prompt);
+            var suggestedTags = (verdict?["tags"] as JArray)?
+                .Select(t => t.ToString().Trim().ToLowerInvariant())
+                .Where(t => !string.IsNullOrEmpty(t) && t.Length < 30)
+                .Take(5)
+                .ToArray() ?? [];
+
+            var resultEntry = new JObject
+            {
+                ["note"] = NodeBrief(n),
+                ["currentTags"] = new JArray(n.Tags),
+                ["suggestedTags"] = new JArray(suggestedTags),
+                ["applied"] = false
+            };
+
+            if (!dryRun && suggestedTags.Length > 0)
+            {
+                var wrote = ApplyTagsToNote(export, n, suggestedTags);
+                resultEntry["applied"] = wrote;
+            }
+            results.Add(resultEntry);
+        }
+
+        return new JObject
+        {
+            ["kind"] = "untagged",
+            ["model"] = model,
+            ["dryRun"] = dryRun,
+            ["scanned"] = untagged.Count,
+            ["results"] = results,
+            ["note"] = dryRun
+                ? "DRY RUN — nothing written. Pass dryRun=false to apply suggested tags."
+                : "Applied. Re-run brain_audit to confirm reduction in untagged count."
+        };
+    }
+
+    private static JToken ApplyLlmCategorySuggestions(BrainExport export, string model, int limit, bool dryRun)
+    {
+        var uncat = export.Nodes
+            .Where(n => n.PrimaryCategory == "Other" || string.IsNullOrEmpty(n.PrimaryCategory))
+            .Where(n => !n.Tags.Any(t => t.Equals("imported", StringComparison.OrdinalIgnoreCase)))
+            .Take(limit)
+            .ToList();
+
+        // The set of categories to choose from — matches KnowledgeCategory enum.
+        const string categoryList =
+            "Programming, DataScience, Design_Art, Engineering, Blockchain_Web3, " +
+            "Business_Finance, Web_Development, AI_MachineLearning, Security_Crypto, " +
+            "DevOps_Cloud, Health_Medicine, GameDev, Mathematics, Science, Other";
+
+        var results = new JArray();
+        foreach (var n in uncat)
+        {
+            var snippet = ReadNoteSnippet(export, n, 1000);
+            var prompt =
+                "Pick the SINGLE most appropriate category for this Markdown note from this exact list:\n" +
+                categoryList + "\n\n" +
+                "Reply with ONLY a JSON object: {\"category\": \"<one of the list>\", \"confidence\": \"high|medium|low\"}\n\n" +
+                $"TITLE: {n.Title}\nCURRENT TAGS: {string.Join(", ", n.Tags)}\n\nCONTENT:\n{snippet}";
+            var verdict = OllamaJsonChat(model, prompt);
+            var cat = verdict?["category"]?.ToString() ?? "";
+            var conf = verdict?["confidence"]?.ToString() ?? "low";
+
+            results.Add(new JObject
+            {
+                ["note"] = NodeBrief(n),
+                ["currentCategory"] = n.PrimaryCategory,
+                ["suggestedCategory"] = cat,
+                ["confidence"] = conf,
+                ["applied"] = false,
+                ["note2"] = "Category is set by KnowledgeIndexer at re-index time. To 'apply', add a 'category: <X>' line to the note's frontmatter and re-index."
+            });
+        }
+
+        return new JObject
+        {
+            ["kind"] = "uncategorized",
+            ["model"] = model,
+            ["dryRun"] = true, // category fix is always advisory — applying needs frontmatter edit + re-index
+            ["scanned"] = uncat.Count,
+            ["results"] = results,
+            ["note"] = "Category suggestions are advisory. Add 'category: <X>' to each note's YAML frontmatter and re-index in ObsidianX to apply."
+        };
+    }
+
+    /// <summary>Append suggested tags to a note's YAML frontmatter. No-op if frontmatter is missing.</summary>
+    private static bool ApplyTagsToNote(BrainExport export, NodeSummary node, string[] suggestedTags)
+    {
+        try
+        {
+            var fp = Path.Combine(export.VaultPath, node.RelativePath);
+            if (!File.Exists(fp)) return false;
+            var content = File.ReadAllText(fp);
+            if (!content.TrimStart().StartsWith("---", StringComparison.Ordinal)) return false;
+
+            // Find frontmatter end
+            var fmStart = content.IndexOf("---", StringComparison.Ordinal);
+            if (fmStart < 0) return false;
+            var fmEnd = content.IndexOf("\n---", fmStart + 3, StringComparison.Ordinal);
+            if (fmEnd < 0) return false;
+            var fmBody = content.Substring(fmStart + 3, fmEnd - (fmStart + 3));
+            var rest = content[(fmEnd + 4)..];
+
+            // Decide: replace existing tags: list or append a new one.
+            var tagsLineRx = new Regex(@"(?m)^tags:\s*(\[.*\]|\s*$)");
+            string newFm;
+            if (tagsLineRx.IsMatch(fmBody))
+            {
+                // Replace a single-line `tags: [a, b]` form, or append below `tags:` flow.
+                var combined = node.Tags.Concat(suggestedTags).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+                var inlineList = "[" + string.Join(", ", combined.Select(t => $"\"{t}\"")) + "]";
+                newFm = tagsLineRx.Replace(fmBody, "tags: " + inlineList, 1);
+            }
+            else
+            {
+                var combined = node.Tags.Concat(suggestedTags).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+                var inlineList = "[" + string.Join(", ", combined.Select(t => $"\"{t}\"")) + "]";
+                newFm = fmBody.TrimEnd() + Environment.NewLine + "tags: " + inlineList + Environment.NewLine;
+            }
+
+            var rebuilt = "---" + newFm + "---" + rest;
+            File.WriteAllText(fp, rebuilt);
+            return true;
+        }
+        catch { return false; }
     }
 
     // ───────────── embedding helpers ─────────────
@@ -1210,11 +2126,30 @@ internal static class Program
 
     private static double ScoreNode(NodeSummary n, string ql)
     {
+        // Bonus when the full phrase appears verbatim
         double s = 0;
-        if (n.Title.Contains(ql, StringComparison.OrdinalIgnoreCase)) s += 3;
-        if (n.Tags.Any(t => t.Contains(ql, StringComparison.OrdinalIgnoreCase))) s += 2;
-        if (n.Preview.Contains(ql, StringComparison.OrdinalIgnoreCase)) s += 1;
-        if (n.PrimaryCategory.Contains(ql, StringComparison.OrdinalIgnoreCase)) s += 1.5;
+        if (n.Title.Contains(ql, StringComparison.OrdinalIgnoreCase)) s += 5;
+        else if (n.Preview.Contains(ql, StringComparison.OrdinalIgnoreCase)) s += 2;
+
+        // Per-word scoring so multi-keyword queries hit notes matching any subset
+        var words = ql.Split(new[] { ' ', '\t', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                      .Where(w => w.Length >= 2)
+                      .ToArray();
+        if (words.Length == 0) return s;
+
+        int matched = 0;
+        foreach (var w in words)
+        {
+            bool hit = false;
+            if (n.Title.Contains(w, StringComparison.OrdinalIgnoreCase)) { s += 3; hit = true; }
+            if (n.Tags.Any(t => t.Contains(w, StringComparison.OrdinalIgnoreCase))) { s += 2; hit = true; }
+            if (n.Preview.Contains(w, StringComparison.OrdinalIgnoreCase)) { s += 1; hit = true; }
+            if (n.PrimaryCategory.Contains(w, StringComparison.OrdinalIgnoreCase)) { s += 1.5; hit = true; }
+            if (hit) matched++;
+        }
+        // Multi-word bonus: rewards notes that match >= 2 query words
+        if (words.Length >= 2 && matched >= 2)
+            s *= 1.0 + (0.25 * (matched - 1));
         return s;
     }
 
