@@ -306,9 +306,9 @@ internal static class CliInstall
         // Quietly remove any existing registration — ignore exit code because
         // `claude mcp remove` fails when the name isn't registered, which is
         // a fine no-op for fresh installs.
-        Console.WriteLine("[1/2] removing any existing obsidianx-brain registration...");
+        Console.WriteLine("[1/3] Claude Code (CLI): removing any existing obsidianx-brain registration...");
         await RunClaudeAsync("mcp", "remove", "obsidianx-brain", "-s", "local").ConfigureAwait(false);
-        Console.WriteLine("[2/2] adding fresh registration with version env...");
+        Console.WriteLine("[2/3] Claude Code (CLI): adding fresh registration with version env...");
         var rc = await RunClaudeAsync(
             "mcp", "add", "obsidianx-brain",
             exePath, vault,
@@ -321,11 +321,125 @@ internal static class CliInstall
             Console.WriteLine($"    claude mcp add obsidianx-brain \"{exePath}\" \"{vault}\" -e OBSIDIANX_VAULT=\"{vault}\" -e OBSIDIANX_MCP_VERSION={Program.ServerVersion}");
             return rc;
         }
+        Console.WriteLine("[3/3] Claude Desktop: updating claude_desktop_config.json...");
+        UpdateClaudeDesktopConfig(exePath, vault);
         Console.WriteLine();
-        Console.WriteLine($"✓ Done. Verify with `claude mcp get obsidianx-brain` — the");
-        Console.WriteLine($"  Environment block now shows OBSIDIANX_MCP_VERSION={Program.ServerVersion}.");
-        Console.WriteLine($"  Restart Claude Code to spawn a fresh MCP process from the new config.");
+        Console.WriteLine($"✓ Done. Verify in TWO places:");
+        Console.WriteLine($"  • Claude Code CLI: `claude mcp get obsidianx-brain` — see OBSIDIANX_MCP_VERSION={Program.ServerVersion}");
+        Console.WriteLine($"  • Claude Desktop:  Settings → Developer → Local MCP servers — see \"obsidianx-brain v{Program.ServerVersion}\"");
+        Console.WriteLine($"  RESTART both Claude Code and Claude Desktop to pick up the new config.");
         return 0;
+    }
+
+    /// <summary>
+    /// Update Claude Desktop's `claude_desktop_config.json` to register
+    /// THIS exe with a version-tagged key. Claude Desktop's UI shows the
+    /// key name in its sidebar (Settings → Developer → Local MCP servers),
+    /// so embedding the version in the key is the only way to surface it
+    /// in that view — Desktop's UI doesn't render env vars or
+    /// initialize.serverInfo.version.
+    ///
+    /// Removes any existing key starting with "obsidianx-brain" to avoid
+    /// version-bump duplicates (e.g. v2.2.0 and v2.3.0 both registered).
+    /// Idempotent across runs; safe to call even if no config exists yet.
+    /// </summary>
+    private static void UpdateClaudeDesktopConfig(string exePath, string vault)
+    {
+        var path = ResolveClaudeDesktopConfigPath();
+        if (path == null)
+        {
+            Console.WriteLine("  ⚠  could not determine Claude Desktop config path for this OS — skipped");
+            return;
+        }
+        if (!File.Exists(path))
+        {
+            Console.WriteLine($"  ⓘ  no Claude Desktop config at {path} (open Claude Desktop once to create it, then re-run) — skipped");
+            return;
+        }
+
+        JObject json;
+        try
+        {
+            json = JObject.Parse(File.ReadAllText(path));
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  ✗ failed to parse Claude Desktop config: {ex.Message}");
+            return;
+        }
+
+        var servers = json["mcpServers"] as JObject;
+        if (servers == null)
+        {
+            servers = new JObject();
+            json["mcpServers"] = servers;
+        }
+
+        // Remove any keys starting with "obsidianx-brain" (with or without
+        // a trailing " v<x.y.z>") — version bumps must not leave stale
+        // duplicates in the sidebar.
+        var staleKeys = servers.Properties()
+            .Where(p => p.Name.StartsWith("obsidianx-brain", StringComparison.OrdinalIgnoreCase))
+            .Select(p => p.Name)
+            .ToList();
+        foreach (var k in staleKeys) servers.Remove(k);
+
+        var newKey = $"obsidianx-brain v{Program.ServerVersion}";
+        servers[newKey] = new JObject
+        {
+            ["command"] = exePath,
+            ["args"] = new JArray(),
+            ["env"] = new JObject
+            {
+                ["OBSIDIANX_VAULT"] = vault,
+                ["OBSIDIANX_MCP_VERSION"] = Program.ServerVersion
+            }
+        };
+
+        try
+        {
+            File.WriteAllText(path, json.ToString(Newtonsoft.Json.Formatting.Indented));
+            if (staleKeys.Count > 0)
+                Console.WriteLine($"  ✓ replaced stale key(s) [{string.Join(", ", staleKeys)}] with \"{newKey}\"");
+            else
+                Console.WriteLine($"  ✓ added \"{newKey}\"");
+            Console.WriteLine($"  → {path}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  ✗ failed to write Claude Desktop config: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Platform-specific Claude Desktop config path. Windows uses
+    /// %APPDATA%/Claude, macOS uses ~/Library/Application Support/Claude,
+    /// Linux follows the XDG_CONFIG_HOME convention.
+    /// </summary>
+    private static string? ResolveClaudeDesktopConfigPath()
+    {
+        var isWindows = System.Runtime.InteropServices.RuntimeInformation
+            .IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
+        var isMac = System.Runtime.InteropServices.RuntimeInformation
+            .IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX);
+
+        if (isWindows)
+        {
+            var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            return string.IsNullOrEmpty(appData)
+                ? null
+                : Path.Combine(appData, "Claude", "claude_desktop_config.json");
+        }
+        if (isMac)
+        {
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            return Path.Combine(home, "Library", "Application Support", "Claude", "claude_desktop_config.json");
+        }
+        // Linux — Claude Desktop isn't officially shipped here yet, but
+        // honour XDG conventions in case it lands later.
+        var xdg = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")
+                  ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".config");
+        return Path.Combine(xdg, "Claude", "claude_desktop_config.json");
     }
 
     /// <summary>
