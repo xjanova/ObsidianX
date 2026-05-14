@@ -379,6 +379,8 @@ export function createScene(canvas, callbacks = {}) {
         size:  1.0,         // uSizeScale — star size multiplier
         edges: 1.0,         // uEdgeAlpha — edge alpha multiplier
         drift: 0.0,         // 0 = freeze after settle; >0 = keep sims simmering forever
+        lightning: 1.0,         // 0 = disable pulses, 1 = default lightning, 2 = blinding
+        lightningSpeed: 1.0,    // 0.5 = slow majestic strike, 1 = default, 2 = frantic flicker
         cameraMode: 'free', // 'free' | 'orbit' | 'follow'
         background: 'nebula', // 'nebula' | 'black' — controls clearColor + nebula sprites + starfield
         lockSelected: true    // when a star is selected, keep it at screen centre
@@ -451,9 +453,13 @@ export function createScene(canvas, callbacks = {}) {
     // characteristic "FLASH … flicker … flicker … fade" pattern that
     // makes the eye read it as lightning rather than a smooth glow.
     // Returns 0 outside the active window so the caller can detach.
-    function lightningAmpStar(elapsedMs) {
-        if (elapsedMs < 0 || elapsedMs >= LIGHTNING_STAR_DURATION_MS) return 0;
-        const t = elapsedMs;
+    function lightningAmpStar(rawElapsedMs) {
+        const intensity = settings.lightning;
+        if (intensity <= 0) return 0;
+        // Speed warps the time axis: speed=2 fits the same flicker into
+        // half the duration, speed=0.5 stretches it to 2× longer.
+        const t = rawElapsedMs * settings.lightningSpeed;
+        if (t < 0 || t >= LIGHTNING_STAR_DURATION_MS) return 0;
         // Each flash: amplitude × exp(-(t - centre)^2 / (2σ²))
         let a = 0;
         a += 1.00 * Math.exp(-((t -   0) * (t -   0)) / (2 *  30 *  30));   // initial blinding flash
@@ -464,19 +470,22 @@ export function createScene(canvas, callbacks = {}) {
         a *= 1.0 + Math.sin(t * 0.21) * 0.07;
         // Allow brief overshoot above 1.0 — the shader bloom turns this
         // into a white-out at the peak, which sells the lightning feel.
-        return Math.max(0, Math.min(1.5, a));
+        // Cap the post-intensity result so intensity=2 doesn't pin alpha forever.
+        return Math.max(0, Math.min(2.0, Math.min(1.5, a) * intensity));
     }
 
-    function lightningAmpEdge(elapsedMs) {
-        if (elapsedMs < 0 || elapsedMs >= LIGHTNING_EDGE_DURATION_MS) return 0;
-        const t = elapsedMs;
+    function lightningAmpEdge(rawElapsedMs) {
+        const intensity = settings.lightning;
+        if (intensity <= 0) return 0;
+        const t = rawElapsedMs * settings.lightningSpeed;
+        if (t < 0 || t >= LIGHTNING_EDGE_DURATION_MS) return 0;
         // Edges fire ~20 ms behind the star and decay slightly faster —
         // the bolt visibly travels outward from the star core.
         let a = 0;
         a += 1.00 * Math.exp(-((t -  20) * (t -  20)) / (2 *  25 *  25));
         a += 0.55 * Math.exp(-((t - 120) * (t - 120)) / (2 *  28 *  28));
         a += 0.40 * Math.exp(-((t - 280) * (t - 280)) / (2 *  40 *  40));
-        return Math.max(0, Math.min(1.4, a));
+        return Math.max(0, Math.min(1.8, Math.min(1.4, a) * intensity));
     }
 
     // Diagnostics: rate-limited warn on pulse misses so a stale id stream
@@ -1167,6 +1176,13 @@ export function createScene(canvas, callbacks = {}) {
         settings.size = clamp(v, 0.3, 3.0);
         applySettings();
     }
+    function setLightning(intensity, speed) {
+        // Either argument may be undefined — preserves current value so a
+        // single-arg call from the host is safe (e.g. only intensity slider
+        // moved but speed slider stayed).
+        if (typeof intensity === 'number') settings.lightning = clamp(intensity, 0, 2);
+        if (typeof speed === 'number')     settings.lightningSpeed = clamp(speed, 0.25, 3);
+    }
     function setEdgeAlpha(v) {
         settings.edges = clamp(v, 0, 2.0);
         applySettings();
@@ -1254,6 +1270,7 @@ export function createScene(canvas, callbacks = {}) {
         setStars,
         setStarSize,
         setEdgeAlpha,
+        setLightning,
         setDrift,
         setCameraMode,
         setBackground,

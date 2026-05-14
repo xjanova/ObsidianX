@@ -34,12 +34,16 @@ const $setSize   = document.getElementById('set-size');
 const $setEdges  = document.getElementById('set-edges');
 const $setDrift  = document.getElementById('set-drift');
 const $setMotion = document.getElementById('set-motion');
+const $setLightning      = document.getElementById('set-lightning');
+const $setLightningSpeed = document.getElementById('set-lightning-speed');
 const $setGlowV   = document.getElementById('set-glow-val');
 const $setStarsV  = document.getElementById('set-stars-val');
 const $setSizeV   = document.getElementById('set-size-val');
 const $setEdgesV  = document.getElementById('set-edges-val');
 const $setDriftV  = document.getElementById('set-drift-val');
 const $setMotionV = document.getElementById('set-motion-val');
+const $setLightningV      = document.getElementById('set-lightning-val');
+const $setLightningSpeedV = document.getElementById('set-lightning-speed-val');
 const $setReset      = document.getElementById('set-reset');
 const $setResettle   = document.getElementById('set-resettle');
 const $setFullscreen = document.getElementById('set-fullscreen');
@@ -68,12 +72,16 @@ function saveWallpaperPrefs(prefs) {
     try { localStorage.setItem(WALLPAPER_PREFS_KEY, JSON.stringify(prefs)); } catch {}
 }
 
-// v2 of the settings schema — adds size/edges/drift. Keys missing from a
-// v1 payload fall back to defaults on load (see loadSettings below).
-const SETTINGS_KEY = 'obsidianx.universe.settings.v2';
+// v3 of the settings schema — adds lightning/lightningSpeed for the
+// MCP-pulse flash effect. Keys missing from older payloads fall back to
+// defaults on load (see loadSettings below) so older v2 saves migrate
+// transparently.
+const SETTINGS_KEY = 'obsidianx.universe.settings.v3';
 const DEFAULT_SETTINGS = {
     glow: 0.55, stars: 0.85, motion: 1.0,
     size: 1.0, edges: 1.0, drift: 0.0,
+    lightning: 1.0,         // 0 = disable pulse flash, 1 = default, 2 = blinding
+    lightningSpeed: 1.0,    // 0.5 = slow majestic strike, 2 = frantic flicker
     background: 'nebula',   // 'nebula' | 'black'
     lockSelected: true      // true = clicked star sticks to screen centre
 };
@@ -516,6 +524,8 @@ function loadSettings() {
             size:   num(parsed.size,   DEFAULT_SETTINGS.size),
             edges:  num(parsed.edges,  DEFAULT_SETTINGS.edges),
             drift:  num(parsed.drift,  DEFAULT_SETTINGS.drift),
+            lightning:      num(parsed.lightning,      DEFAULT_SETTINGS.lightning),
+            lightningSpeed: num(parsed.lightningSpeed, DEFAULT_SETTINGS.lightningSpeed),
             background: (parsed.background === 'black' || parsed.background === 'nebula')
                 ? parsed.background : DEFAULT_SETTINGS.background,
             lockSelected: typeof parsed.lockSelected === 'boolean'
@@ -538,6 +548,8 @@ function applySettingsToUI(s) {
     if ($setEdges)  { $setEdges.value  = s.edges;  $setEdgesV.textContent  = s.edges.toFixed(2); }
     if ($setDrift)  { $setDrift.value  = s.drift;  $setDriftV.textContent  = s.drift.toFixed(2); }
     if ($setMotion) { $setMotion.value = s.motion; $setMotionV.textContent = s.motion.toFixed(2); }
+    if ($setLightning)      { $setLightning.value      = s.lightning;      $setLightningV.textContent      = s.lightning.toFixed(2); }
+    if ($setLightningSpeed) { $setLightningSpeed.value = s.lightningSpeed; $setLightningSpeedV.textContent = s.lightningSpeed.toFixed(2); }
     document.querySelectorAll('.cam-btn[data-bg]').forEach(b =>
         b.classList.toggle('active', b.dataset.bg === s.background));
     document.querySelectorAll('.cam-btn[data-lock]').forEach(b =>
@@ -560,6 +572,7 @@ function applySettingsToScene(s) {
     scene.setEdgeAlpha?.(s.edges);
     scene.setDrift?.(s.drift);
     scene.setMotion(s.motion);
+    scene.setLightning?.(s.lightning, s.lightningSpeed);
     scene.setLockSelected?.(s.lockSelected);
     applyBackground(s.background);
 }
@@ -586,6 +599,10 @@ function wireSettingsPanel() {
     $setEdges ?.addEventListener('input', onSlide('edges',  $setEdges,  $setEdgesV));
     $setDrift ?.addEventListener('input', onSlide('drift',  $setDrift,  $setDriftV));
     $setMotion?.addEventListener('input', onSlide('motion', $setMotion, $setMotionV));
+    $setLightning?.addEventListener('input',
+        onSlide('lightning', $setLightning, $setLightningV));
+    $setLightningSpeed?.addEventListener('input',
+        onSlide('lightningSpeed', $setLightningSpeed, $setLightningSpeedV));
 
     $setReset?.addEventListener('click', () => {
         currentSettings = { ...DEFAULT_SETTINGS };
