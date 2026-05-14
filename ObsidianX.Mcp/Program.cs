@@ -21,7 +21,7 @@ internal static class Program
 {
     private const string ProtocolVersion = "2025-06-18";
     private const string ServerName = "obsidianx-brain";
-    private const string ServerVersion = "2.2.0";
+    private const string ServerVersion = "2.3.0";
 
     private static string _vaultPath = ResolveVault(Environment.GetCommandLineArgs());
 
@@ -140,7 +140,8 @@ internal static class Program
             "AFTER any answer that took > 2 tool calls AND produced a non-trivial insight:\n" +
             "  → IMMEDIATELY call brain_create_note (full note) OR brain_remember (one-liner).\n" +
             "  → Do NOT ask the user 'should I save this?'. Save by default. The user has explicitly opted into proactive saves (see project memory rules).\n" +
-            "  → If a note on the same topic exists, prefer brain_append_note over creating a duplicate.\n\n" +
+            "  → If a note on the same topic exists, prefer brain_append_note over creating a duplicate.\n" +
+            "  → INSPECT the `hygiene` field in the response: it lists `relatedNotes` (paste their `wikiLink` strings into the new note to avoid orphans), `possibleDuplicates` (consider brain_append_note instead if any score ≥ 0.5), and `suggestedTags` (add via brain_append_note's frontmatter or a follow-up edit). This is the brain telling you HOW to integrate the note before the next turn.\n\n" +
             "AT SESSION END (when user says 'พรุ่งนี้คุยต่อ' / 'save session' / 'handoff' / 'พักก่อน'):\n" +
             "  → Write a #session-handoff note in Notes/Claude-Sessions/ with: branch, files touched, what shipped, what's pending, gotchas, deploy steps, open questions.\n" +
             "  → The SessionStart hook auto-injects the most recent #session-handoff into the next Claude's context — a good handoff means the next session starts at full context.\n\n" +
@@ -950,6 +951,14 @@ internal static class Program
         // Log the write so the client's Real Brain camera can fly here
         LogAccess(ComputeStableId(fullPath), "write", title);
 
+        // Hygiene snapshot — runs against the brain-export.json that
+        // pre-dates THIS write, so the new note can't match itself. Gives
+        // Claude immediate signal about which existing notes to wiki-link
+        // and which tags the topic typically carries. Cheap (~10ms per
+        // call for a 600-note brain).
+        var contentSample = content.Length > 600 ? content[..600] : content;
+        var hygiene = ComputeHygiene(title, tags, contentSample);
+
         return new JObject
         {
             ["success"] = true,
@@ -957,7 +966,8 @@ internal static class Program
             ["fullPath"] = fullPath,
             ["id"] = ComputeStableId(fullPath),
             ["bytes"] = sb.Length,
-            ["hint"] = "ObsidianX client will pick this up on next re-index. Tell user to click Re-index or it auto-refreshes on editor save."
+            ["hygiene"] = hygiene,
+            ["hint"] = "ObsidianX client will pick this up on next re-index. Tell user to click Re-index or it auto-refreshes on editor save. Inspect `hygiene` for related notes you should wiki-link before the next turn."
         };
     }
 
@@ -995,7 +1005,27 @@ internal static class Program
 
         LogAccess(resolvedId, "write", Path.GetFileNameWithoutExtension(fullPath));
 
-        return new JObject
+        // Hygiene snapshot on the APPENDED content — finds notes that the
+        // new section should link to. Excludes the source note itself.
+        // We use the existing note's title + tags (from the export) plus
+        // the new content sample.
+        JObject? hygiene = null;
+        try
+        {
+            var exp = LoadExport();
+            var sourceNode = exp?.Nodes.FirstOrDefault(n => n.Id == resolvedId);
+            if (sourceNode != null)
+            {
+                var contentSample = content.Length > 600 ? content[..600] : content;
+                hygiene = ComputeHygiene(sourceNode.Title, sourceNode.Tags, contentSample, excludeId: resolvedId);
+            }
+        }
+        catch
+        {
+            // Hygiene is best-effort — never block the append on a snapshot failure
+        }
+
+        var result = new JObject
         {
             ["success"] = true,
             ["path"] = fullPath,
@@ -1003,6 +1033,8 @@ internal static class Program
             ["appendedBytes"] = content.Length,
             ["hint"] = "Re-index in ObsidianX to update the graph."
         };
+        if (hygiene != null) result["hygiene"] = hygiene;
+        return result;
     }
 
     private static JToken BrainRemember(JObject args)
@@ -2435,6 +2467,166 @@ internal static class Program
                         .Select(t => t.ToLowerInvariant())
                         .Where(t => t.Length > 2);
         return tb.Count(t => ta.Contains(t));
+    }
+
+    /// <summary>
+    /// Tokenize a title for hygiene-style fuzzy matching.
+    /// Splits on whitespace + common separators, lowercases, drops short tokens
+    /// and stopwords, dedupes. Used when comparing a NEW (unindexed) note's
+    /// title against the existing graph — we don't have a NodeSummary for it
+    /// yet, so TitleTokenOverlap's signature doesn't fit.
+    /// </summary>
+    private static HashSet<string> TokenizeTitleForHygiene(string title)
+    {
+        if (string.IsNullOrEmpty(title))
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        return new HashSet<string>(
+            title.Split(new[] { ' ', '_', '-', '.', '/', '\\', '—', '–', ':', '(', ')', '[', ']', '|', ',', '#' },
+                       StringSplitOptions.RemoveEmptyEntries)
+                 .Select(t => t.ToLowerInvariant().Trim())
+                 .Where(t => t.Length >= 3 && !HygieneStopwords.Contains(t))
+                 .Distinct(),
+            StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static readonly HashSet<string> HygieneStopwords =
+        new(StringComparer.OrdinalIgnoreCase)
+    {
+        // English fillers — duplicates AutoLinker's StopWords but kept
+        // independent so the two layers can diverge if needed
+        "the", "and", "for", "with", "from", "this", "that", "are", "was",
+        "readme", "note", "notes", "index", "main", "new", "claude",
+        "session", "handoff", "draft", "wip",
+        // Thai fillers
+        "และ", "หรือ", "คือ", "ของ", "ใน", "ที่", "จะ", "ได้", "ให้", "กับ"
+    };
+
+    /// <summary>
+    /// Lightweight brain-hygiene snapshot for a note that was just written
+    /// or about to be written. Scores every NodeSummary in the export
+    /// against (title, tags, contentSample) using three heuristic signals:
+    ///   • shared tag count
+    ///   • title-token Jaccard
+    ///   • bonus when the existing note's title appears verbatim in the new
+    ///     content (strong "this needs a [[link]]" signal)
+    /// Returns top relatedNotes (with [[wiki-link]] strings ready to paste),
+    /// possibleDuplicates (title-Jaccard ≥ 0.5 — title-collision warning),
+    /// and suggestedTags (tags appearing in 2+ relatedNotes but missing
+    /// from the new note). Does NOT require the new note to be indexed
+    /// yet — that's the whole point: it runs DURING brain_create_note so
+    /// Claude can act on the suggestions in the next turn instead of
+    /// waiting for the user to notice the gap.
+    /// </summary>
+    /// <param name="title">Title of the new/edited note (no [[ ]] brackets)</param>
+    /// <param name="tags">Tags on the new note</param>
+    /// <param name="contentSample">Body text — first ~600 chars is enough</param>
+    /// <param name="excludeId">Optional: the note's own id if it's already in the export (for append case)</param>
+    private static JObject ComputeHygiene(string title, IReadOnlyCollection<string> tags, string contentSample, string? excludeId = null)
+    {
+        var export = LoadExport();
+        if (export == null)
+        {
+            return new JObject
+            {
+                ["status"] = "no-export",
+                ["note"] = "brain-export.json not built yet — open ObsidianX → Settings → Export Brain Now to enable hygiene suggestions"
+            };
+        }
+
+        var newTitleTokens = TokenizeTitleForHygiene(title);
+        var newTagSet = new HashSet<string>(tags, StringComparer.OrdinalIgnoreCase);
+        var lowerContent = (contentSample ?? string.Empty).ToLowerInvariant();
+
+        var scored = new List<(NodeSummary n, double score, double titleJac, int sharedTags, bool titleInContent)>();
+        foreach (var n in export.Nodes)
+        {
+            if (!string.IsNullOrEmpty(excludeId) && n.Id == excludeId) continue;
+            if (string.IsNullOrEmpty(n.Title)) continue;
+
+            // Tag overlap — raw count, not Jaccard. Each shared tag is a
+            // strong signal; Jaccard would punish notes that just happen
+            // to be more heavily tagged.
+            var sharedTags = newTagSet.Count == 0 || n.Tags.Count == 0
+                ? 0
+                : n.Tags.Count(t => newTagSet.Contains(t));
+
+            // Title-token Jaccard — bounded [0,1]. Punishes accidental
+            // matches on a single common token like "session".
+            var existingTokens = TokenizeTitleForHygiene(n.Title);
+            double titleJaccard = 0;
+            if (existingTokens.Count > 0 && newTitleTokens.Count > 0)
+            {
+                var inter = existingTokens.Intersect(newTitleTokens, StringComparer.OrdinalIgnoreCase).Count();
+                var union = existingTokens.Union(newTitleTokens, StringComparer.OrdinalIgnoreCase).Count();
+                if (union > 0) titleJaccard = (double)inter / union;
+            }
+
+            // Title-appears-in-content — the strongest single signal that
+            // a [[wiki-link]] is missing. Requires title length ≥ 4 to
+            // avoid false positives on common short words.
+            var titleInContent = n.Title.Length >= 4
+                                 && lowerContent.Length > 0
+                                 && lowerContent.Contains(n.Title.ToLowerInvariant());
+
+            var score = sharedTags * 0.5
+                      + titleJaccard * 0.4
+                      + (titleInContent ? 0.6 : 0);
+
+            if (score < 0.2) continue;
+            scored.Add((n, score, titleJaccard, sharedTags, titleInContent));
+        }
+
+        var top = scored.OrderByDescending(x => x.score).Take(8).ToList();
+
+        var related = top.Take(5).Select(x => new JObject
+        {
+            ["id"] = x.n.Id,
+            ["title"] = x.n.Title,
+            ["wikiLink"] = $"[[{x.n.Title}]]",
+            ["score"] = Math.Round(x.score, 3),
+            ["sharedTags"] = x.sharedTags,
+            ["titleInContent"] = x.titleInContent,
+            ["path"] = x.n.RelativePath
+        });
+
+        // Title-Jaccard ≥ 0.5 = at least half the title tokens collide.
+        // Worth flagging as "are you sure you're not duplicating this?"
+        var dupes = top.Where(x => x.titleJac >= 0.5).Select(x => new JObject
+        {
+            ["id"] = x.n.Id,
+            ["title"] = x.n.Title,
+            ["titleJaccard"] = Math.Round(x.titleJac, 3),
+            ["path"] = x.n.RelativePath
+        });
+
+        // Suggested tags — appearing in ≥2 relatedNotes but missing from
+        // the new note. Drops tags already on the new note. Ordered by
+        // frequency so the highest-signal tags rank first.
+        var suggestedTags = top
+            .SelectMany(x => x.n.Tags)
+            .GroupBy(t => t, StringComparer.OrdinalIgnoreCase)
+            .Where(g => g.Count() >= 2)
+            .Where(g => !newTagSet.Contains(g.Key))
+            .OrderByDescending(g => g.Count())
+            .Select(g => new JObject
+            {
+                ["tag"] = g.Key,
+                ["seenIn"] = g.Count()
+            })
+            .Take(5);
+
+        var hasResults = top.Count > 0;
+        return new JObject
+        {
+            ["status"] = "ok",
+            ["scanned"] = export.Nodes.Count,
+            ["relatedNotes"] = new JArray(related),
+            ["possibleDuplicates"] = new JArray(dupes),
+            ["suggestedTags"] = new JArray(suggestedTags),
+            ["hint"] = hasResults
+                ? "Consider embedding the wikiLink strings from relatedNotes into the note body for graph cohesion. Check possibleDuplicates before creating again to avoid forking topics."
+                : "No related notes found — this is a fresh topic for the brain. Consider linking it to a hub note (e.g. an index or domain README) so it doesn't become an orphan island."
+        };
     }
 
     // ───────────── helpers ─────────────
