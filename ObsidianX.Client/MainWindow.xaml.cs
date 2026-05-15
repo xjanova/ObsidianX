@@ -450,6 +450,14 @@ public partial class MainWindow : Window
     private DispatcherTimer? _wallpaperWatchdog;
     private bool _wallpaperReattachInFlight;     // re-entry guard for AttachWallpaperToShell
     private bool _wallpaperEventsHooked;         // prevent double-subscribing SystemEvents
+    // Anti-flicker cooldown: after any successful attach (initial Apply or
+    // reattach), watchdog backs off for 30s. SystemEvents (resume, unlock,
+    // display-changed) BYPASS this — those signals are genuine. The watchdog
+    // is best-effort polling for cases SystemEvents missed; rate-limiting
+    // it eliminates the "refresh every 10s" flicker users see when Explorer
+    // does benign WorkerW reshuffling.
+    private DateTime _lastWallpaperAttachUtc = DateTime.MinValue;
+    private static readonly TimeSpan WatchdogCooldown = TimeSpan.FromSeconds(30);
 
     private const int SW_HIDE = 0;
     private const int SW_SHOW = 5;
@@ -914,6 +922,59 @@ public partial class MainWindow : Window
         var hwnd = inst.Hwnd;
         try
         {
+            // ── SOFT PATH ────────────────────────────────────────────────
+            // On reattach, FIRST check if shell is still split (icons-host
+            // still exists). If yes, skip the 0x052C dance entirely —
+            // SetParent to the existing icons-host and we're done. This
+            // eliminates the 800ms+ visible flicker that re-spawning the
+            // back-WorkerW caused on every watchdog tick, and is the main
+            // fix for the "wallpaper refreshes every 10-30s" complaint.
+            if (isReattach)
+            {
+                var existingHost = FindIconsHost();
+                if (existingHost != IntPtr.Zero)
+                {
+                    var currentParent = GetParent(hwnd);
+                    var parentChanged = currentParent != existingHost;
+
+                    if (parentChanged)
+                        SetParent(hwnd, existingHost);
+
+                    // Bounds didn't change → skip the resize-frame work
+                    // entirely. Only resize when monitor bounds actually
+                    // shifted (display-changed event). Cuts the SWP_FRAMECHANGED
+                    // repaint that's the visible part of the flicker.
+                    var boundsChanged = currentParent == IntPtr.Zero || parentChanged;
+                    var flags = SWP_NOACTIVATE | (boundsChanged
+                        ? (SWP_FRAMECHANGED | SWP_SHOWWINDOW)
+                        : (SWP_NOMOVE | SWP_NOSIZE));
+                    SetWindowPos(hwnd, IntPtr.Zero,
+                        boundsChanged ? inst.Left : 0,
+                        boundsChanged ? inst.Top  : 0,
+                        boundsChanged ? inst.Width  : 0,
+                        boundsChanged ? inst.Height : 0,
+                        flags);
+                    inst.IconsHost = existingHost;
+
+                    if (parentChanged && !_desktopIconsHidden)
+                    {
+                        try { RaiseDesktopIcons(); }
+                        catch (Exception iconEx) { Debug.WriteLine($"soft-attach raise icons: {iconEx.Message}"); }
+                    }
+                    ReportWp(parentChanged
+                        ? $"SOFT-REATTACHED[{inst.MonitorId}] (no 0x052C, no resize)"
+                        : $"VERIFIED[{inst.MonitorId}] still attached, no-op");
+                    return;
+                }
+                // existingHost == IntPtr.Zero → shell genuinely lost its
+                // icons-host (rare). Fall through to the hard path below.
+                ReportWp($"{prefix}[{inst.MonitorId}] — icons-host missing, falling to hard path");
+            }
+
+            // ── HARD PATH ────────────────────────────────────────────────
+            // Initial Apply or reattach when icons-host is truly gone. Sends
+            // 0x052C to Progman to spawn back-WorkerW, waits 800ms for shell
+            // to settle, then SetParent. This is the slow expensive path.
             ReportWp($"{prefix}[{inst.MonitorId}] — locating Progman");
             var progman = FindWindow("Progman", null);
             if (progman == IntPtr.Zero) { ReportWp($"{prefix} FAILED — Progman not found"); return; }
@@ -925,9 +986,9 @@ public partial class MainWindow : Window
             //   WorkerW (front) ← contains SHELLDLL_DefView with icons
             //   WorkerW (back)  ← empty, where we put our wallpaper
             // Idempotent — Progman tracks split state, second call on
-            // already-split desktop is a no-op. Per-monitor: still only
-            // ONE 0x052C call is needed for the whole desktop, not per
-            // monitor. Caller (ReattachAllWallpapers) batches.
+            // already-split desktop is a no-op. But sending it visibly
+            // disturbs the desktop layer for ~800ms, hence the SOFT PATH
+            // above skipping this entirely when not needed.
             ReportWp($"{prefix}[{inst.MonitorId}] — spawning WorkerW (0x052C ×2) + 800ms wait");
             SendMessageTimeout(progman, 0x052C, new IntPtr(0xD), new IntPtr(0x1), 0x0000, 1000, out _);
             SendMessageTimeout(progman, 0x052C, new IntPtr(0xD), new IntPtr(0x0), 0x0000, 1000, out _);
@@ -958,20 +1019,12 @@ public partial class MainWindow : Window
                 }, IntPtr.Zero);
             }
 
-            // Strategy A (primary): SetParent INTO the icons-host (the same
-            // top-level window that contains SHELLDLL_DefView — Progman or a
-            // front-WorkerW). See FinalizeWallpaper's original commentary for
-            // why this beats the back-WorkerW approach on Win11.
+            // Strategy A (primary): SetParent INTO the icons-host.
             var iconsHost = FindIconsHost();
             if (iconsHost != IntPtr.Zero)
             {
                 ReportWp($"{prefix}[{inst.MonitorId}] — SetParent → icons-host + position");
                 SetParent(hwnd, iconsHost);
-                // Position is RELATIVE to parent (icons-host). For Progman /
-                // icons-host, 0,0 maps to the icons-host's top-left which IS
-                // the virtual screen origin — so passing absolute monitor
-                // coords still resolves correctly. The Width/Height however
-                // must be the monitor's pixel size.
                 SetWindowPos(hwnd, IntPtr.Zero, inst.Left, inst.Top, inst.Width, inst.Height,
                     SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
                 inst.IconsHost = iconsHost;
@@ -981,7 +1034,7 @@ public partial class MainWindow : Window
                     catch (Exception iconEx) { Debug.WriteLine($"post-apply raise icons: {iconEx.Message}"); }
                 }
                 ReportWp(isReattach
-                    ? $"RE-ATTACHED[{inst.MonitorId}] behind icons — {inst.Width}×{inst.Height} @ {inst.Left},{inst.Top}"
+                    ? $"HARD-REATTACHED[{inst.MonitorId}] behind icons — {inst.Width}×{inst.Height} @ {inst.Left},{inst.Top}"
                     : $"LIVE[{inst.MonitorId}] behind icons — {inst.Width}×{inst.Height} @ {inst.Left},{inst.Top}");
             }
             else if (workerW != IntPtr.Zero)
@@ -1005,6 +1058,7 @@ public partial class MainWindow : Window
         finally
         {
             _wallpaperReattachInFlight = false;
+            _lastWallpaperAttachUtc = DateTime.UtcNow;
         }
     }
 
@@ -1079,26 +1133,44 @@ public partial class MainWindow : Window
     private void StartWallpaperWatchdog()
     {
         if (_wallpaperWatchdog != null) return;
+        // 30s interval (was 10s) + cooldown + smarter drift detection
+        // collectively eliminate the "wallpaper refreshes every N seconds"
+        // flicker. Watchdog is now a safety net for cases SystemEvents
+        // genuinely missed, not a polling re-applier.
         _wallpaperWatchdog = new DispatcherTimer(DispatcherPriority.Background)
         {
-            Interval = TimeSpan.FromSeconds(10)
+            Interval = TimeSpan.FromSeconds(30)
         };
         _wallpaperWatchdog.Tick += async (_, _) =>
         {
             if (!_isWallpaperMode || !_wallpaperFinalized || _wallpapers.Count == 0) return;
+
+            // Cooldown: skip if we just attached recently. SystemEvents are
+            // not subject to this — they bypass via direct call. Watchdog
+            // is best-effort polling and should not re-fire while a recent
+            // attach is still settling.
+            if (DateTime.UtcNow - _lastWallpaperAttachUtc < WatchdogCooldown) return;
+
             try
             {
-                // Check each instance — any drift triggers a full reattach
-                // of ALL surfaces (so they stay in sync; cheap because the
-                // 0x052C dance is idempotent).
+                // STRICT drift detection: only trigger reattach when the
+                // wallpaper is provably orphaned. Specifically:
+                //   1. HWND has no parent (currentParent == IntPtr.Zero)
+                //      → window is now top-level, definitely not composited
+                //      as wallpaper.
+                //   2. Current parent HWND is destroyed (IsWindow=false)
+                //      → wallpaper is parented to a dead window.
+                // We DO NOT trigger on `currentParent != savedIconsHost`
+                // anymore — Explorer rebuilds the WorkerW chain as benign
+                // background activity (themes, third-party tools, transient
+                // shell restarts), and reattaching on those wastes a
+                // SetParent + repaint that users see as flicker.
                 bool driftDetected = false;
                 foreach (var inst in _wallpapers)
                 {
                     if (inst.Hwnd == IntPtr.Zero || !IsWindow(inst.Hwnd)) continue;
-                    // No saved host (Strategy C / fallback) → nothing to compare.
-                    if (inst.IconsHost == IntPtr.Zero) continue;
                     var currentParent = GetParent(inst.Hwnd);
-                    if (currentParent != inst.IconsHost || !IsWindow(inst.IconsHost))
+                    if (currentParent == IntPtr.Zero || !IsWindow(currentParent))
                     {
                         driftDetected = true;
                         break;
