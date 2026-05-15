@@ -702,7 +702,19 @@ body.bg-nebula {
     min-width: 460px;
     max-width: calc(100vw - 40px);
     pointer-events: auto;
-    animation: fade-in 0.4s ease-out both;
+    animation: wp-fade-in-centered 0.4s ease-out both;
+}
+
+/* CRITICAL: respect the HTML [hidden] attribute. The base .wp-setup-bar
+   rule sets `display: flex`, which has the SAME specificity as the
+   browser-default `[hidden] { display: none }` — and since user CSS is
+   evaluated after the user-agent stylesheet, `display: flex` was winning
+   and the panel showed up on EVERY page load (including the main app's
+   universe view, where ?mode=wallpaper-setup is not set so wireWallpaperSetup
+   is never called). Bumping specificity to (.class + [attr]) makes the
+   `hidden` attribute actually hide the element again. */
+.wp-setup-bar[hidden] {
+    display: none;
 }
 
 .wp-setup-title {
@@ -773,6 +785,25 @@ body.wallpaper-setup #settings-panel {
     bottom: 22px;   /* same as default */
 }
 
+/* Setup-only fade-in that preserves horizontal centering — the generic
+   `fade-in` ends with `transform: none`, which clobbers the bar's
+   `translateX(-50%)` (animations with fill-mode:both override inline
+   transforms permanently). Result was the bar sliding right of center
+   and clashing with the window chrome / token chip. */
+@keyframes wp-fade-in-centered {
+    from { opacity: 0; transform: translate(-50%, 4px); }
+    to   { opacity: 1; transform: translate(-50%, 0); }
+}
+
+/* During setup the +985 token chip sits at the exact same top-center
+   coordinates as the setup bar — even with z-index it bleeds through
+   the glass background. Hide it for the duration of setup; it'll come
+   back automatically once we exit (wallpaper-mode has its own rule
+   below, the live HUD shows it again on the normal universe). */
+body.wallpaper-setup #token-chip {
+    display: none !important;
+}
+
 /* Exit hint shown briefly after Apply + on mouse-move in wallpaper-mode.
    Reminds the user how to escape once HUD is gone. */
 .wp-exit-hint {
@@ -790,7 +821,7 @@ body.wallpaper-setup #settings-panel {
     letter-spacing: 0.3px;
     pointer-events: none;
     box-shadow: 0 0 14px rgba(108, 240, 255, 0.35);
-    animation: fade-in 0.4s ease-out both;
+    animation: wp-fade-in-centered 0.4s ease-out both;
 }
 
 .wp-exit-hint b {

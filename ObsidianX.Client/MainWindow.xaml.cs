@@ -324,24 +324,79 @@ public partial class MainWindow : Window
     /// </summary>
     private bool ToggleDesktopIcons(bool hide)
     {
+        var defView = FindShellDefView();
+        if (defView == IntPtr.Zero) return false;
+        ShowWindow(defView, hide ? SW_HIDE : SW_SHOW);
+        _desktopIconsHidden = hide;
+        return true;
+    }
+
+    /// <summary>
+    /// Locate the SHELLDLL_DefView pane (the desktop-icons container).
+    /// After 0x052C the shell can move it from Progman into a sibling
+    /// WorkerW, so try Progman first, then EnumWindows. Returns IntPtr.Zero
+    /// if nothing is found (the caller decides how to recover).
+    /// </summary>
+    private IntPtr FindShellDefView()
+    {
         var defView = IntPtr.Zero;
         var progman = FindWindow("Progman", null);
         if (progman != IntPtr.Zero)
             defView = FindWindowEx(progman, IntPtr.Zero, "SHELLDLL_DefView", null);
         if (defView == IntPtr.Zero)
         {
-            // After 0x052C, SHELLDLL_DefView may have migrated under a WorkerW.
             EnumWindows((tophandle, _) =>
             {
                 var dv = FindWindowEx(tophandle, IntPtr.Zero, "SHELLDLL_DefView", null);
-                if (dv != IntPtr.Zero) defView = dv;
+                if (dv != IntPtr.Zero) { defView = dv; return false; }
                 return true;
             }, IntPtr.Zero);
         }
-        if (defView == IntPtr.Zero) return false;
-        ShowWindow(defView, hide ? SW_HIDE : SW_SHOW);
-        _desktopIconsHidden = hide;
-        return true;
+        return defView;
+    }
+
+    /// <summary>
+    /// Bring the desktop icons (SHELLDLL_DefView) to the TOP of their parent's
+    /// z-order. Only effective when our wallpaper window is a sibling of
+    /// SHELLDLL_DefView (same parent). If we're in a different WorkerW we
+    /// can't reach across z-order layers from here — the parenting strategy
+    /// (FinalizeWallpaper) has to put us in the icons-host first.
+    /// </summary>
+    private void RaiseDesktopIcons()
+    {
+        var defView = FindShellDefView();
+        if (defView == IntPtr.Zero) return;
+        ShowWindow(defView, SW_SHOW);
+        // HWND_TOP = IntPtr.Zero. Move icons to top of their parent's children.
+        SetWindowPos(defView, IntPtr.Zero, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
+    /// <summary>
+    /// Return the top-level shell window that hosts SHELLDLL_DefView (the
+    /// desktop-icons pane). On Win10 pre-22H2 this is normally Progman;
+    /// after 0x052C the shell can move icons into a sibling WorkerW. We
+    /// SetParent our wallpaper INTO this host so we're in the same z-order
+    /// space as the icons — then a simple SetWindowPos on SHELLDLL_DefView
+    /// puts it visually on top of us.
+    /// </summary>
+    private IntPtr FindIconsHost()
+    {
+        var progman = FindWindow("Progman", null);
+        if (progman != IntPtr.Zero
+            && FindWindowEx(progman, IntPtr.Zero, "SHELLDLL_DefView", null) != IntPtr.Zero)
+            return progman;
+        IntPtr host = IntPtr.Zero;
+        EnumWindows((tophandle, _) =>
+        {
+            if (FindWindowEx(tophandle, IntPtr.Zero, "SHELLDLL_DefView", null) != IntPtr.Zero)
+            {
+                host = tophandle;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return host;
     }
 
     /// <summary>
@@ -533,33 +588,101 @@ public partial class MainWindow : Window
             var progman = FindWindow("Progman", null);
             if (progman == IntPtr.Zero) { ReportWp("FAILED — Progman not found"); return; }
 
-            ReportWp("apply 4/6 — spawning WorkerW (0x052C) + 500ms wait");
-            SendMessageTimeout(progman, 0x052C, IntPtr.Zero, IntPtr.Zero, 0x0000, 1000, out _);
-            await Task.Delay(500);
+            // 0x052C (undocumented) tells Progman to spawn a sibling WorkerW
+            // behind itself. Two-call pattern is the Lively/Wallpaper-Engine
+            // canon — Win10 22H2+ / Win11 need BOTH lParam values (0x1, 0x0)
+            // to reliably end up with the desktop split into:
+            //   WorkerW (front) ← contains SHELLDLL_DefView with icons
+            //   WorkerW (back)  ← empty, where we put our wallpaper
+            // Sending only once with wParam=0 (the previous code) was a
+            // no-op on modern Windows: no back-WorkerW spawned, so the
+            // SetParent fallback fired HWND_BOTTOM, which doesn't go behind
+            // the taskbar — wallpaper ended up covering icons + taskbar.
+            ReportWp("apply 4/6 — spawning WorkerW (0x052C ×2) + 800ms wait");
+            SendMessageTimeout(progman, 0x052C, new IntPtr(0xD), new IntPtr(0x1), 0x0000, 1000, out _);
+            SendMessageTimeout(progman, 0x052C, new IntPtr(0xD), new IntPtr(0x0), 0x0000, 1000, out _);
+            await Task.Delay(800);
 
             ReportWp("apply 5/6 — scanning EnumWindows for WorkerW sibling");
             IntPtr workerW = IntPtr.Zero;
-            EnumWindows((tophandle, _) =>
+            // Retry the scan a few times — on slow boots / shell-restart races
+            // the back-WorkerW can take a beat to appear after 0x052C.
+            for (int attempt = 0; attempt < 5 && workerW == IntPtr.Zero; attempt++)
             {
-                if (FindWindowEx(tophandle, IntPtr.Zero, "SHELLDLL_DefView", null) != IntPtr.Zero)
-                    workerW = FindWindowEx(IntPtr.Zero, tophandle, "WorkerW", null);
-                return true;
-            }, IntPtr.Zero);
+                if (attempt > 0) await Task.Delay(250);
+                EnumWindows((tophandle, _) =>
+                {
+                    // Skip windows that DON'T have SHELLDLL_DefView — those
+                    // aren't the icons-WorkerW.
+                    if (FindWindowEx(tophandle, IntPtr.Zero, "SHELLDLL_DefView", null) == IntPtr.Zero)
+                        return true;
+                    // tophandle holds the icons. Walk WorkerW siblings until
+                    // we find one that does NOT have SHELLDLL_DefView — that's
+                    // the empty back-WorkerW we want to parent into. Without
+                    // this guard we'd sometimes pick a WorkerW that ALSO holds
+                    // icons (Win11 multi-WorkerW), putting our wallpaper as a
+                    // sibling of the icons → wallpaper covers them.
+                    IntPtr candidate = FindWindowEx(IntPtr.Zero, tophandle, "WorkerW", null);
+                    while (candidate != IntPtr.Zero)
+                    {
+                        if (FindWindowEx(candidate, IntPtr.Zero, "SHELLDLL_DefView", null) == IntPtr.Zero)
+                        {
+                            workerW = candidate;
+                            return false; // stop enumeration
+                        }
+                        candidate = FindWindowEx(IntPtr.Zero, candidate, "WorkerW", null);
+                    }
+                    return true;
+                }, IntPtr.Zero);
+            }
 
-            if (workerW != IntPtr.Zero)
+            // Strategy A (primary): SetParent INTO the icons-host (the same
+            // top-level window that contains SHELLDLL_DefView — Progman or a
+            // front-WorkerW). Then HWND_TOP within that host puts us at the
+            // top of its children → RaiseDesktopIcons moves SHELLDLL_DefView
+            // above us so icons render on top of our wallpaper. This works
+            // because both windows are siblings in the same parent, and
+            // SetWindowPos z-order is unambiguous within a single parent.
+            //
+            // Why this beats the back-WorkerW approach on Win11: the user's
+            // build composites the back-WorkerW IN FRONT of the icons-host
+            // (reversed from convention), so even at HWND_TOP we were
+            // covering icons. Putting wallpaper INSIDE the icons-host
+            // sidesteps that — z-order is decided by parent children alone.
+            var iconsHost = FindIconsHost();
+            if (iconsHost != IntPtr.Zero)
             {
-                ReportWp("apply 6/6 — SetParent → WorkerW + SWP_FRAMECHANGED");
+                ReportWp("apply 6/6 — SetParent → icons-host + HWND_TOP, then raise icons");
+                SetParent(hwnd, iconsHost);
+                SetWindowPos(hwnd, IntPtr.Zero, 0, 0, vsWidth, vsHeight,
+                    SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+                if (!_desktopIconsHidden)
+                {
+                    try { RaiseDesktopIcons(); }
+                    catch (Exception iconEx) { Debug.WriteLine($"post-apply raise icons: {iconEx.Message}"); }
+                }
+                ReportWp($"LIVE behind icons — {vsWidth}×{vsHeight}");
+            }
+            else if (workerW != IntPtr.Zero)
+            {
+                // Strategy B (fallback): back-WorkerW approach. Used when
+                // FindIconsHost returns null (very unusual — would mean no
+                // SHELLDLL_DefView exists). Keeps the old WorkerW logic for
+                // diagnostic value; expected to be unreachable in practice.
+                ReportWp("apply 6/6 — fallback: SetParent → back-WorkerW + HWND_TOP");
                 SetParent(hwnd, workerW);
                 SetWindowPos(hwnd, IntPtr.Zero, 0, 0, vsWidth, vsHeight,
                     SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
-                ReportWp($"LIVE behind icons — {vsWidth}×{vsHeight}");
+                ReportWp($"LIVE behind icons (back-WorkerW fallback) — {vsWidth}×{vsHeight}");
             }
             else
             {
-                ReportWp("apply 6/6 — WorkerW missing, HWND_BOTTOM fallback");
+                // Last-ditch: top-level HWND_BOTTOM. Wallpaper renders but
+                // probably covers icons + taskbar. Better than vanishing.
+                ReportWp("apply 6/6 — last-ditch: top-level HWND_BOTTOM");
                 SetWindowPos(hwnd, HWND_BOTTOM, vsLeft, vsTop, vsWidth, vsHeight,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                ReportWp($"LIVE bottom-Z — {vsWidth}×{vsHeight}");
+                ReportWp($"LIVE bottom-Z fallback — {vsWidth}×{vsHeight}");
             }
 
             // Tell JS to drop the setup chrome + add wallpaper-mode (HUD-less).

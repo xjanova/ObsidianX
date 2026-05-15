@@ -381,7 +381,7 @@ export function createScene(canvas, callbacks = {}) {
         drift: 0.0,         // 0 = freeze after settle; >0 = keep sims simmering forever
         lightning: 1.0,         // 0 = disable pulses, 1 = default lightning, 2 = blinding
         lightningSpeed: 1.0,    // 0.5 = slow majestic strike, 1 = default, 2 = frantic flicker
-        cameraMode: 'free', // 'free' | 'orbit' | 'follow'
+        cameraMode: 'free', // 'free' | 'orbit' | 'follow' | 'random'
         background: 'nebula', // 'nebula' | 'black' — controls clearColor + nebula sprites + starfield
         lockSelected: true    // when a star is selected, keep it at screen centre
     };
@@ -1410,11 +1410,71 @@ export function createScene(canvas, callbacks = {}) {
         applyDrift();
     }
     function setCameraMode(m) {
-        if (m !== 'free' && m !== 'orbit' && m !== 'follow') return;
+        if (m !== 'free' && m !== 'orbit' && m !== 'follow' && m !== 'random') return;
+        const prev = settings.cameraMode;
         settings.cameraMode = m;
         // 'orbit' uses OrbitControls.autoRotate — built-in, smooth, auto-
         // pauses on user input. 'free' and 'follow' both leave autoRotate off.
         controls.autoRotate = (m === 'orbit');
+        // 'random' = persistent showcase mode: every 9-14s pick a random
+        // action (fly to a node, zoom out, fly to a random angle, brief
+        // orbit). Designed for the wallpaper / idle showcase use case
+        // where the user wants the universe to drift on its own.
+        if (prev === 'random' && m !== 'random') stopRandomMode();
+        if (m === 'random') startRandomMode();
+    }
+
+    // ── Random camera mode ──────────────────────────────────────────────
+    // Cycles through "showcase" actions on a jittered timer so a left-on
+    // wallpaper / monitor doesn't sit on the same shot. Picks actions by
+    // weighted random; an early-out check on settings.cameraMode keeps the
+    // queue from outliving a mode switch.
+    let _randomTimer = null;
+    function startRandomMode() {
+        stopRandomMode();
+        const actions = [
+            { w: 35, fn: flyToRandomNode },             // zoom in on a star
+            { w: 25, fn: () => fitToScreen({ padding: 1.35, duration: 1.4 }) }, // zoom out
+            { w: 25, fn: randomizeCamera },             // random orbit angle
+            { w: 15, fn: () => orbitBriefly(12000) }    // 12s of auto-rotate
+        ];
+        const total = actions.reduce((s, a) => s + a.w, 0);
+        function pickAndQueue() {
+            let r = Math.random() * total;
+            for (const a of actions) {
+                r -= a.w;
+                if (r <= 0) {
+                    try { a.fn(); } catch (e) { console.warn('[random-cam] action failed', e); }
+                    break;
+                }
+            }
+            // Re-queue only if still in random mode (mode-switch could've
+            // landed mid-action; respect it on the next tick).
+            if (settings.cameraMode === 'random') {
+                _randomTimer = setTimeout(pickAndQueue, 9000 + Math.random() * 5000);
+            }
+        }
+        // Fire one immediately so the user sees feedback on the click.
+        pickAndQueue();
+    }
+    function stopRandomMode() {
+        if (_randomTimer) { clearTimeout(_randomTimer); _randomTimer = null; }
+        // Orbit may have been left on by orbitBriefly; clear it unless the
+        // current mode is actually orbit.
+        if (settings.cameraMode !== 'orbit') controls.autoRotate = false;
+    }
+    function flyToRandomNode() {
+        if (!universe || !universe.nodes.length) return;
+        const idx = Math.floor(Math.random() * universe.nodes.length);
+        focusNode(idx);
+    }
+    function orbitBriefly(durationMs) {
+        controls.autoRotate = true;
+        setTimeout(() => {
+            // Don't override if user (or another action) switched to orbit
+            // proper, or if random was disabled while we were spinning.
+            if (settings.cameraMode === 'random') controls.autoRotate = false;
+        }, durationMs);
     }
 
     /**
@@ -1473,6 +1533,73 @@ export function createScene(canvas, callbacks = {}) {
         controls.target.set(snap.tgt.x, snap.tgt.y, snap.tgt.z);
         controls.update();
     }
+
+    /**
+     * Auto-fit: reframe the camera so every node sits inside the viewport.
+     * Uses LIVE world positions (post-physics) and the current viewport
+     * aspect, so the result is tight regardless of how far the simulation
+     * has drifted or how the user has resized the window.
+     *
+     * @param {object} [opts]
+     * @param {number} [opts.padding=1.18]  Extra room around the bounding sphere; 1.0 = touch edges.
+     * @param {number} [opts.duration=0.85] flyTo duration in seconds; pass 0 for snap.
+     * @param {boolean} [opts.keepDirection=true] If true, preserve current camera angle; if false, use the default 3/4 viewing angle.
+     */
+    function fitToScreen(opts = {}) {
+        if (!universe || !universe.nodes.length) return;
+        const padding  = opts.padding  ?? 1.18;
+        const duration = opts.duration ?? 0.85;
+        const keepDir  = opts.keepDirection !== false;
+
+        // 1) Bounding sphere: centroid + max-radial-distance. Centroid handles
+        //    asymmetric layouts (one huge galaxy, several tiny ones) better
+        //    than an AABB midpoint would.
+        let cx = 0, cy = 0, cz = 0;
+        const n = universe.nodes.length;
+        for (let i = 0; i < n; i++) {
+            const p = universe.nodes[i].position;
+            cx += p.x; cy += p.y; cz += p.z;
+        }
+        const inv = 1 / n;
+        cx *= inv; cy *= inv; cz *= inv;
+
+        let maxDist2 = 0;
+        for (let i = 0; i < n; i++) {
+            const p = universe.nodes[i].position;
+            const dx = p.x - cx, dy = p.y - cy, dz = p.z - cz;
+            const d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 > maxDist2) maxDist2 = d2;
+        }
+        const sphereR = Math.sqrt(maxDist2) || 1;
+
+        // Take universeGroup rotation into account — node.position values are
+        // in pre-rotation local space; the visible centroid lives in world.
+        universeGroup.updateMatrixWorld();
+        const centroid = new THREE.Vector3(cx, cy, cz).applyMatrix4(universeGroup.matrixWorld);
+
+        // 2) Camera distance from FOV + aspect. For a perspective camera the
+        //    vertical half-FOV maps directly; horizontal half-FOV is
+        //    atan(tan(v/2) * aspect). Use the SMALLER tangent so the sphere
+        //    fits in BOTH dimensions — otherwise a wide window crops the top
+        //    and bottom of the cluster.
+        const fovV = camera.fov * Math.PI / 180;
+        const tanV = Math.tan(fovV / 2);
+        const aspect = camera.aspect || 1;
+        const tanH = tanV * aspect;
+        const tan = Math.min(tanV, tanH);
+        const distance = (sphereR * padding) / tan;
+
+        // 3) Direction = (cam − target) normalized. Reusing it keeps the
+        //    user's angle intact (just zooms in/out + recentres). If we're
+        //    on first mount or the camera coincides with the target, fall
+        //    back to a pleasant 3/4 view.
+        let dir = camera.position.clone().sub(controls.target);
+        if (!keepDir || dir.lengthSq() < 1e-6) dir.set(0.25, 0.55, 1);
+        dir.normalize();
+        const camVec = centroid.clone().add(dir.multiplyScalar(distance));
+        flyTo(centroid, camVec, duration);
+    }
+
     function getSettings() { return { ...settings }; }
 
     return {
@@ -1499,6 +1626,7 @@ export function createScene(canvas, callbacks = {}) {
         randomizeCamera,
         snapshotCamera,
         restoreCamera,
+        fitToScreen,
         getSettings,
         destroy
     };

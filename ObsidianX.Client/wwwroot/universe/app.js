@@ -47,6 +47,7 @@ const $setLightningV      = document.getElementById('set-lightning-val');
 const $setLightningSpeedV = document.getElementById('set-lightning-speed-val');
 const $setReset      = document.getElementById('set-reset');
 const $setResettle   = document.getElementById('set-resettle');
+const $setFit        = document.getElementById('set-fit');
 const $setFullscreen = document.getElementById('set-fullscreen');
 const $setShowCase   = document.getElementById('set-showcase');
 const $setWallpaper  = document.getElementById('set-wallpaper');
@@ -85,7 +86,9 @@ const DEFAULT_SETTINGS = {
     lightning: 1.0,         // 0 = disable pulse flash, 1 = default, 2 = blinding
     lightningSpeed: 1.0,    // 0.5 = slow majestic strike, 2 = frantic flicker
     background: 'nebula',   // 'nebula' | 'black'
-    lockSelected: true      // true = clicked star sticks to screen centre
+    lockSelected: true,     // true = clicked star sticks to screen centre
+    legendVisible: true,    // true = show galaxy/expertise legend on the right
+    cameraMode: 'free'      // 'free' | 'orbit' | 'follow' | 'random'
 };
 
 function setStatus(text, isError = false) {
@@ -133,12 +136,17 @@ function renderStats(brain) {
 
 function renderLegend(galaxies) {
     if (!$legend || !$legendRows) return;
-    if (!galaxies.length) {
+    _legendHasRows = galaxies.length > 0;
+    if (!galaxies.length || !currentSettings.legendVisible) {
+        // Either nothing to show, or user toggled it off in settings.
         $legend.hidden = true;
-        return;
+        // Still populate rows below so the next "Show" toggle has content
+        // without waiting for the brain payload to re-arrive.
+        if (!galaxies.length) return;
+    } else {
+        $legend.hidden = false;
+        $legend.classList.add('fade-in');
     }
-    $legend.hidden = false;
-    $legend.classList.add('fade-in');
     $legendRows.innerHTML = '';
     for (const g of galaxies) {
         const row = document.createElement('div');
@@ -286,6 +294,17 @@ function wireWallpaperSetup() {
     if (!$wpSetupBar) return;
     $wpSetupBar.hidden = false;
 
+    // Reflect current cameraMode on the Random toggle button — if the user
+    // left Random on, the button should already read "ON" when setup opens.
+    if ($wpRandomize) {
+        const isRandom = currentSettings.cameraMode === 'random';
+        $wpRandomize.dataset.on = String(isRandom);
+        $wpRandomize.classList.toggle('primary', isRandom);
+        $wpRandomize.innerHTML = isRandom
+            ? '\u{1F3B2} Random camera · ON'
+            : '\u{1F3B2} Random camera';
+    }
+
     // Restore last saved camera angle + settings if available — so user
     // doesn't lose their previous setup when they reopen Wallpaper.
     const saved = loadWallpaperPrefs();
@@ -302,8 +321,25 @@ function wireWallpaperSetup() {
         }
     }
 
+    // Random camera = persistent showcase mode. Toggle ON keeps cycling
+    // shots forever (perfect for wallpaper); toggle OFF reverts to 'free'.
+    // Persist via currentSettings so the mode survives reload / Apply.
     $wpRandomize?.addEventListener('click', () => {
-        scene?.randomizeCamera?.();
+        const wasOn = $wpRandomize.dataset.on === 'true';
+        const nextOn = !wasOn;
+        const nextMode = nextOn ? 'random' : 'free';
+        $wpRandomize.dataset.on = String(nextOn);
+        $wpRandomize.classList.toggle('primary', nextOn);
+        $wpRandomize.innerHTML = nextOn
+            ? '\u{1F3B2} Random camera · ON'
+            : '\u{1F3B2} Random camera';
+        currentSettings = { ...currentSettings, cameraMode: nextMode };
+        scene?.setCameraMode?.(nextMode);
+        saveSettings(currentSettings);
+        // Also keep the main settings camera-mode picker in sync (matters
+        // when the same WebView is the host vs the wallpaper-setup child).
+        document.querySelectorAll('.cam-btn[data-mode]').forEach(b =>
+            b.classList.toggle('active', b.dataset.mode === nextMode));
     });
 
     // Hide/Show desktop icons — C# handles SHELLDLL_DefView ShowWindow.
@@ -539,7 +575,11 @@ function loadSettings() {
             background: (parsed.background === 'black' || parsed.background === 'nebula')
                 ? parsed.background : DEFAULT_SETTINGS.background,
             lockSelected: typeof parsed.lockSelected === 'boolean'
-                ? parsed.lockSelected : DEFAULT_SETTINGS.lockSelected
+                ? parsed.lockSelected : DEFAULT_SETTINGS.lockSelected,
+            legendVisible: typeof parsed.legendVisible === 'boolean'
+                ? parsed.legendVisible : DEFAULT_SETTINGS.legendVisible,
+            cameraMode: (['free','orbit','follow','random'].includes(parsed.cameraMode))
+                ? parsed.cameraMode : DEFAULT_SETTINGS.cameraMode
         };
     } catch {
         return { ...DEFAULT_SETTINGS };
@@ -564,6 +604,23 @@ function applySettingsToUI(s) {
         b.classList.toggle('active', b.dataset.bg === s.background));
     document.querySelectorAll('.cam-btn[data-lock]').forEach(b =>
         b.classList.toggle('active', (b.dataset.lock === 'on') === s.lockSelected));
+    document.querySelectorAll('.cam-btn[data-legend]').forEach(b =>
+        b.classList.toggle('active', (b.dataset.legend === 'on') === s.legendVisible));
+    document.querySelectorAll('.cam-btn[data-mode]').forEach(b =>
+        b.classList.toggle('active', b.dataset.mode === s.cameraMode));
+    applyLegendVisibility(s.legendVisible);
+}
+
+// Track whether the legend has galaxies to display. The "Show" toggle is a
+// no-op until renderLegend() has actually been called with a non-empty list.
+let _legendHasRows = false;
+
+function applyLegendVisibility(visible) {
+    if (!$legend) return;
+    // Only un-hide if there's something to show — otherwise we'd flash an
+    // empty glass panel during the brain-fetch race.
+    $legend.hidden = !visible || !_legendHasRows;
+    if (visible && _legendHasRows) $legend.classList.add('fade-in');
 }
 
 function applyBackground(which) {
@@ -584,6 +641,7 @@ function applySettingsToScene(s) {
     scene.setMotion(s.motion);
     scene.setLightning?.(s.lightning, s.lightningSpeed);
     scene.setLockSelected?.(s.lockSelected);
+    scene.setCameraMode?.(s.cameraMode);
     applyBackground(s.background);
 }
 
@@ -623,8 +681,17 @@ function wireSettingsPanel() {
 
     // Replays the per-galaxy d3-force assembly animation. Pumps alpha
     // back to 1 so the simulations heat up and settle again over ~3.5 s.
+    // After ~4 s (sim is settled), auto-fit to reframe the new layout.
     $setResettle?.addEventListener('click', () => {
         scene?.resettle?.();
+        setTimeout(() => scene?.fitToScreen?.(), 4000);
+    });
+
+    // Fit: zoom + recentre so every star sits inside the viewport.
+    // Uses live (post-physics) positions and the current aspect ratio.
+    $setFit?.addEventListener('click', () => {
+        scene?.fitToScreen?.();
+        setStatus('Fit · reframed to current node positions');
     });
 
     // Toggle WPF host fullscreen (covers the Windows taskbar). The C# side
@@ -668,14 +735,17 @@ function wireSettingsPanel() {
         }
     });
 
-    // Camera-mode picker (Free / Orbit / Follow). Pure JS — scene.js owns
-    // the auto-drive logic; we just toggle settings.cameraMode + active class.
+    // Camera-mode picker (Free / Orbit / Follow / Random). Persisted so a
+    // user who left wallpaper on Random doesn't lose the mode across
+    // restarts. scene.js owns the auto-drive timer.
     document.querySelectorAll('.cam-btn[data-mode]').forEach(btn => {
         btn.addEventListener('click', () => {
             const mode = btn.dataset.mode;
             document.querySelectorAll('.cam-btn[data-mode]').forEach(b =>
                 b.classList.toggle('active', b === btn));
+            currentSettings = { ...currentSettings, cameraMode: mode };
             scene?.setCameraMode?.(mode);
+            saveSettings(currentSettings);
         });
     });
 
@@ -699,6 +769,20 @@ function wireSettingsPanel() {
                 b.classList.toggle('active', b === btn));
             currentSettings = { ...currentSettings, background: bg };
             applyBackground(bg);
+            saveSettings(currentSettings);
+        });
+    });
+
+    // Expertise legend toggle: show/hide the right-side galaxy panel.
+    // Persisted in settings so it survives reload. Doesn't re-render the
+    // rows on toggle — just flips $legend.hidden via applyLegendVisibility.
+    document.querySelectorAll('.cam-btn[data-legend]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const visible = btn.dataset.legend === 'on';
+            document.querySelectorAll('.cam-btn[data-legend]').forEach(b =>
+                b.classList.toggle('active', b === btn));
+            currentSettings = { ...currentSettings, legendVisible: visible };
+            applyLegendVisibility(visible);
             saveSettings(currentSettings);
         });
     });
@@ -809,6 +893,22 @@ async function tryStandaloneFetch() {
     }
 }
 
+// Debounce auto-fit so dragging the window edge doesn't fire a flyTo on
+// every pixel. 250 ms = long enough that the user has stopped resizing,
+// short enough that the cluster snaps into frame before they let go.
+let _autoFitTimer = null;
+function scheduleAutoFit() {
+    if (_autoFitTimer) clearTimeout(_autoFitTimer);
+    _autoFitTimer = setTimeout(() => {
+        _autoFitTimer = null;
+        // Wallpaper-mode is read-only — no camera moves while it's the
+        // desktop background. Also skip if the user is actively using
+        // the wallpaper-setup window (they're framing their own shot).
+        if (IS_WALLPAPER_MODE) return;
+        scene?.fitToScreen?.({ duration: 0.45, keepDirection: true });
+    }, 250);
+}
+
 function handleResize() {
     applyCanvasSize();
     if ($size) {
@@ -816,6 +916,9 @@ function handleResize() {
         $size.textContent = `${w} × ${h} @ ${dpr}×`;
     }
     if (scene) scene.setSize(window.innerWidth, window.innerHeight);
+    // Keep the universe framed across window-size changes — otherwise a
+    // wider window leaves dead space and a narrower one crops galaxies.
+    scheduleAutoFit();
 }
 
 // kick off — DOMContentLoaded guard for the rare case the script lands
