@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using ObsidianX.Core.Models;
 
@@ -77,6 +78,32 @@ public class SqliteBrainStorage : IBrainStorage
                 title, preview, tags, category,
                 tokenize = "unicode61 remove_diacritics 2"
             );
+
+            -- Join Brain v2 — per-peer permission grants. Each row =
+            -- one owner has granted one peer a specific visibility scope.
+            -- Default behaviour is deny: rows that don't exist mean
+            -- "this peer cannot see anything from me". See ShareScope.cs
+            -- for field semantics; list columns are JSON arrays serialized
+            -- with System.Text.Json (compact, no whitespace).
+            CREATE TABLE IF NOT EXISTS share_scopes (
+                owner_address    TEXT NOT NULL,
+                peer_address     TEXT NOT NULL,
+                level            INTEGER NOT NULL,
+                allow_categories TEXT NOT NULL DEFAULT '[]',
+                allow_tags       TEXT NOT NULL DEFAULT '[]',
+                allow_folders    TEXT NOT NULL DEFAULT '[]',
+                deny_tags        TEXT NOT NULL DEFAULT '[]',
+                deny_folders     TEXT NOT NULL DEFAULT '[]',
+                allowlist        TEXT NOT NULL DEFAULT '[]',
+                blocklist        TEXT NOT NULL DEFAULT '[]',
+                expires_at_utc   TEXT NULL,
+                require_per_note INTEGER NOT NULL DEFAULT 1,
+                created_at_utc   TEXT NOT NULL,
+                updated_at_utc   TEXT NOT NULL,
+                owner_signature  BLOB NOT NULL DEFAULT (zeroblob(0)),
+                PRIMARY KEY (owner_address, peer_address)
+            );
+            CREATE INDEX IF NOT EXISTS ix_scopes_owner ON share_scopes(owner_address);
         """;
         cmd.ExecuteNonQuery();
     }
@@ -303,5 +330,177 @@ public class SqliteBrainStorage : IBrainStorage
         var terms = cleaned.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries);
         if (terms.Length == 0) return "\"\"";
         return string.Join(" ", terms.Select(t => $"\"{t}\"*"));
+    }
+
+    // ── Share-scope CRUD (Join Brain v2) ──────────────────────────────────
+    //
+    // Stored as a single row per (owner, peer); list-shaped fields are JSON
+    // arrays so we don't need a child table per filter type. Reads/writes
+    // are synchronous internally but exposed as Task<T> to match the
+    // interface contract (other backends e.g. MySQL will benefit).
+
+    private static readonly JsonSerializerOptions ScopeJson = new()
+    {
+        WriteIndented = false
+    };
+
+    public Task<ShareScope?> GetScopeAsync(string ownerAddress, string peerAddress)
+    {
+        if (string.IsNullOrWhiteSpace(ownerAddress) || string.IsNullOrWhiteSpace(peerAddress))
+            return Task.FromResult<ShareScope?>(null);
+
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = "SELECT * FROM share_scopes WHERE owner_address = $o AND peer_address = $p";
+        cmd.Parameters.AddWithValue("$o", ownerAddress);
+        cmd.Parameters.AddWithValue("$p", peerAddress);
+        using var r = cmd.ExecuteReader();
+        return Task.FromResult(r.Read() ? ReadScope(r) : null);
+    }
+
+    public Task<List<ShareScope>> ListScopesAsync(string ownerAddress)
+    {
+        var results = new List<ShareScope>();
+        if (string.IsNullOrWhiteSpace(ownerAddress))
+            return Task.FromResult(results);
+
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = "SELECT * FROM share_scopes WHERE owner_address = $o ORDER BY updated_at_utc DESC";
+        cmd.Parameters.AddWithValue("$o", ownerAddress);
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            var scope = ReadScope(r);
+            if (scope != null) results.Add(scope);
+        }
+        return Task.FromResult(results);
+    }
+
+    public Task UpsertScopeAsync(ShareScope scope)
+    {
+        if (scope == null
+            || string.IsNullOrWhiteSpace(scope.OwnerAddress)
+            || string.IsNullOrWhiteSpace(scope.PeerAddress))
+        {
+            return Task.CompletedTask;
+        }
+
+        scope.UpdatedAt = DateTime.UtcNow;
+        // Preserve CreatedAt on update — SQLite's INSERT ... ON CONFLICT lets
+        // us keep the original row's created_at_utc.
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO share_scopes (
+                owner_address, peer_address, level,
+                allow_categories, allow_tags, allow_folders,
+                deny_tags, deny_folders,
+                allowlist, blocklist,
+                expires_at_utc, require_per_note,
+                created_at_utc, updated_at_utc, owner_signature
+            ) VALUES (
+                $owner, $peer, $level,
+                $allowCats, $allowTags, $allowFolders,
+                $denyTags, $denyFolders,
+                $allowlist, $blocklist,
+                $expires, $requirePer,
+                $created, $updated, $sig
+            )
+            ON CONFLICT(owner_address, peer_address) DO UPDATE SET
+                level            = excluded.level,
+                allow_categories = excluded.allow_categories,
+                allow_tags       = excluded.allow_tags,
+                allow_folders    = excluded.allow_folders,
+                deny_tags        = excluded.deny_tags,
+                deny_folders     = excluded.deny_folders,
+                allowlist        = excluded.allowlist,
+                blocklist        = excluded.blocklist,
+                expires_at_utc   = excluded.expires_at_utc,
+                require_per_note = excluded.require_per_note,
+                updated_at_utc   = excluded.updated_at_utc,
+                owner_signature  = excluded.owner_signature;
+        """;
+        cmd.Parameters.AddWithValue("$owner", scope.OwnerAddress);
+        cmd.Parameters.AddWithValue("$peer", scope.PeerAddress);
+        cmd.Parameters.AddWithValue("$level", (int)scope.Level);
+        cmd.Parameters.AddWithValue("$allowCats", JsonSerializer.Serialize(scope.AllowCategories.Select(c => c.ToString()).ToList(), ScopeJson));
+        cmd.Parameters.AddWithValue("$allowTags", JsonSerializer.Serialize(scope.AllowTags, ScopeJson));
+        cmd.Parameters.AddWithValue("$allowFolders", JsonSerializer.Serialize(scope.AllowFolders, ScopeJson));
+        cmd.Parameters.AddWithValue("$denyTags", JsonSerializer.Serialize(scope.DenyTags, ScopeJson));
+        cmd.Parameters.AddWithValue("$denyFolders", JsonSerializer.Serialize(scope.DenyFolders, ScopeJson));
+        cmd.Parameters.AddWithValue("$allowlist", JsonSerializer.Serialize(scope.NoteIdAllowlist, ScopeJson));
+        cmd.Parameters.AddWithValue("$blocklist", JsonSerializer.Serialize(scope.NoteIdBlocklist, ScopeJson));
+        cmd.Parameters.AddWithValue("$expires", (object?)scope.ExpiresAt?.ToString("O") ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$requirePer", scope.RequirePerNoteApproval ? 1 : 0);
+        cmd.Parameters.AddWithValue("$created", scope.CreatedAt.ToString("O"));
+        cmd.Parameters.AddWithValue("$updated", scope.UpdatedAt.ToString("O"));
+        cmd.Parameters.AddWithValue("$sig", scope.OwnerSignature ?? []);
+        cmd.ExecuteNonQuery();
+        return Task.CompletedTask;
+    }
+
+    public Task DeleteScopeAsync(string ownerAddress, string peerAddress)
+    {
+        if (string.IsNullOrWhiteSpace(ownerAddress) || string.IsNullOrWhiteSpace(peerAddress))
+            return Task.CompletedTask;
+
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = "DELETE FROM share_scopes WHERE owner_address = $o AND peer_address = $p";
+        cmd.Parameters.AddWithValue("$o", ownerAddress);
+        cmd.Parameters.AddWithValue("$p", peerAddress);
+        cmd.ExecuteNonQuery();
+        return Task.CompletedTask;
+    }
+
+    private static ShareScope? ReadScope(SqliteDataReader r)
+    {
+        try
+        {
+            var s = new ShareScope
+            {
+                OwnerAddress = r.GetString(r.GetOrdinal("owner_address")),
+                PeerAddress  = r.GetString(r.GetOrdinal("peer_address")),
+                Level        = (ShareLevel)r.GetInt32(r.GetOrdinal("level")),
+                AllowTags    = JsonDeserializeStrings(r, "allow_tags"),
+                AllowFolders = JsonDeserializeStrings(r, "allow_folders"),
+                DenyTags     = JsonDeserializeStrings(r, "deny_tags"),
+                DenyFolders  = JsonDeserializeStrings(r, "deny_folders"),
+                NoteIdAllowlist = JsonDeserializeStrings(r, "allowlist"),
+                NoteIdBlocklist = JsonDeserializeStrings(r, "blocklist"),
+                RequirePerNoteApproval = r.GetInt32(r.GetOrdinal("require_per_note")) != 0,
+                CreatedAt = DateTime.Parse(r.GetString(r.GetOrdinal("created_at_utc"))).ToUniversalTime(),
+                UpdatedAt = DateTime.Parse(r.GetString(r.GetOrdinal("updated_at_utc"))).ToUniversalTime()
+            };
+
+            // Categories stored as strings so we can rename the enum without
+            // corrupting old rows. Unknown values are silently dropped.
+            foreach (var name in JsonDeserializeStrings(r, "allow_categories"))
+            {
+                if (Enum.TryParse<KnowledgeCategory>(name, ignoreCase: false, out var cat))
+                    s.AllowCategories.Add(cat);
+            }
+
+            var expiresOrd = r.GetOrdinal("expires_at_utc");
+            if (!r.IsDBNull(expiresOrd))
+                s.ExpiresAt = DateTime.Parse(r.GetString(expiresOrd)).ToUniversalTime();
+
+            var sigOrd = r.GetOrdinal("owner_signature");
+            if (!r.IsDBNull(sigOrd))
+                s.OwnerSignature = (byte[])r["owner_signature"];
+
+            return s;
+        }
+        catch
+        {
+            // Corrupt row — skip rather than crash the whole list. The next
+            // upsert from the owner will heal it.
+            return null;
+        }
+    }
+
+    private static List<string> JsonDeserializeStrings(SqliteDataReader r, string column)
+    {
+        var raw = r.GetString(r.GetOrdinal(column));
+        if (string.IsNullOrWhiteSpace(raw) || raw == "[]") return [];
+        try { return JsonSerializer.Deserialize<List<string>>(raw) ?? []; }
+        catch { return []; }
     }
 }

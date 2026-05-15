@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.SignalR;
 using ObsidianX.Core.Models;
+using ObsidianX.Core.Services;
 
 namespace ObsidianX.Server.Hubs;
 
@@ -11,6 +12,15 @@ public class BrainHub : Hub
     private static readonly List<string> ActivityLog = [];
     private static readonly DateTime StartTime = DateTime.UtcNow;
     private static int _totalShareRequests;
+    private static int _totalShareDenials;
+
+    // Join Brain v2 — scopes table keyed by (owner, peer). In-memory only
+    // for Phase 1; clients re-upload on reconnect. Phase 3 will back this
+    // with a server-side SqliteBrainStorage so scopes survive server
+    // restarts. ConcurrentDictionary lets us avoid the outer lock —
+    // ScopeKey is value-equatable so dictionary indexing is correct.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<ScopeKey, ShareScope> Scopes = new();
+    private readonly record struct ScopeKey(string Owner, string Peer);
 
     private const int MaxPendingRequests = 10_000;
     private const int MaxKeywords = 50;
@@ -53,6 +63,8 @@ public class BrainHub : Hub
                 TotalKnowledge = ConnectedPeers.Values.Sum(p => p.TotalKnowledgeNodes),
                 TotalWords = ConnectedPeers.Values.Sum(p => p.TotalWords),
                 TotalShareRequests = _totalShareRequests,
+                TotalShareDenials = _totalShareDenials,
+                TotalScopes = Scopes.Count,
                 Uptime = (DateTime.UtcNow - StartTime).TotalSeconds,
                 RecentActivity = recentActivity
             };
@@ -173,6 +185,36 @@ public class BrainHub : Hub
             throw new HubException("Invalid share request");
         }
 
+        Interlocked.Increment(ref _totalShareRequests);
+
+        // Join Brain v2 — cheap pre-flight: deny at the hub when the OWNER
+        // (request.ToAddress) has not granted the REQUESTER (FromAddress)
+        // any scope at all, or the scope is paused / expired. This both
+        // shortcuts the round-trip and means an offline owner's privacy
+        // is enforced even if the hub is the only thing online.
+        //
+        // Full per-note evaluation still happens on the owner's client
+        // (where the note content lives) — see ShareScopeEvaluator. The
+        // hub only does the rules that don't need note metadata.
+        Scopes.TryGetValue(new ScopeKey(request.ToAddress, request.FromAddress), out var scope);
+        var preflightReason = PreflightDeny(scope);
+        if (preflightReason != ShareDenyReason.None)
+        {
+            Interlocked.Increment(ref _totalShareDenials);
+            await Clients.Caller.SendAsync("ShareDenied", new
+            {
+                request.FromAddress,
+                request.ToAddress,
+                request.NodeTitle,
+                Reason = preflightReason.ToString(),
+                Stage = "preflight"
+            });
+            var shortAddr = request.ToAddress.Length > 18 ? request.ToAddress[..18] + "..." : request.ToAddress;
+            LogActivity($"Share DENIED ({preflightReason}): → {shortAddr}");
+            Console.WriteLine($"[!] Share denied {preflightReason}: {request.FromAddress} -> {request.ToAddress}");
+            return;
+        }
+
         lock (PendingRequests)
         {
             // Cap pending requests to prevent memory exhaustion
@@ -180,8 +222,6 @@ public class BrainHub : Hub
                 PendingRequests.RemoveAll(r => r.Status != ShareStatus.Pending);
             PendingRequests.Add(request);
         }
-
-        Interlocked.Increment(ref _totalShareRequests);
 
         PeerInfo? target;
         lock (ConnectedPeers)
@@ -195,6 +235,89 @@ public class BrainHub : Hub
             var shortAddr = request.ToAddress.Length > 18 ? request.ToAddress[..18] + "..." : request.ToAddress;
             LogActivity($"Share request: {Sanitize(request.NodeTitle, 60)} → {shortAddr}");
             Console.WriteLine($"[>] Share request: {request.FromAddress} -> {request.ToAddress} ({request.NodeTitle})");
+        }
+    }
+
+    /// <summary>
+    /// Hub-side share-scope rules that don't need note content. Used to
+    /// reject requests before bothering the owner's client. Mirrors the
+    /// first few cases of <see cref="ShareScopeEvaluator.Evaluate"/>.
+    /// </summary>
+    private static ShareDenyReason PreflightDeny(ShareScope? scope)
+    {
+        if (scope == null) return ShareDenyReason.NoScope;
+        if (scope.Level == ShareLevel.None) return ShareDenyReason.LevelNone;
+        if (scope.ExpiresAt.HasValue && scope.ExpiresAt.Value < DateTime.UtcNow)
+            return ShareDenyReason.Expired;
+        return ShareDenyReason.None;
+    }
+
+    // ── Scope management (Join Brain v2 Phase 1) ──────────────────────────
+    //
+    // Caller-owned: the connection identity (PeerInfo.BrainAddress registered
+    // via RegisterBrain) must match scope.OwnerAddress on writes. Reads are
+    // self-only — nobody can list someone else's scopes.
+    //
+    // SignalR can't trust client-supplied "owner" parameters on its own, so
+    // we look up the caller's registered address via Context.ConnectionId.
+
+    public Task<List<ShareScope>> GetMyScopes()
+    {
+        var addr = CallerBrainAddress();
+        if (string.IsNullOrEmpty(addr)) return Task.FromResult(new List<ShareScope>());
+        var mine = Scopes.Values
+            .Where(s => s.OwnerAddress == addr)
+            .OrderByDescending(s => s.UpdatedAt)
+            .ToList();
+        return Task.FromResult(mine);
+    }
+
+    public Task SetScope(ShareScope? scope)
+    {
+        if (scope == null) throw new HubException("scope is required");
+        var caller = CallerBrainAddress();
+        if (string.IsNullOrEmpty(caller))
+            throw new HubException("RegisterBrain first — caller has no identity");
+        if (!string.Equals(scope.OwnerAddress, caller, StringComparison.Ordinal))
+            throw new HubException("scope.OwnerAddress must match the caller's registered brain address");
+        if (string.IsNullOrWhiteSpace(scope.PeerAddress))
+            throw new HubException("scope.PeerAddress is required");
+
+        scope.UpdatedAt = DateTime.UtcNow;
+        Scopes.AddOrUpdate(
+            new ScopeKey(scope.OwnerAddress, scope.PeerAddress),
+            scope,
+            (_, existing) =>
+            {
+                // Preserve the original CreatedAt on update.
+                scope.CreatedAt = existing.CreatedAt;
+                return scope;
+            });
+
+        var shortPeer = scope.PeerAddress.Length > 18 ? scope.PeerAddress[..18] + "..." : scope.PeerAddress;
+        LogActivity($"Scope set: {scope.Level} → {shortPeer}");
+        return Task.CompletedTask;
+    }
+
+    public Task RevokeScope(string? peerAddress)
+    {
+        if (string.IsNullOrWhiteSpace(peerAddress)) return Task.CompletedTask;
+        var caller = CallerBrainAddress();
+        if (string.IsNullOrEmpty(caller)) return Task.CompletedTask;
+
+        if (Scopes.TryRemove(new ScopeKey(caller, peerAddress), out _))
+        {
+            var shortPeer = peerAddress.Length > 18 ? peerAddress[..18] + "..." : peerAddress;
+            LogActivity($"Scope revoked: → {shortPeer}");
+        }
+        return Task.CompletedTask;
+    }
+
+    private string CallerBrainAddress()
+    {
+        lock (ConnectedPeers)
+        {
+            return EndpointToAddress.TryGetValue(Context.ConnectionId, out var addr) ? addr : string.Empty;
         }
     }
 

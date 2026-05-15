@@ -35,6 +35,31 @@ public interface IBrainStorage : IDisposable
 
     /// <summary>Count nodes in the store (for UI telemetry).</summary>
     int NodeCount();
+
+    // ── Share-scope CRUD (Join Brain v2 Phase 1) ──────────────────────────
+    //
+    // Permission grants are per-(owner, peer) so a brain can have hundreds
+    // of peers with completely different visibility rules without the rule
+    // engine having to scan unrelated records. Storage is local-first:
+    // even on MySQL deployments, scope ownership is tied to the OWNER's
+    // brain address — the hub never persists scopes that don't belong to
+    // the caller. Default for any (owner, peer) pair that has no record is
+    // "deny everything" — never store an implicit allow.
+    //
+    // Default impls return empty / no-op so legacy storage providers don't
+    // break the build during Phase 1 rollout.
+
+    /// <summary>Fetch the scope this owner has granted to a specific peer, or null if none.</summary>
+    Task<ShareScope?> GetScopeAsync(string ownerAddress, string peerAddress) => Task.FromResult<ShareScope?>(null);
+
+    /// <summary>List every scope this owner has issued. Used by the Sharing settings panel.</summary>
+    Task<List<ShareScope>> ListScopesAsync(string ownerAddress) => Task.FromResult(new List<ShareScope>());
+
+    /// <summary>Insert or replace a scope. Sets UpdatedAt; preserves CreatedAt if the row already exists.</summary>
+    Task UpsertScopeAsync(ShareScope scope) => Task.CompletedTask;
+
+    /// <summary>Remove the (owner, peer) row entirely — equivalent to a full revoke.</summary>
+    Task DeleteScopeAsync(string ownerAddress, string peerAddress) => Task.CompletedTask;
 }
 
 public class SearchResult
