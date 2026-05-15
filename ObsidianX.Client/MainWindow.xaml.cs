@@ -330,7 +330,6 @@ public partial class MainWindow : Window
     private const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
     private const uint EVENT_SYSTEM_MINIMIZESTART = 0x0016;
     private const uint EVENT_SYSTEM_MINIMIZEEND = 0x0017;
-    private const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
     private const uint WINEVENT_OUTOFCONTEXT = 0x0000;
     private const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
 
@@ -496,13 +495,17 @@ public partial class MainWindow : Window
     private DateTime _lastWallpaperAttachUtc = DateTime.MinValue;
     private static readonly TimeSpan WatchdogCooldown = TimeSpan.FromSeconds(30);
 
-    // Auto-pause subsystem state. _foregroundHook = SetWinEventHook handle
-    // (must be kept alive + unhooked on cleanup). _winEventDelegate must
-    // be a field, not a local — otherwise GC eats it and the callback
-    // crashes the process when Windows fires the event. _pauseEvalTimer
-    // debounces rapid foreground-window changes (e.g. switching apps
-    // burst-fires events) so we don't re-evaluate every keystroke.
+    // Auto-pause subsystem state. Two narrow hooks (FOREGROUND-only +
+    // MINIMIZE-only) instead of one wide range (0x0003..0x0017) which
+    // would catch ~20 unrelated events (MenuStart/End, DragDropStart/End,
+    // DialogStart/End etc.) and wake the UI thread for nothing.
+    // _winEventDelegate must be a field, not a local — otherwise GC eats
+    // it and the callback crashes the process when Windows fires the
+    // event. _pauseEvalTimer debounces rapid foreground-window changes
+    // (launching an app fires multiple events) so we don't re-evaluate
+    // every keystroke.
     private IntPtr _foregroundHook = IntPtr.Zero;
+    private IntPtr _minimizeHook   = IntPtr.Zero;
     private WinEventDelegate? _winEventDelegate;
     private DispatcherTimer? _pauseEvalTimer;
 
@@ -1269,10 +1272,30 @@ public partial class MainWindow : Window
         if (_foregroundHook != IntPtr.Zero) return;
         // Field-bound delegate — local would be GC'd and crash the process.
         _winEventDelegate = OnForegroundWinEvent;
+        // Two narrow hooks instead of one wide range — catch only the
+        // events that actually matter for pause/resume decisions:
+        //   - EVENT_SYSTEM_FOREGROUND (0x0003) → window came to front
+        //   - EVENT_SYSTEM_MINIMIZESTART/END  (0x0016/0x0017) → user
+        //     minimized the covering window (foreground change fires
+        //     too, but minimize is the more direct signal)
         _foregroundHook = SetWinEventHook(
-            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
+            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
             IntPtr.Zero, _winEventDelegate, 0, 0,
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        _minimizeHook = SetWinEventHook(
+            EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
+            IntPtr.Zero, _winEventDelegate, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+        // Surface failures — both should succeed on any normal Win10+
+        // session. A zero handle means auto-pause silently won't work,
+        // which would mislead users into thinking the feature is broken
+        // when really the hook install failed (rare — usually session
+        // 0 / service / sandboxed contexts).
+        if (_foregroundHook == IntPtr.Zero)
+            ReportWp("auto-pause: SetWinEventHook(FOREGROUND) FAILED — pause-on-cover disabled");
+        if (_minimizeHook == IntPtr.Zero)
+            ReportWp("auto-pause: SetWinEventHook(MINIMIZE) FAILED — minimize-resume disabled");
 
         _pauseEvalTimer ??= new DispatcherTimer(DispatcherPriority.Background)
         {
@@ -1292,6 +1315,11 @@ public partial class MainWindow : Window
         {
             try { UnhookWinEvent(_foregroundHook); } catch { }
             _foregroundHook = IntPtr.Zero;
+        }
+        if (_minimizeHook != IntPtr.Zero)
+        {
+            try { UnhookWinEvent(_minimizeHook); } catch { }
+            _minimizeHook = IntPtr.Zero;
         }
         _winEventDelegate = null;
         if (_pauseEvalTimer != null)
@@ -1356,13 +1384,23 @@ public partial class MainWindow : Window
             }
             if (!GetWindowRect(fg, out var fgRect)) return;
             // Reject the desktop itself + our own app windows (Progman,
-            // WorkerW, our MainWindow). Those should never cause a pause.
+            // WorkerW, our MainWindow). Those should never CAUSE a pause —
+            // but DO resume any paused instance because "desktop is
+            // foreground" = nothing covering us = wallpaper should animate.
+            // Without this fix, Win+D after gaming left the wallpaper
+            // stuck on its last frame (instances still RenderPaused=true
+            // but foreground is Progman → nothing un-pauses them).
             // Our app windows are excluded by WINEVENT_SKIPOWNPROCESS at
             // hook time; the desktop check is a defensive belt.
             var fgClass = new System.Text.StringBuilder(64);
             GetClassName(fg, fgClass, fgClass.Capacity);
             var className = fgClass.ToString();
-            if (className == "Progman" || className == "WorkerW") return;
+            if (className == "Progman" || className == "WorkerW")
+            {
+                foreach (var inst in _wallpapers)
+                    if (inst.RenderPaused) SendResumeToInstance(inst);
+                return;
+            }
 
             foreach (var inst in _wallpapers)
             {
