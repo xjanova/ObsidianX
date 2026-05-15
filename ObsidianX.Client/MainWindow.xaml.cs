@@ -299,6 +299,109 @@ public partial class MainWindow : Window
     [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
     private static extern bool IsWindow(IntPtr hWnd);
 
+    // Per-monitor wallpaper enumeration. EnumDisplayMonitors gives us a
+    // RECT per physical monitor (in physical pixels), GetMonitorInfo
+    // returns work area + primary flag. We use this instead of WPF's
+    // SystemParameters.VirtualScreen (which collapses everything into a
+    // single bounding rect — fine for spanned wallpapers, no good for
+    // per-monitor where each monitor needs its own window).
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip,
+        MonitorEnumProc lpfnEnum, IntPtr dwData);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+    private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEX lpmi);
+
+    private delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdcMonitor,
+        ref RECT lprcMonitor, IntPtr dwData);
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct RECT { public int Left, Top, Right, Bottom; }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+    private struct MONITORINFOEX
+    {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string szDevice;
+    }
+
+    private const uint MONITORINFOF_PRIMARY = 0x00000001;
+
+    /// <summary>
+    /// Per-monitor display info, in PHYSICAL pixels. We use physical
+    /// coords throughout the wallpaper subsystem so that SetWindowPos
+    /// (which takes physical pixels) lines up with monitor bounds even
+    /// on per-monitor-DPI multi-display setups. WPF Window.Width/Left
+    /// expects DIPs — we accept the small mismatch here as Phase-1 cost.
+    /// Phase 2 (TODO) would convert via PresentationSource DPI per window.
+    /// </summary>
+    private sealed class MonitorBounds
+    {
+        public int Left, Top, Width, Height;
+        public string DeviceName = "";
+        public bool IsPrimary;
+        public override string ToString() =>
+            $"{DeviceName} {Width}×{Height} @{Left},{Top}{(IsPrimary ? " (primary)" : "")}";
+    }
+
+    /// <summary>
+    /// Enumerate all monitors via Win32 (avoids pulling in System.Windows.Forms
+    /// just for Screen.AllScreens). Falls back to a single virtual-screen
+    /// rect if EnumDisplayMonitors fails for any reason — preserves the
+    /// pre-per-monitor single-spanned-window behavior as a safety net.
+    /// </summary>
+    private List<MonitorBounds> EnumerateMonitors()
+    {
+        var list = new List<MonitorBounds>();
+        try
+        {
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (IntPtr hMon, IntPtr _, ref RECT _, IntPtr _) =>
+            {
+                var info = new MONITORINFOEX();
+                info.cbSize = System.Runtime.InteropServices.Marshal.SizeOf<MONITORINFOEX>();
+                if (GetMonitorInfo(hMon, ref info))
+                {
+                    list.Add(new MonitorBounds
+                    {
+                        Left   = info.rcMonitor.Left,
+                        Top    = info.rcMonitor.Top,
+                        Width  = info.rcMonitor.Right  - info.rcMonitor.Left,
+                        Height = info.rcMonitor.Bottom - info.rcMonitor.Top,
+                        DeviceName = info.szDevice ?? "",
+                        IsPrimary  = (info.dwFlags & MONITORINFOF_PRIMARY) != 0
+                    });
+                }
+                return true;
+            }, IntPtr.Zero);
+        }
+        catch (Exception ex) { Debug.WriteLine($"EnumerateMonitors: {ex.Message}"); }
+
+        // Fallback: synthesize one entry from VirtualScreen if enumeration
+        // returned nothing (extremely unusual — would mean Win32 broke).
+        if (list.Count == 0)
+        {
+            list.Add(new MonitorBounds
+            {
+                Left   = (int)SystemParameters.VirtualScreenLeft,
+                Top    = (int)SystemParameters.VirtualScreenTop,
+                Width  = (int)SystemParameters.VirtualScreenWidth,
+                Height = (int)SystemParameters.VirtualScreenHeight,
+                DeviceName = "fallback-virtualscreen",
+                IsPrimary  = true
+            });
+        }
+
+        // Put primary first so index 0 of _wallpapers is always the
+        // monitor users would expect to be "the main one" (matches
+        // single-monitor behavior order).
+        list.Sort((a, b) => b.IsPrimary.CompareTo(a.IsPrimary));
+        return list;
+    }
+
     // Wallpaper Engine constants for window styling + z-ordering.
     private const int GWL_EXSTYLE = -20;
     private const int WS_EX_TOOLWINDOW = 0x00000080;   // out of Alt-Tab + taskbar
@@ -315,15 +418,35 @@ public partial class MainWindow : Window
 
     private bool _isWallpaperMode;
     private bool _wallpaperFinalized;            // true after WorkerW reparent — i.e. it's a real wallpaper now
-    private Window? _wallpaperWindow;            // separate child window — has to be opaque (no AllowsTransparency)
-    private Microsoft.Web.WebView2.Wpf.WebView2? _wallpaperWebView;
     private bool _desktopIconsHidden;            // remember so we can restore on exit
-    // Survives standby/lock/screensaver: Win11 DWM rebuilds desktop window
-    // tree on session resume → back-WorkerW we parented into may be gone, or
-    // composition is silently dropped. We watch for that and re-attach. The
-    // icons-host HWND is captured at attach time so the watchdog can detect
-    // drift (GetParent ≠ saved host = need re-attach).
-    private IntPtr _wallpaperIconsHost = IntPtr.Zero;
+
+    /// <summary>
+    /// One per-monitor wallpaper surface. During SETUP only the
+    /// _setupInstance exists (a small draggable preview window — user
+    /// configures camera/theme there). On Apply, FinalizeWallpaper
+    /// enumerates monitors, resizes the setup window to monitor[0]'s
+    /// bounds (= reuses it as the primary wallpaper), and CLONES new
+    /// instances for each additional monitor. After that point all
+    /// active wallpapers live in _wallpapers; _setupInstance is null.
+    /// </summary>
+    private sealed class WallpaperInstance
+    {
+        public Window Window = null!;
+        public Microsoft.Web.WebView2.Wpf.WebView2 WebView = null!;
+        public IntPtr Hwnd;             // captured after EnsureHandle / Show
+        public IntPtr IconsHost;        // saved at attach for watchdog drift detection
+        public int Left, Top, Width, Height;   // monitor bounds in physical pixels
+        public string MonitorId = "";   // for HUD logs
+    }
+
+    // SETUP-only preview window. After Apply this is null — the window
+    // it owned has been promoted into _wallpapers[0].
+    private WallpaperInstance? _setupInstance;
+    // All active wallpaper surfaces — one per monitor in per-monitor mode,
+    // or [primary] only on single-monitor setups. SystemEvents + watchdog
+    // iterate this list; CleanupWallpaperWindow tears each one down.
+    private readonly List<WallpaperInstance> _wallpapers = new();
+
     private DispatcherTimer? _wallpaperWatchdog;
     private bool _wallpaperReattachInFlight;     // re-entry guard for AttachWallpaperToShell
     private bool _wallpaperEventsHooked;         // prevent double-subscribing SystemEvents
@@ -438,30 +561,31 @@ public partial class MainWindow : Window
     {
         try
         {
-            // Idempotent guard: if a previous wallpaper window is still around
-            // (e.g. user toggled off after a standby-induced invisible state
-            // and the OS-side window/HWND wasn't fully destroyed) clean it up
-            // before spawning a new one. Without this we'd have two render
-            // loops running — the visible new one + an orphaned one parented
-            // somewhere in the WorkerW chain still consuming GPU.
-            if (_wallpaperWindow != null || _wallpaperWebView != null)
+            // Idempotent guard: if a previous wallpaper / setup window is
+            // still around (e.g. user toggled off after a standby-induced
+            // invisible state and the OS-side window/HWND wasn't fully
+            // destroyed) clean it up before spawning a new one. Without
+            // this we'd have multiple render loops running — the visible
+            // new one + orphans parented somewhere in the WorkerW chain
+            // still consuming GPU.
+            if (_setupInstance != null || _wallpapers.Count > 0)
             {
                 ReportWp("setup 0/4 — cleaning up zombie wallpaper before re-entering");
                 CleanupWallpaperWindow();
             }
             ReportWp("setup 1/4 — building preview window (Wallpaper Engine style)");
-            _wallpaperWebView = new Microsoft.Web.WebView2.Wpf.WebView2
+            var webView = new Microsoft.Web.WebView2.Wpf.WebView2
             {
                 DefaultBackgroundColor = System.Drawing.Color.Black
             };
             // Preview-size, NOT topmost, has a title bar with X + drag — user
             // can move it, minimize it, click other apps freely. Apply will
-            // then resize to full virtual screen and reparent to WorkerW.
+            // then resize to monitor[0] bounds + reparent + clone for extras.
             var primaryW = (int)SystemParameters.PrimaryScreenWidth;
             var primaryH = (int)SystemParameters.PrimaryScreenHeight;
             var setupW   = Math.Min(1200, primaryW - 200);
             var setupH   = Math.Min(720,  primaryH - 200);
-            _wallpaperWindow = new Window
+            var window = new Window
             {
                 WindowStyle    = WindowStyle.ToolWindow,  // X + drag title bar
                 ResizeMode     = ResizeMode.CanResize,
@@ -473,10 +597,10 @@ public partial class MainWindow : Window
                 Width          = setupW,
                 Height         = setupH,
                 Title          = "ObsidianX Wallpaper — Preview (drag, tweak, then Apply)",
-                Content        = _wallpaperWebView
+                Content        = webView
             };
             // If user closes setup window via X → treat as Cancel.
-            _wallpaperWindow.Closed += (_, _) =>
+            window.Closed += (_, _) =>
             {
                 if (!_wallpaperFinalized) ExitWallpaperMode();
             };
@@ -484,7 +608,7 @@ public partial class MainWindow : Window
             // SAFETY HATCH: Esc / Ctrl+Shift+W ALWAYS exits wallpaper, even
             // before Apply. Without this the user could get stuck in a
             // Topmost setup window with no visible exit.
-            _wallpaperWindow.PreviewKeyDown += (_, ke) =>
+            window.PreviewKeyDown += (_, ke) =>
             {
                 if (ke.Key == System.Windows.Input.Key.Escape
                     || (ke.Key == System.Windows.Input.Key.W
@@ -499,21 +623,28 @@ public partial class MainWindow : Window
             };
 
             ReportWp("setup 3/4 — Show() + EnsureHandle");
-            _wallpaperWindow.Show();
-            var helper = new System.Windows.Interop.WindowInteropHelper(_wallpaperWindow);
+            window.Show();
+            var helper = new System.Windows.Interop.WindowInteropHelper(window);
             helper.EnsureHandle();
             var hwnd = helper.Handle;
             if (hwnd == IntPtr.Zero) { ReportWp("FAILED — couldn't get HWND"); return; }
 
             ReportWp("setup 4/4 — initialising WebView2 with ?mode=wallpaper-setup");
-            await _wallpaperWebView.EnsureCoreWebView2Async();
-            var core = _wallpaperWebView.CoreWebView2;
+            await webView.EnsureCoreWebView2Async();
+            var core = webView.CoreWebView2;
             var wwwroot = Path.Combine(AppContext.BaseDirectory, "wwwroot");
             core.SetVirtualHostNameToFolderMapping(
                 "universe.local", wwwroot, CoreWebView2HostResourceAccessKind.Allow);
             core.WebMessageReceived += OnWallpaperMessage;
-            _wallpaperWebView.Source = new Uri("https://universe.local/universe/index.html?mode=wallpaper-setup");
+            webView.Source = new Uri("https://universe.local/universe/index.html?mode=wallpaper-setup");
 
+            _setupInstance = new WallpaperInstance
+            {
+                Window = window,
+                WebView = webView,
+                Hwnd = hwnd,
+                MonitorId = "setup-preview"
+            };
             _isWallpaperMode = true;
             _wallpaperFinalized = false;
             ReportWp("SETUP mode — drag, tweak, then click Apply to lock as wallpaper");
@@ -523,6 +654,22 @@ public partial class MainWindow : Window
             ReportWp($"FAILED: {ex.Message}");
             CleanupWallpaperWindow();
         }
+    }
+
+    /// <summary>
+    /// Lookup which WallpaperInstance fired a WebView2 event. Used by
+    /// OnWallpaperMessage so per-monitor wallpapers each get their own
+    /// brain payload pushed back rather than re-pushing to the wrong one.
+    /// </summary>
+    private WallpaperInstance? FindInstanceByWebView(object? sender)
+    {
+        if (sender is Microsoft.Web.WebView2.Core.CoreWebView2 core)
+        {
+            if (_setupInstance?.WebView?.CoreWebView2 == core) return _setupInstance;
+            foreach (var inst in _wallpapers)
+                if (inst.WebView?.CoreWebView2 == core) return inst;
+        }
+        return _setupInstance ?? (_wallpapers.Count > 0 ? _wallpapers[0] : null);
     }
 
     /// <summary>
@@ -538,11 +685,16 @@ public partial class MainWindow : Window
         {
             var json = e.WebMessageAsJson;
             var msg = Newtonsoft.Json.JsonConvert.DeserializeAnonymousType(json, new { type = "" });
+            // Per-monitor: the sender is a CoreWebView2 — find which instance
+            // it belongs to so we push brain payload back to THAT specific
+            // WebView2 (each one re-asks `ready` after page reload).
+            var instance = FindInstanceByWebView(sender);
+
             if (msg?.type == "ready")
             {
                 var path = Path.Combine(_vaultPath, ".obsidianx", "brain-export.json");
-                if (File.Exists(path))
-                    _wallpaperWebView?.CoreWebView2?.PostWebMessageAsJson(
+                if (File.Exists(path) && instance?.WebView?.CoreWebView2 != null)
+                    instance.WebView.CoreWebView2.PostWebMessageAsJson(
                         "{\"type\":\"brain\",\"payload\":" + File.ReadAllText(path) + "}");
             }
             else if (msg?.type == "wallpaperApply")
@@ -555,6 +707,8 @@ public partial class MainWindow : Window
             }
             else if (msg?.type == "wallpaperToggleIcons")
             {
+                // Icon visibility is system-wide — only act once even if
+                // multiple monitors send the message simultaneously.
                 var hidePayload = Newtonsoft.Json.JsonConvert.DeserializeAnonymousType(
                     e.WebMessageAsJson, new { hide = false });
                 var hide = hidePayload?.hide ?? false;
@@ -571,62 +725,173 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Stage 2: SetParent the setup window into WorkerW (or HWND_BOTTOM
-    /// fallback). Sends finalizeWallpaper back to JS so it drops the setup
-    /// bar + adds the wallpaper-mode CSS class.
+    /// Stage 2: enumerate monitors, then for each one either reuse the
+    /// SETUP window (monitor[0] → primary) or spawn a clone (additional
+    /// monitors). Each instance gets resized to its monitor bounds and
+    /// reparented under the icons-host (or back-WorkerW fallback).
+    ///
+    /// Per-monitor design: each WebView2 loads the same wallpaper URL but
+    /// renders independently — one Universe scene per physical display.
+    /// Single-monitor users get exactly the previous behavior (one
+    /// instance covering one screen). Multi-monitor users get the
+    /// equivalent of Wallpaper Engine's "every monitor" mode.
     /// </summary>
     private async void FinalizeWallpaper()
     {
-        if (_wallpaperWindow == null || _wallpaperFinalized) return;
+        if (_setupInstance == null || _wallpaperFinalized) return;
         try
         {
-            var helper = new System.Windows.Interop.WindowInteropHelper(_wallpaperWindow);
-            var hwnd = helper.Handle;
-            if (hwnd == IntPtr.Zero) { ReportWp("FAILED — no HWND on finalize"); return; }
+            // Enumerate monitors NOW (not at EnterWallpaperMode) — covers
+            // the case where the user plugs/unplugs displays between Setup
+            // and Apply.
+            var monitors = EnumerateMonitors();
+            ReportWp($"apply 1/4 — found {monitors.Count} monitor(s): {string.Join(" | ", monitors)}");
 
-            // SAFETY FIRST: drop Topmost via BOTH the WPF property AND an
-            // explicit Win32 SetWindowPos(HWND_NOTOPMOST). If anything below
-            // throws, the window won't be blocking other apps anymore.
-            ReportWp("apply 1/6 — dropping Topmost (safety first)");
-            _wallpaperWindow.Topmost = false;
-            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            // Promote the setup instance to be wallpaper #0 (primary
+            // monitor). This avoids tearing down + recreating the WebView2
+            // (slow) for the user's main display.
+            var setup = _setupInstance;
+            _setupInstance = null;
+            setup.MonitorId = monitors[0].DeviceName;
+            await PrepareInstanceForWallpaper(setup, monitors[0]);
+            await AttachWallpaperToShell(setup, isReattach: false);
+            _wallpapers.Add(setup);
 
-            ReportWp("apply 2/6 — expand setup window → full virtual screen");
-            // Flip to chrome-less + expand to entire multi-monitor area.
-            _wallpaperWindow.WindowStyle    = WindowStyle.None;
-            _wallpaperWindow.ResizeMode     = ResizeMode.NoResize;
-            _wallpaperWindow.ShowInTaskbar  = false;
-            var vsLeft   = (int)SystemParameters.VirtualScreenLeft;
-            var vsTop    = (int)SystemParameters.VirtualScreenTop;
-            var vsWidth  = (int)SystemParameters.VirtualScreenWidth;
-            var vsHeight = (int)SystemParameters.VirtualScreenHeight;
-            _wallpaperWindow.Left   = vsLeft;
-            _wallpaperWindow.Top    = vsTop;
-            _wallpaperWindow.Width  = vsWidth;
-            _wallpaperWindow.Height = vsHeight;
+            // Clone an instance per ADDITIONAL monitor. Each gets its own
+            // Window + WebView2 + bridge. Brain payload is pushed when
+            // each WebView2 fires `ready`.
+            for (int i = 1; i < monitors.Count; i++)
+            {
+                var mon = monitors[i];
+                ReportWp($"apply 2/4 — cloning wallpaper for monitor {i + 1}/{monitors.Count} ({mon.DeviceName})");
+                var clone = await SpawnWallpaperClone(mon);
+                if (clone != null)
+                {
+                    await AttachWallpaperToShell(clone, isReattach: false);
+                    _wallpapers.Add(clone);
+                }
+                else
+                {
+                    ReportWp($"apply — clone for {mon.DeviceName} FAILED, skipping that monitor");
+                }
+            }
 
-            // Add WS_EX_TOOLWINDOW + WS_EX_NOACTIVATE so we leave Alt-Tab.
-            var ex = GetWindowLong(hwnd, GWL_EXSTYLE);
-            SetWindowLong(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE);
-
-            // The WorkerW spawn + SetParent dance is its own helper because
-            // it needs to re-run after standby / session unlock / display
-            // change — the back-WorkerW we parent into is recreated by DWM
-            // and our HWND silently loses composition.
-            await AttachWallpaperToShell(hwnd, vsLeft, vsTop, vsWidth, vsHeight, isReattach: false);
-
-            // Tell JS to drop the setup chrome + add wallpaper-mode (HUD-less).
-            _wallpaperWebView?.CoreWebView2?.PostWebMessageAsJson(
-                "{\"type\":\"finalizeWallpaper\"}");
+            // Tell every WebView2 to flip from setup-chrome to wallpaper-mode.
+            ReportWp("apply 3/4 — telling JS to drop setup chrome (all instances)");
+            foreach (var inst in _wallpapers)
+            {
+                try { inst.WebView?.CoreWebView2?.PostWebMessageAsJson("{\"type\":\"finalizeWallpaper\"}"); }
+                catch (Exception ex) { Debug.WriteLine($"finalizeWallpaper post for {inst.MonitorId}: {ex.Message}"); }
+            }
 
             _wallpaperFinalized = true;
             StartWallpaperWatchdog();
             HookWallpaperSystemEvents();
+            ReportWp($"apply 4/4 — LIVE on {_wallpapers.Count} monitor(s)");
         }
         catch (Exception ex)
         {
             ReportWp($"Apply FAILED: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Mutate an existing setup-style window into wallpaper-mode: drop
+    /// Topmost, strip chrome, resize to the monitor's physical bounds,
+    /// add WS_EX_TOOLWINDOW + WS_EX_NOACTIVATE so it leaves Alt-Tab.
+    /// </summary>
+    private Task PrepareInstanceForWallpaper(WallpaperInstance inst, MonitorBounds mon)
+    {
+        // SAFETY FIRST: drop Topmost via BOTH the WPF property AND an
+        // explicit Win32 SetWindowPos(HWND_NOTOPMOST). If anything below
+        // throws, the window won't be blocking other apps anymore.
+        inst.Window.Topmost = false;
+        SetWindowPos(inst.Hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+        // Flip to chrome-less + position on the monitor's bounds.
+        inst.Window.WindowStyle    = WindowStyle.None;
+        inst.Window.ResizeMode     = ResizeMode.NoResize;
+        inst.Window.ShowInTaskbar  = false;
+        // WPF Width/Left expect DIPs — we set physical px here. Acceptable
+        // mismatch on uniform-DPI setups (pixels==DIPs at 100%); on mixed
+        // DPI the window may be sized slightly off until the post-attach
+        // SetWindowPos snaps it to physical bounds.
+        inst.Window.Left   = mon.Left;
+        inst.Window.Top    = mon.Top;
+        inst.Window.Width  = mon.Width;
+        inst.Window.Height = mon.Height;
+        inst.Left = mon.Left; inst.Top = mon.Top;
+        inst.Width = mon.Width; inst.Height = mon.Height;
+
+        // Out of Alt-Tab + can't steal focus.
+        var ex = GetWindowLong(inst.Hwnd, GWL_EXSTYLE);
+        SetWindowLong(inst.Hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Create a new chromeless wallpaper window + WebView2 sized to a
+    /// non-primary monitor's bounds. Used by FinalizeWallpaper to clone
+    /// additional surfaces beyond the primary.
+    /// </summary>
+    private async Task<WallpaperInstance?> SpawnWallpaperClone(MonitorBounds mon)
+    {
+        try
+        {
+            var webView = new Microsoft.Web.WebView2.Wpf.WebView2
+            {
+                DefaultBackgroundColor = System.Drawing.Color.Black
+            };
+            var window = new Window
+            {
+                WindowStyle    = WindowStyle.None,
+                ResizeMode     = ResizeMode.NoResize,
+                ShowInTaskbar  = false,
+                AllowsTransparency = false,
+                Background     = System.Windows.Media.Brushes.Black,
+                Topmost        = false,
+                WindowStartupLocation = WindowStartupLocation.Manual,
+                Left   = mon.Left,
+                Top    = mon.Top,
+                Width  = mon.Width,
+                Height = mon.Height,
+                Title  = $"ObsidianX Wallpaper [{mon.DeviceName}]",
+                Content = webView
+            };
+            window.Show();
+            var helper = new System.Windows.Interop.WindowInteropHelper(window);
+            helper.EnsureHandle();
+            var hwnd = helper.Handle;
+            if (hwnd == IntPtr.Zero) return null;
+
+            // Out of Alt-Tab + can't steal focus.
+            var ex = GetWindowLong(hwnd, GWL_EXSTYLE);
+            SetWindowLong(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE);
+
+            await webView.EnsureCoreWebView2Async();
+            var core = webView.CoreWebView2;
+            var wwwroot = Path.Combine(AppContext.BaseDirectory, "wwwroot");
+            core.SetVirtualHostNameToFolderMapping(
+                "universe.local", wwwroot, CoreWebView2HostResourceAccessKind.Allow);
+            core.WebMessageReceived += OnWallpaperMessage;
+            // Load directly in wallpaper-mode (no setup chrome) since clones
+            // skip the setup phase entirely.
+            webView.Source = new Uri("https://universe.local/universe/index.html?mode=wallpaper");
+
+            return new WallpaperInstance
+            {
+                Window = window,
+                WebView = webView,
+                Hwnd = hwnd,
+                Left = mon.Left, Top = mon.Top, Width = mon.Width, Height = mon.Height,
+                MonitorId = mon.DeviceName
+            };
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"SpawnWallpaperClone({mon.DeviceName}): {ex.Message}");
+            return null;
         }
     }
 
@@ -641,14 +906,15 @@ public partial class MainWindow : Window
     /// "re-attach" so the user can tell from the HUD whether this is initial
     /// Apply or a recovery.
     /// </summary>
-    private async Task AttachWallpaperToShell(IntPtr hwnd, int vsLeft, int vsTop, int vsWidth, int vsHeight, bool isReattach)
+    private async Task AttachWallpaperToShell(WallpaperInstance inst, bool isReattach)
     {
         if (_wallpaperReattachInFlight) return;
         _wallpaperReattachInFlight = true;
         var prefix = isReattach ? "re-attach" : "apply";
+        var hwnd = inst.Hwnd;
         try
         {
-            ReportWp($"{prefix} — locating Progman");
+            ReportWp($"{prefix}[{inst.MonitorId}] — locating Progman");
             var progman = FindWindow("Progman", null);
             if (progman == IntPtr.Zero) { ReportWp($"{prefix} FAILED — Progman not found"); return; }
 
@@ -658,12 +924,16 @@ public partial class MainWindow : Window
             // to reliably end up with the desktop split into:
             //   WorkerW (front) ← contains SHELLDLL_DefView with icons
             //   WorkerW (back)  ← empty, where we put our wallpaper
-            ReportWp($"{prefix} — spawning WorkerW (0x052C ×2) + 800ms wait");
+            // Idempotent — Progman tracks split state, second call on
+            // already-split desktop is a no-op. Per-monitor: still only
+            // ONE 0x052C call is needed for the whole desktop, not per
+            // monitor. Caller (ReattachAllWallpapers) batches.
+            ReportWp($"{prefix}[{inst.MonitorId}] — spawning WorkerW (0x052C ×2) + 800ms wait");
             SendMessageTimeout(progman, 0x052C, new IntPtr(0xD), new IntPtr(0x1), 0x0000, 1000, out _);
             SendMessageTimeout(progman, 0x052C, new IntPtr(0xD), new IntPtr(0x0), 0x0000, 1000, out _);
             await Task.Delay(800);
 
-            ReportWp($"{prefix} — scanning EnumWindows for WorkerW sibling");
+            ReportWp($"{prefix}[{inst.MonitorId}] — scanning EnumWindows for WorkerW sibling");
             IntPtr workerW = IntPtr.Zero;
             // Retry the scan a few times — on slow boots / shell-restart races
             // the back-WorkerW can take a beat to appear after 0x052C.
@@ -695,36 +965,41 @@ public partial class MainWindow : Window
             var iconsHost = FindIconsHost();
             if (iconsHost != IntPtr.Zero)
             {
-                ReportWp($"{prefix} — SetParent → icons-host + HWND_TOP, then raise icons");
+                ReportWp($"{prefix}[{inst.MonitorId}] — SetParent → icons-host + position");
                 SetParent(hwnd, iconsHost);
-                SetWindowPos(hwnd, IntPtr.Zero, 0, 0, vsWidth, vsHeight,
+                // Position is RELATIVE to parent (icons-host). For Progman /
+                // icons-host, 0,0 maps to the icons-host's top-left which IS
+                // the virtual screen origin — so passing absolute monitor
+                // coords still resolves correctly. The Width/Height however
+                // must be the monitor's pixel size.
+                SetWindowPos(hwnd, IntPtr.Zero, inst.Left, inst.Top, inst.Width, inst.Height,
                     SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
-                _wallpaperIconsHost = iconsHost;
+                inst.IconsHost = iconsHost;
                 if (!_desktopIconsHidden)
                 {
                     try { RaiseDesktopIcons(); }
                     catch (Exception iconEx) { Debug.WriteLine($"post-apply raise icons: {iconEx.Message}"); }
                 }
                 ReportWp(isReattach
-                    ? $"RE-ATTACHED behind icons — {vsWidth}×{vsHeight}"
-                    : $"LIVE behind icons — {vsWidth}×{vsHeight}");
+                    ? $"RE-ATTACHED[{inst.MonitorId}] behind icons — {inst.Width}×{inst.Height} @ {inst.Left},{inst.Top}"
+                    : $"LIVE[{inst.MonitorId}] behind icons — {inst.Width}×{inst.Height} @ {inst.Left},{inst.Top}");
             }
             else if (workerW != IntPtr.Zero)
             {
-                ReportWp($"{prefix} — fallback: SetParent → back-WorkerW + HWND_TOP");
+                ReportWp($"{prefix}[{inst.MonitorId}] — fallback: SetParent → back-WorkerW");
                 SetParent(hwnd, workerW);
-                SetWindowPos(hwnd, IntPtr.Zero, 0, 0, vsWidth, vsHeight,
+                SetWindowPos(hwnd, IntPtr.Zero, inst.Left, inst.Top, inst.Width, inst.Height,
                     SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
-                _wallpaperIconsHost = workerW;
-                ReportWp($"LIVE behind icons (back-WorkerW fallback) — {vsWidth}×{vsHeight}");
+                inst.IconsHost = workerW;
+                ReportWp($"LIVE[{inst.MonitorId}] (back-WorkerW fallback) — {inst.Width}×{inst.Height}");
             }
             else
             {
-                ReportWp($"{prefix} — last-ditch: top-level HWND_BOTTOM");
-                SetWindowPos(hwnd, HWND_BOTTOM, vsLeft, vsTop, vsWidth, vsHeight,
+                ReportWp($"{prefix}[{inst.MonitorId}] — last-ditch: top-level HWND_BOTTOM");
+                SetWindowPos(hwnd, HWND_BOTTOM, inst.Left, inst.Top, inst.Width, inst.Height,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                _wallpaperIconsHost = IntPtr.Zero;
-                ReportWp($"LIVE bottom-Z fallback — {vsWidth}×{vsHeight}");
+                inst.IconsHost = IntPtr.Zero;
+                ReportWp($"LIVE[{inst.MonitorId}] bottom-Z fallback — {inst.Width}×{inst.Height}");
             }
         }
         finally
@@ -742,28 +1017,49 @@ public partial class MainWindow : Window
     /// </summary>
     private async Task ReattachWallpaperAsync(string reason)
     {
-        if (!_isWallpaperMode || !_wallpaperFinalized || _wallpaperWindow == null) return;
+        if (!_isWallpaperMode || !_wallpaperFinalized) return;
+        if (_wallpapers.Count == 0) return;
         try
         {
-            var helper = new System.Windows.Interop.WindowInteropHelper(_wallpaperWindow);
-            var hwnd = helper.Handle;
-            if (hwnd == IntPtr.Zero || !IsWindow(hwnd))
+            ReportWp($"re-attach ({reason}) — reapplying WorkerW reparent for {_wallpapers.Count} surface(s)");
+
+            // Re-enumerate monitors — display-changed events may have added,
+            // removed, or repositioned a screen. We DON'T spawn/destroy
+            // instances here (Phase 1 limitation); instead each existing
+            // instance gets re-clamped to the closest monitor, or to its
+            // last-known bounds if no match exists.
+            var monitors = EnumerateMonitors();
+
+            for (int i = 0; i < _wallpapers.Count; i++)
             {
-                ReportWp($"re-attach skipped ({reason}) — wallpaper HWND gone");
-                return;
+                var inst = _wallpapers[i];
+                if (inst.Window == null) continue;
+                var helper = new System.Windows.Interop.WindowInteropHelper(inst.Window);
+                var hwnd = helper.Handle;
+                if (hwnd == IntPtr.Zero || !IsWindow(hwnd))
+                {
+                    ReportWp($"re-attach skipped[{inst.MonitorId}] ({reason}) — HWND gone");
+                    continue;
+                }
+                inst.Hwnd = hwnd;
+
+                // Pick the matching monitor (by index when count matches; by
+                // device name otherwise; fallback = keep saved bounds).
+                MonitorBounds? mon = null;
+                if (i < monitors.Count) mon = monitors[i];
+                if (mon == null)
+                    mon = monitors.Find(m => m.DeviceName == inst.MonitorId);
+                if (mon != null)
+                {
+                    inst.Window.Left   = mon.Left;
+                    inst.Window.Top    = mon.Top;
+                    inst.Window.Width  = mon.Width;
+                    inst.Window.Height = mon.Height;
+                    inst.Left = mon.Left; inst.Top = mon.Top;
+                    inst.Width = mon.Width; inst.Height = mon.Height;
+                }
+                await AttachWallpaperToShell(inst, isReattach: true);
             }
-            ReportWp($"re-attach ({reason}) — reapplying WorkerW reparent");
-            // Re-clamp size to current virtual screen — DPI / monitor changes
-            // can shift bounds while we were invisible.
-            var vsLeft   = (int)SystemParameters.VirtualScreenLeft;
-            var vsTop    = (int)SystemParameters.VirtualScreenTop;
-            var vsWidth  = (int)SystemParameters.VirtualScreenWidth;
-            var vsHeight = (int)SystemParameters.VirtualScreenHeight;
-            _wallpaperWindow.Left   = vsLeft;
-            _wallpaperWindow.Top    = vsTop;
-            _wallpaperWindow.Width  = vsWidth;
-            _wallpaperWindow.Height = vsHeight;
-            await AttachWallpaperToShell(hwnd, vsLeft, vsTop, vsWidth, vsHeight, isReattach: true);
         }
         catch (Exception ex)
         {
@@ -789,17 +1085,26 @@ public partial class MainWindow : Window
         };
         _wallpaperWatchdog.Tick += async (_, _) =>
         {
-            if (!_isWallpaperMode || !_wallpaperFinalized || _wallpaperWindow == null) return;
+            if (!_isWallpaperMode || !_wallpaperFinalized || _wallpapers.Count == 0) return;
             try
             {
-                var helper = new System.Windows.Interop.WindowInteropHelper(_wallpaperWindow);
-                var hwnd = helper.Handle;
-                if (hwnd == IntPtr.Zero || !IsWindow(hwnd)) return;
-                var currentParent = GetParent(hwnd);
-                // No saved host (Strategy C / fallback) → nothing to compare.
-                if (_wallpaperIconsHost == IntPtr.Zero) return;
-                // Parent-drift OR the saved host has been destroyed → reattach.
-                if (currentParent != _wallpaperIconsHost || !IsWindow(_wallpaperIconsHost))
+                // Check each instance — any drift triggers a full reattach
+                // of ALL surfaces (so they stay in sync; cheap because the
+                // 0x052C dance is idempotent).
+                bool driftDetected = false;
+                foreach (var inst in _wallpapers)
+                {
+                    if (inst.Hwnd == IntPtr.Zero || !IsWindow(inst.Hwnd)) continue;
+                    // No saved host (Strategy C / fallback) → nothing to compare.
+                    if (inst.IconsHost == IntPtr.Zero) continue;
+                    var currentParent = GetParent(inst.Hwnd);
+                    if (currentParent != inst.IconsHost || !IsWindow(inst.IconsHost))
+                    {
+                        driftDetected = true;
+                        break;
+                    }
+                }
+                if (driftDetected)
                     await ReattachWallpaperAsync("watchdog");
             }
             catch (Exception ex) { Debug.WriteLine($"wallpaper watchdog: {ex.Message}"); }
@@ -881,37 +1186,45 @@ public partial class MainWindow : Window
             catch (Exception ex) { Debug.WriteLine($"restore icons: {ex.Message}"); }
         }
 
-        // Reparent back to top-level (HWND_DESKTOP) BEFORE Close. Once a WPF
-        // Window has been SetParent'd into a native Win32 host (WorkerW /
-        // Progman / icons-host), the WPF dispatcher loses message routing —
-        // a plain _wallpaperWindow.Close() may leave the HWND alive,
-        // including the hosted WebView2 process, which then renders a zombie
-        // copy somewhere in the desktop layer. Detaching first restores
-        // normal WPF window semantics so Close + WebView2 disposal happen
-        // cleanly and reclaim GPU/RAM.
-        if (_wallpaperWindow != null)
+        // Build the full list of instances to tear down — both active
+        // wallpapers AND the setup-only preview (if user cancelled before
+        // Apply). Iterate in reverse so additional-monitor clones close
+        // before the primary (avoids any focus-shuffle flicker on the
+        // primary monitor while clones are still alive).
+        var toCleanup = new List<WallpaperInstance>();
+        toCleanup.AddRange(_wallpapers);
+        if (_setupInstance != null) toCleanup.Add(_setupInstance);
+
+        for (int i = toCleanup.Count - 1; i >= 0; i--)
         {
+            var inst = toCleanup[i];
+            // Reparent back to top-level (HWND_DESKTOP) BEFORE Close. Once a
+            // WPF Window has been SetParent'd into a native Win32 host
+            // (WorkerW / Progman / icons-host), the WPF dispatcher loses
+            // message routing — a plain Close() may leave the HWND alive,
+            // including the hosted WebView2 process, which then renders a
+            // zombie copy somewhere in the desktop layer. Detaching first
+            // restores normal WPF window semantics so Close + WebView2
+            // disposal happen cleanly and reclaim GPU/RAM.
             try
             {
-                var helper = new System.Windows.Interop.WindowInteropHelper(_wallpaperWindow);
-                var hwnd = helper.Handle;
-                if (hwnd != IntPtr.Zero && IsWindow(hwnd))
+                if (inst.Hwnd != IntPtr.Zero && IsWindow(inst.Hwnd))
                 {
-                    var currentParent = GetParent(hwnd);
+                    var currentParent = GetParent(inst.Hwnd);
                     if (currentParent != IntPtr.Zero)
-                        SetParent(hwnd, IntPtr.Zero);
+                        SetParent(inst.Hwnd, IntPtr.Zero);
                 }
             }
-            catch (Exception ex) { Debug.WriteLine($"wallpaper detach: {ex.Message}"); }
+            catch (Exception ex) { Debug.WriteLine($"wallpaper detach[{inst.MonitorId}]: {ex.Message}"); }
+
+            try { inst.WebView?.Dispose(); }
+            catch (Exception ex) { Debug.WriteLine($"wallpaper webview dispose[{inst.MonitorId}]: {ex.Message}"); }
+            try { inst.Window?.Close(); }
+            catch (Exception ex) { Debug.WriteLine($"wallpaper close[{inst.MonitorId}]: {ex.Message}"); }
         }
 
-        try { _wallpaperWebView?.Dispose(); }
-        catch (Exception ex) { Debug.WriteLine($"wallpaper webview dispose: {ex.Message}"); }
-        try { _wallpaperWindow?.Close(); }
-        catch (Exception ex) { Debug.WriteLine($"wallpaper close: {ex.Message}"); }
-        _wallpaperWindow = null;
-        _wallpaperWebView = null;
-        _wallpaperIconsHost = IntPtr.Zero;
+        _wallpapers.Clear();
+        _setupInstance = null;
     }
 
     private void ReportWp(string text)
@@ -6298,9 +6611,10 @@ public partial class MainWindow : Window
 
         // Tear down wallpaper engine cleanly — stops watchdog, unhooks
         // SystemEvents (static events leak if not unsubscribed), reparents
-        // wallpaper HWND back to top-level so WPF Close disposes WebView2.
-        // CleanupWallpaperWindow is safe when no wallpaper is active.
-        if (_isWallpaperMode || _wallpaperWindow != null)
+        // every wallpaper HWND back to top-level so WPF Close disposes
+        // each WebView2 process. CleanupWallpaperWindow is safe when no
+        // wallpaper is active.
+        if (_isWallpaperMode || _setupInstance != null || _wallpapers.Count > 0)
         {
             try { CleanupWallpaperWindow(); }
             catch (Exception ex) { Debug.WriteLine($"wallpaper teardown on close: {ex.Message}"); }
@@ -10296,7 +10610,7 @@ public partial class MainWindow : Window
     /// </summary>
     private void BroadcastPulseToUniverse(string noteId, string op, string? context)
     {
-        if (!_universeInitialized && _wallpaperWebView == null) return;
+        if (!_universeInitialized && _wallpapers.Count == 0 && _setupInstance == null) return;
         try
         {
             // Hand-rolled JSON so we don't pull a serializer for a 4-field
@@ -10309,13 +10623,22 @@ public partial class MainWindow : Window
                 sb.Append(",\"context\":\"").Append(EscapeJson(context)).Append("\"");
             sb.Append('}');
             var json = sb.ToString();
-            // Fan out to BOTH WebView surfaces so the wallpaper window stays
-            // perfectly synced with the main app — every MCP touch flashes
-            // on both the in-program Universe and the desktop wallpaper.
+            // Fan out to ALL WebView surfaces so every Universe (main app +
+            // each per-monitor wallpaper + setup preview if active) stays
+            // perfectly synced. Every MCP touch flashes the same star on
+            // each surface.
             try { UniverseWebView?.CoreWebView2?.PostWebMessageAsJson(json); }
             catch (Exception ex) { Debug.WriteLine($"main pulse: {ex.Message}"); }
-            try { _wallpaperWebView?.CoreWebView2?.PostWebMessageAsJson(json); }
-            catch (Exception ex) { Debug.WriteLine($"wallpaper pulse: {ex.Message}"); }
+            foreach (var inst in _wallpapers)
+            {
+                try { inst.WebView?.CoreWebView2?.PostWebMessageAsJson(json); }
+                catch (Exception ex) { Debug.WriteLine($"wallpaper pulse[{inst.MonitorId}]: {ex.Message}"); }
+            }
+            if (_setupInstance != null)
+            {
+                try { _setupInstance.WebView?.CoreWebView2?.PostWebMessageAsJson(json); }
+                catch (Exception ex) { Debug.WriteLine($"wallpaper-setup pulse: {ex.Message}"); }
+            }
         }
         catch (Exception ex) { Debug.WriteLine($"BroadcastPulseToUniverse: {ex.Message}"); }
     }
@@ -10326,7 +10649,7 @@ public partial class MainWindow : Window
     /// </summary>
     private void BroadcastTokenStatsToUniverse(string text, string tooltip)
     {
-        if (!_universeInitialized && _wallpaperWebView == null) return;
+        if (!_universeInitialized && _wallpapers.Count == 0 && _setupInstance == null) return;
         try
         {
             var json = "{\"type\":\"tokenStats\",\"text\":\"" +
@@ -10337,8 +10660,16 @@ public partial class MainWindow : Window
             // element is display:none.
             try { UniverseWebView?.CoreWebView2?.PostWebMessageAsJson(json); }
             catch (Exception ex) { Debug.WriteLine($"main tokenStats: {ex.Message}"); }
-            try { _wallpaperWebView?.CoreWebView2?.PostWebMessageAsJson(json); }
-            catch (Exception ex) { Debug.WriteLine($"wallpaper tokenStats: {ex.Message}"); }
+            foreach (var inst in _wallpapers)
+            {
+                try { inst.WebView?.CoreWebView2?.PostWebMessageAsJson(json); }
+                catch (Exception ex) { Debug.WriteLine($"wallpaper tokenStats[{inst.MonitorId}]: {ex.Message}"); }
+            }
+            if (_setupInstance != null)
+            {
+                try { _setupInstance.WebView?.CoreWebView2?.PostWebMessageAsJson(json); }
+                catch (Exception ex) { Debug.WriteLine($"wallpaper-setup tokenStats: {ex.Message}"); }
+            }
         }
         catch (Exception ex) { Debug.WriteLine($"BroadcastTokenStatsToUniverse: {ex.Message}"); }
     }
