@@ -56,7 +56,6 @@ const $setIslands    = document.getElementById('set-islands');
 const $tokenChip     = document.getElementById('token-chip');
 const $tokenText     = document.getElementById('token-text');
 const $wpSetupBar    = document.getElementById('wp-setup-bar');
-const $wpRandomize   = document.getElementById('wp-randomize');
 const $wpIcons       = document.getElementById('wp-icons');
 const $wpApply       = document.getElementById('wp-apply');
 const $wpCancel      = document.getElementById('wp-cancel');
@@ -323,16 +322,9 @@ function wireWallpaperSetup() {
     if (!$wpSetupBar) return;
     $wpSetupBar.hidden = false;
 
-    // Reflect current cameraMode on the Random toggle button — if the user
-    // left Random on, the button should already read "ON" when setup opens.
-    if ($wpRandomize) {
-        const isRandom = currentSettings.cameraMode === 'random';
-        $wpRandomize.dataset.on = String(isRandom);
-        $wpRandomize.classList.toggle('primary', isRandom);
-        $wpRandomize.innerHTML = isRandom
-            ? '\u{1F3B2} Random camera · ON'
-            : '\u{1F3B2} Random camera';
-    }
+    // (Removed Random camera quick-toggle UI sync — cameraMode is now set
+    // via the main settings panel's cam-btn picker, which reads/writes the
+    // wallpaper-specific config through saveSettings's routing.)
 
     // Restore last saved camera angle + settings if available — so user
     // doesn't lose their previous setup when they reopen Wallpaper.
@@ -468,26 +460,12 @@ function wireWallpaperSetup() {
         renderMonitorChips();
     }
 
-    // Random camera = persistent showcase mode. Toggle ON keeps cycling
-    // shots forever (perfect for wallpaper); toggle OFF reverts to 'free'.
-    // Persist via currentSettings so the mode survives reload / Apply.
-    $wpRandomize?.addEventListener('click', () => {
-        const wasOn = $wpRandomize.dataset.on === 'true';
-        const nextOn = !wasOn;
-        const nextMode = nextOn ? 'random' : 'free';
-        $wpRandomize.dataset.on = String(nextOn);
-        $wpRandomize.classList.toggle('primary', nextOn);
-        $wpRandomize.innerHTML = nextOn
-            ? '\u{1F3B2} Random camera · ON'
-            : '\u{1F3B2} Random camera';
-        currentSettings = { ...currentSettings, cameraMode: nextMode };
-        scene?.setCameraMode?.(nextMode);
-        saveSettings(currentSettings);
-        // Also keep the main settings camera-mode picker in sync (matters
-        // when the same WebView is the host vs the wallpaper-setup child).
-        document.querySelectorAll('.cam-btn[data-mode]').forEach(b =>
-            b.classList.toggle('active', b.dataset.mode === nextMode));
-    });
+    // (Random camera quick-toggle handler removed — Free/Orbit/Follow/Random
+    // is now picked via the settings panel's standard .cam-btn[data-mode]
+    // group, which already calls scene.setCameraMode and saveSettings —
+    // and saveSettings now routes through the wallpaper prefs object when
+    // the URL is ?mode=wallpaper-setup, so the wallpaper's camera-mode
+    // choice is fully decoupled from the main app's settings.)
 
     // Hide/Show desktop icons — C# handles SHELLDLL_DefView ShowWindow.
     // Button label flips between "Hide" / "Show" so the action is clear.
@@ -808,8 +786,30 @@ function loadSettings() {
 }
 
 function saveSettings(s) {
-    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); }
-    catch { /* private mode / quota — silently drop */ }
+    try {
+        // CRITICAL: wallpaper-setup and finalized wallpaper instances live
+        // in their OWN WebView2 contexts with the same JS module. Writing
+        // to the main app's SETTINGS_KEY (obsidianx.universe.settings.v3)
+        // from a wallpaper context CLOBBERS the user's main-app settings
+        // every time they tweak a slider or pick a camera mode during
+        // setup. That's the "wallpaper config keeps overwriting my main
+        // app config" complaint.
+        //
+        // Fix: in any wallpaper-related URL (`?mode=wallpaper-setup` for
+        // the interactive setup, `?mode=wallpaper` for finalized clones),
+        // route settings writes into the wallpaper prefs object
+        // (obsidianx.wallpaper.prefs.v2) instead. This keeps the two
+        // configurations fully independent — wallpaper's camera mode /
+        // sliders / background never bleed into the main app's UI and
+        // vice-versa.
+        if (window.location.search.includes('mode=wallpaper')) {
+            const existing = loadWallpaperPrefs() || {};
+            existing.settings = s;
+            saveWallpaperPrefs(existing);
+        } else {
+            localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+        }
+    } catch { /* private mode / quota — silently drop */ }
 }
 
 function applySettingsToUI(s) {
