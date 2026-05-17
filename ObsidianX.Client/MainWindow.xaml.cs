@@ -5072,6 +5072,22 @@ public partial class MainWindow : Window
             _identity.SaveToFile(_identityPath);
         }
 
+        // Self-heal: previous versions had [JsonIgnore] on PrivateKey, which
+        // dropped it on save → returning users had identities that couldn't
+        // sign. The Join Brain v2 handshake (and any signed ShareRequest)
+        // requires a private key, so regenerate if missing. Keeps the
+        // DisplayName the user chose; address changes because it's derived
+        // from the new public key — that's intentional, the old identity
+        // was useless anyway.
+        if (!_identity.CanSign)
+        {
+            var name = _identity.DisplayName;
+            _identity = BrainIdentity.Generate(string.IsNullOrWhiteSpace(name)
+                ? Environment.UserName + "'s Brain"
+                : name);
+            _identity.SaveToFile(_identityPath);
+        }
+
         UpdateBrainTitleLabel();
         FullAddressText.Text = _identity.Address;
     }
@@ -7719,7 +7735,7 @@ public partial class MainWindow : Window
             JoinedAt = DateTime.UtcNow
         };
 
-        var success = await _network.ConnectAsync(_serverUrl, myInfo);
+        var success = await _network.ConnectAsync(_serverUrl, myInfo, _identity);
         if (success)
         {
             JoinNetworkBtn.Content = "\u2705 Connected";

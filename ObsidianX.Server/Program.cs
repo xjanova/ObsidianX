@@ -22,6 +22,12 @@ builder.Services.AddCors(options =>
 
 var app = builder.Build();
 
+// PR #7 — tamper-evident audit log lives next to the server binary so a
+// rotated/wiped DB can still be cross-checked. Set OBSIDIANX_AUDIT_KEY in
+// the environment for production so the HMAC chain survives restarts.
+ObsidianX.Server.Hubs.AuditLog.Initialize(
+    Path.Combine(AppContext.BaseDirectory, "audit"));
+
 app.UseCors();
 app.UseDefaultFiles();
 app.UseStaticFiles();
