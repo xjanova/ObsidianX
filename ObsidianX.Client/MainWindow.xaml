@@ -1794,43 +1794,354 @@
 
                         <!-- ═══ SHARING VIEW ═══ -->
                         <Grid x:Name="SharingView" Visibility="Collapsed">
-                            <Grid Margin="24,16">
-                                <Grid.RowDefinitions>
-                                    <RowDefinition Height="Auto"/>
-                                    <RowDefinition Height="Auto"/>
-                                    <RowDefinition Height="*"/>
-                                </Grid.RowDefinitions>
-                                <StackPanel Margin="0,0,0,16">
-                                    <TextBlock Text="Knowledge Sharing" FontSize="24" FontWeight="Bold"
-                                               Foreground="{StaticResource TextPrimaryBrush}" Margin="0,0,0,4"/>
-                                    <TextBlock Text="Share and receive knowledge with peers on the network"
-                                               FontSize="12" Foreground="{StaticResource TextSecondaryBrush}"/>
-                                </StackPanel>
+                            <!-- Main scrollable content. The Add/Edit dialog at the
+                                 bottom of this Grid is positioned as a full-area
+                                 overlay (separate Z-layer) so it floats over the
+                                 scroll content when Visible. -->
+                            <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                                <Grid Margin="24,16,24,16">
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto"/> <!-- header -->
+                                        <RowDefinition Height="Auto"/> <!-- my address -->
+                                        <RowDefinition Height="Auto"/> <!-- peers list card -->
+                                        <RowDefinition Height="Auto"/> <!-- incoming -->
+                                        <RowDefinition Height="Auto"/> <!-- activity / audit -->
+                                    </Grid.RowDefinitions>
 
-                                <!-- Incoming Requests -->
-                                <Border Grid.Row="1" Style="{StaticResource CardPanel}" Margin="0,0,0,12">
-                                    <StackPanel>
-                                        <TextBlock Text="INCOMING REQUESTS" FontSize="11" FontWeight="SemiBold"
-                                                   Foreground="{StaticResource NeonPinkBrush}" Margin="0,0,0,10"/>
-                                        <StackPanel x:Name="IncomingSharesList">
-                                            <TextBlock Text="No incoming requests" FontSize="12"
-                                                       Foreground="{StaticResource TextMutedBrush}" FontStyle="Italic"/>
-                                        </StackPanel>
+                                    <StackPanel Grid.Row="0" Margin="0,0,0,16">
+                                        <TextBlock Text="Knowledge Sharing" FontSize="24" FontWeight="Bold"
+                                                   Foreground="{StaticResource TextPrimaryBrush}" Margin="0,0,0,4"/>
+                                        <TextBlock Text="Decide which peers see which parts of your brain. Default is deny — peers see nothing until you grant them."
+                                                   FontSize="12" Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"/>
                                     </StackPanel>
-                                </Border>
 
-                                <!-- Share History -->
-                                <Border Grid.Row="2" Style="{StaticResource CardPanel}">
-                                    <StackPanel>
-                                        <TextBlock Text="SHARING HISTORY" FontSize="11" FontWeight="SemiBold"
-                                                   Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,10"/>
-                                        <StackPanel x:Name="ShareHistoryList">
-                                            <TextBlock Text="No sharing history yet" FontSize="12"
-                                                       Foreground="{StaticResource TextMutedBrush}" FontStyle="Italic"/>
+                                    <!-- ─── MY ADDRESS ─── -->
+                                    <Border Grid.Row="1" Style="{StaticResource CardPanel}" Margin="0,0,0,12">
+                                        <StackPanel>
+                                            <TextBlock Text="MY BRAIN ADDRESS" FontSize="11" FontWeight="SemiBold"
+                                                       Foreground="{StaticResource NeonCyanBrush}" Margin="0,0,0,10"/>
+                                            <TextBlock Text="Share this with peers who want to request access to your knowledge."
+                                                       FontSize="11" Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,8" TextWrapping="Wrap"/>
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <Border Background="{StaticResource SurfaceBrush}" CornerRadius="4" Padding="10,6">
+                                                    <TextBlock x:Name="SharingMyAddressText" Text="—" FontFamily="{StaticResource MonoFont}"
+                                                               FontSize="12" Foreground="{StaticResource TextPrimaryBrush}"
+                                                               VerticalAlignment="Center"/>
+                                                </Border>
+                                                <Button x:Name="SharingCopyAddrBtn" Grid.Column="1" Content="&#x1F4CB; Copy"
+                                                        Style="{StaticResource NavButton}" Click="SharingCopyAddrBtn_Click"
+                                                        Margin="8,0,0,0" Padding="10,6"/>
+                                            </Grid>
                                         </StackPanel>
-                                    </StackPanel>
+                                    </Border>
+
+                                    <!-- ─── PEERS WITH ACCESS ─── -->
+                                    <Border Grid.Row="2" Style="{StaticResource CardPanel}" Margin="0,0,0,12">
+                                        <StackPanel>
+                                            <Grid Margin="0,0,0,10">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <StackPanel Orientation="Horizontal">
+                                                    <TextBlock Text="PEERS WITH ACCESS" FontSize="11" FontWeight="SemiBold"
+                                                               Foreground="{StaticResource NeonPinkBrush}" VerticalAlignment="Center"/>
+                                                    <Border Background="{StaticResource SurfaceLightBrush}" CornerRadius="8"
+                                                            Padding="6,1" Margin="8,0,0,0" VerticalAlignment="Center">
+                                                        <TextBlock x:Name="SharingScopeCountBadge" Text="0" FontSize="10"
+                                                                   FontWeight="Bold" Foreground="{StaticResource TextPrimaryBrush}"/>
+                                                    </Border>
+                                                </StackPanel>
+                                                <Button Grid.Column="1" x:Name="SharingAddScopeBtn" Content="&#x2795;  Grant access"
+                                                        Style="{StaticResource NeonButtonFilled}" Click="SharingAddScopeBtn_Click"
+                                                        Padding="10,5"/>
+                                            </Grid>
+
+                                            <!-- Empty state -->
+                                            <Border x:Name="SharingEmptyState" Background="{StaticResource SurfaceBrush}"
+                                                    CornerRadius="6" Padding="16" Margin="0,4,0,0">
+                                                <StackPanel HorizontalAlignment="Center">
+                                                    <TextBlock Text="&#x1F510;" FontSize="28" HorizontalAlignment="Center"
+                                                               Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,6"/>
+                                                    <TextBlock Text="No peers granted access yet"
+                                                               FontSize="13" FontWeight="SemiBold"
+                                                               Foreground="{StaticResource TextSecondaryBrush}"
+                                                               HorizontalAlignment="Center"/>
+                                                    <TextBlock Text="Default-deny is on. Peers can request, but they see nothing until you grant access."
+                                                               FontSize="11" TextWrapping="Wrap" TextAlignment="Center"
+                                                               Foreground="{StaticResource TextMutedBrush}" Margin="0,4,0,0"
+                                                               MaxWidth="420"/>
+                                                </StackPanel>
+                                            </Border>
+
+                                            <!-- Populated list (filled by RefreshScopesView) -->
+                                            <StackPanel x:Name="SharingScopesList"/>
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- ─── INCOMING REQUESTS ─── -->
+                                    <Border Grid.Row="3" Style="{StaticResource CardPanel}" Margin="0,0,0,12">
+                                        <StackPanel>
+                                            <TextBlock Text="INCOMING REQUESTS" FontSize="11" FontWeight="SemiBold"
+                                                       Foreground="{StaticResource ElectricPurpleBrush}" Margin="0,0,0,10"/>
+                                            <StackPanel x:Name="IncomingSharesList">
+                                                <TextBlock Text="No incoming requests" FontSize="12"
+                                                           Foreground="{StaticResource TextMutedBrush}" FontStyle="Italic"/>
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- ─── ACTIVITY / AUDIT LOG ─── -->
+                                    <Border Grid.Row="4" Style="{StaticResource CardPanel}" Margin="0,0,0,12">
+                                        <StackPanel>
+                                            <Grid Margin="0,0,0,10">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Text="RECENT ACTIVITY" FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextMutedBrush}" VerticalAlignment="Center"/>
+                                                <TextBlock Grid.Column="1" Text="(server audit log: audit/share-audit.log)"
+                                                           FontSize="10" FontStyle="Italic"
+                                                           Foreground="{StaticResource TextMutedBrush}" VerticalAlignment="Center"/>
+                                            </Grid>
+                                            <StackPanel x:Name="ShareHistoryList">
+                                                <TextBlock Text="No sharing activity yet" FontSize="12"
+                                                           Foreground="{StaticResource TextMutedBrush}" FontStyle="Italic"/>
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+                            </ScrollViewer>
+
+                            <!-- ═════════════════════════════════════════════════ -->
+                            <!-- ADD / EDIT SCOPE DIALOG (overlay)                   -->
+                            <!-- ═════════════════════════════════════════════════ -->
+                            <Border x:Name="ScopeDialogOverlay" Visibility="Collapsed"
+                                    Background="#CC000000">
+                                <Border Width="560" MaxHeight="700" VerticalAlignment="Center"
+                                        HorizontalAlignment="Center"
+                                        Background="{StaticResource DarkPanelBrush}"
+                                        BorderBrush="{StaticResource ElectricPurpleBrush}" BorderThickness="1"
+                                        CornerRadius="10" Padding="0" Effect="{StaticResource PurpleGlow}">
+                                    <Grid>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="*"/>
+                                            <RowDefinition Height="Auto"/>
+                                        </Grid.RowDefinitions>
+
+                                        <!-- Header -->
+                                        <Border Grid.Row="0" Background="{StaticResource SurfaceBrush}"
+                                                CornerRadius="10,10,0,0" Padding="20,14">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <StackPanel>
+                                                    <TextBlock x:Name="ScopeDialogTitle" Text="Grant access"
+                                                               FontSize="18" FontWeight="Bold"
+                                                               Foreground="{StaticResource TextPrimaryBrush}"/>
+                                                    <TextBlock Text="Choose what this peer is allowed to see. Empty means deny everything (default)."
+                                                               FontSize="11" Foreground="{StaticResource TextSecondaryBrush}"
+                                                               Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                                </StackPanel>
+                                                <Button Grid.Column="1" Content="&#x2715;" Style="{StaticResource NavButton}"
+                                                        Click="ScopeDialogClose_Click" Padding="8,2" FontSize="14"/>
+                                            </Grid>
+                                        </Border>
+
+                                        <!-- Body (scrollable) -->
+                                        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Padding="20,12">
+                                            <StackPanel>
+                                                <!-- Peer address -->
+                                                <TextBlock Text="Peer brain address" FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                <Grid Margin="0,0,0,4">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBox x:Name="ScopeDialogPeerAddress" FontFamily="{StaticResource MonoFont}"
+                                                             Padding="8,6" Background="{StaticResource SurfaceBrush}"
+                                                             Foreground="{StaticResource TextPrimaryBrush}"
+                                                             BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1"
+                                                             FontSize="12"/>
+                                                    <Button Grid.Column="1" Content="Pick online&#x2026;" Style="{StaticResource NavButton}"
+                                                            Click="ScopeDialogPickPeer_Click" Margin="6,0,0,0" Padding="8,4" FontSize="11"/>
+                                                </Grid>
+                                                <TextBlock x:Name="ScopeDialogPeerHint" Text="" FontSize="10"
+                                                           Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,12"/>
+
+                                                <!-- Visibility level -->
+                                                <TextBlock Text="Visibility level" FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,6"/>
+                                                <StackPanel x:Name="ScopeDialogLevelPanel" Margin="0,0,0,12">
+                                                    <RadioButton x:Name="ScopeLevelNone" Tag="None" GroupName="ScopeLevel"
+                                                                 Foreground="{StaticResource TextPrimaryBrush}" Margin="0,2">
+                                                        <RadioButton.Content>
+                                                            <StackPanel>
+                                                                <TextBlock Text="Paused (None)" FontWeight="SemiBold"/>
+                                                                <TextBlock Text="Peer keeps saved filters but sees nothing."
+                                                                           FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                                            </StackPanel>
+                                                        </RadioButton.Content>
+                                                    </RadioButton>
+                                                    <RadioButton x:Name="ScopeLevelMetadata" Tag="MetadataOnly" GroupName="ScopeLevel"
+                                                                 Foreground="{StaticResource TextPrimaryBrush}" Margin="0,2">
+                                                        <RadioButton.Content>
+                                                            <StackPanel>
+                                                                <TextBlock Text="Metadata only" FontWeight="SemiBold"/>
+                                                                <TextBlock Text="Title + category + word count. No content."
+                                                                           FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                                            </StackPanel>
+                                                        </RadioButton.Content>
+                                                    </RadioButton>
+                                                    <RadioButton x:Name="ScopeLevelPreview" Tag="Preview" GroupName="ScopeLevel"
+                                                                 IsChecked="True"
+                                                                 Foreground="{StaticResource TextPrimaryBrush}" Margin="0,2">
+                                                        <RadioButton.Content>
+                                                            <StackPanel>
+                                                                <TextBlock Text="Preview" FontWeight="SemiBold"/>
+                                                                <TextBlock Text="Metadata + first 480 chars (mirrors brain_search preview)."
+                                                                           FontSize="10" Foreground="{StaticResource TextMutedBrush}"/>
+                                                            </StackPanel>
+                                                        </RadioButton.Content>
+                                                    </RadioButton>
+                                                    <RadioButton x:Name="ScopeLevelFull" Tag="Full" GroupName="ScopeLevel"
+                                                                 Foreground="{StaticResource TextPrimaryBrush}" Margin="0,2">
+                                                        <RadioButton.Content>
+                                                            <StackPanel Orientation="Horizontal">
+                                                                <TextBlock Text="Full" FontWeight="SemiBold"/>
+                                                                <Border Background="#33FF5566" CornerRadius="3" Padding="4,0" Margin="6,0,0,0">
+                                                                    <TextBlock Text="HIGH EXPOSURE" FontSize="9"
+                                                                               Foreground="{StaticResource DangerBrush}" FontWeight="Bold"/>
+                                                                </Border>
+                                                            </StackPanel>
+                                                        </RadioButton.Content>
+                                                    </RadioButton>
+                                                </StackPanel>
+
+                                                <!-- Allow categories -->
+                                                <TextBlock Text="Allow categories" FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                <TextBlock Text="Toggle each category the peer may see. None selected = no category-level allow (still works via tag/folder/note-id rules below)."
+                                                           FontSize="10" TextWrapping="Wrap"
+                                                           Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,6"/>
+                                                <WrapPanel x:Name="ScopeDialogCategoryChips" Margin="0,0,0,12"/>
+
+                                                <!-- Allow tags -->
+                                                <TextBlock Text="Allow tags (comma-separated)" FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                <TextBox x:Name="ScopeDialogAllowTags" Padding="8,6" Margin="0,0,0,12"
+                                                         Background="{StaticResource SurfaceBrush}"
+                                                         Foreground="{StaticResource TextPrimaryBrush}"
+                                                         BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1"
+                                                         FontSize="12"/>
+
+                                                <!-- Allow folders -->
+                                                <TextBlock Text="Allow folders (comma-separated, path prefixes)" FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                <TextBox x:Name="ScopeDialogAllowFolders" Padding="8,6" Margin="0,0,0,12"
+                                                         Background="{StaticResource SurfaceBrush}"
+                                                         Foreground="{StaticResource TextPrimaryBrush}"
+                                                         BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1"
+                                                         FontSize="12"/>
+
+                                                <!-- Advanced expander -->
+                                                <Expander x:Name="ScopeDialogAdvanced" Header="Advanced filters &#x25BC;"
+                                                          Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,12"
+                                                          FontSize="11" FontWeight="SemiBold">
+                                                    <StackPanel Margin="0,8,0,0">
+                                                        <TextBlock Text="Deny tags (override allow)" FontSize="11"
+                                                                   Foreground="{StaticResource DangerBrush}" Margin="0,0,0,4"/>
+                                                        <TextBox x:Name="ScopeDialogDenyTags" Padding="8,6" Margin="0,0,0,8"
+                                                                 Background="{StaticResource SurfaceBrush}"
+                                                                 Foreground="{StaticResource TextPrimaryBrush}"
+                                                                 BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1" FontSize="12"/>
+
+                                                        <TextBlock Text="Deny folders (override allow)" FontSize="11"
+                                                                   Foreground="{StaticResource DangerBrush}" Margin="0,0,0,4"/>
+                                                        <TextBox x:Name="ScopeDialogDenyFolders" Padding="8,6" Margin="0,0,0,8"
+                                                                 Background="{StaticResource SurfaceBrush}"
+                                                                 Foreground="{StaticResource TextPrimaryBrush}"
+                                                                 BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1" FontSize="12"/>
+
+                                                        <TextBlock Text="Per-note allowlist (note IDs, comma-separated)" FontSize="11"
+                                                                   Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                        <TextBox x:Name="ScopeDialogNoteAllowlist" Padding="8,6" Margin="0,0,0,8"
+                                                                 Background="{StaticResource SurfaceBrush}"
+                                                                 Foreground="{StaticResource TextPrimaryBrush}"
+                                                                 BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1" FontSize="12"/>
+
+                                                        <TextBlock Text="Per-note blocklist (highest priority)" FontSize="11"
+                                                                   Foreground="{StaticResource DangerBrush}" Margin="0,0,0,4"/>
+                                                        <TextBox x:Name="ScopeDialogNoteBlocklist" Padding="8,6"
+                                                                 Background="{StaticResource SurfaceBrush}"
+                                                                 Foreground="{StaticResource TextPrimaryBrush}"
+                                                                 BorderBrush="{StaticResource SurfaceLightBrush}" BorderThickness="1" FontSize="12"/>
+                                                    </StackPanel>
+                                                </Expander>
+
+                                                <!-- Expiry -->
+                                                <TextBlock Text="Expiry" FontSize="11" FontWeight="SemiBold"
+                                                           Foreground="{StaticResource TextSecondaryBrush}" Margin="0,0,0,4"/>
+                                                <ComboBox x:Name="ScopeDialogExpiry" Padding="8,4" Margin="0,0,0,12"
+                                                          Background="{StaticResource SurfaceBrush}"
+                                                          Foreground="{StaticResource TextPrimaryBrush}"
+                                                          BorderBrush="{StaticResource SurfaceLightBrush}" FontSize="12">
+                                                    <ComboBoxItem Content="7 days" Tag="7"/>
+                                                    <ComboBoxItem Content="30 days" Tag="30" IsSelected="True"/>
+                                                    <ComboBoxItem Content="90 days" Tag="90"/>
+                                                    <ComboBoxItem Content="Never (not recommended)" Tag="0"/>
+                                                </ComboBox>
+
+                                                <!-- Per-note approval -->
+                                                <CheckBox x:Name="ScopeDialogPerNote" IsChecked="True"
+                                                          Foreground="{StaticResource TextPrimaryBrush}" Margin="0,0,0,2">
+                                                    <CheckBox.Content>
+                                                        <StackPanel>
+                                                            <TextBlock Text="Require per-note approval (recommended)" FontWeight="SemiBold"/>
+                                                            <TextBlock Text="Every share request still pops up Accept/Reject even when the scope allows it."
+                                                                       FontSize="10" Foreground="{StaticResource TextMutedBrush}"
+                                                                       TextWrapping="Wrap" MaxWidth="460"/>
+                                                        </StackPanel>
+                                                    </CheckBox.Content>
+                                                </CheckBox>
+                                                <TextBlock x:Name="ScopeDialogAutoApproveWarn" Visibility="Collapsed"
+                                                           Text="&#x26A0; Auto-accept ON — matching notes will be sent without prompting."
+                                                           FontSize="10" Foreground="{StaticResource DangerBrush}"
+                                                           Margin="22,0,0,12"/>
+                                            </StackPanel>
+                                        </ScrollViewer>
+
+                                        <!-- Footer -->
+                                        <Border Grid.Row="2" Background="{StaticResource SurfaceBrush}"
+                                                CornerRadius="0,0,10,10" Padding="20,12">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock x:Name="ScopeDialogError" Text="" Grid.Column="0"
+                                                           Foreground="{StaticResource DangerBrush}" FontSize="11"
+                                                           VerticalAlignment="Center" TextWrapping="Wrap"/>
+                                                <Button Grid.Column="1" Content="Cancel" Style="{StaticResource NavButton}"
+                                                        Click="ScopeDialogClose_Click" Margin="8,0" Padding="14,6"/>
+                                                <Button Grid.Column="2" x:Name="ScopeDialogSaveBtn" Content="Save"
+                                                        Style="{StaticResource NeonButtonFilled}"
+                                                        Click="ScopeDialogSave_Click" Padding="18,6"/>
+                                            </Grid>
+                                        </Border>
+                                    </Grid>
                                 </Border>
-                            </Grid>
+                            </Border>
                         </Grid>
 
                         <!-- ═══ IMPORT / SCAN VIEW ═══

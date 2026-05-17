@@ -3,6 +3,7 @@ using System.IO;
 using System.Net.Http;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives; // ToggleButton (scope category chips)
 using Microsoft.Web.WebView2.Core;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -34,6 +35,14 @@ public partial class MainWindow : Window
     private string _serverUrl = "http://localhost:5142/brain-hub";
     private readonly List<ShareRequest> _incomingShares = [];
     private readonly List<string> _shareHistory = [];
+
+    // Phase 3 scope-management screen state.
+    // _myScopes is the in-memory mirror of what the hub has stored for us;
+    // refreshed via GetMyScopesAsync when the Sharing tab is opened.
+    // _editingScope is non-null while the Add/Edit dialog is in EDIT mode —
+    // null = ADD mode.
+    private List<ShareScope> _myScopes = [];
+    private ShareScope? _editingScope;
 
     // Auto-import + brain export
     private readonly VaultImporter _importer = new();
@@ -7061,6 +7070,7 @@ public partial class MainWindow : Window
         if (tag == "Network") _ = RefreshNetworkStats();
         if (tag == "Vault") RefreshVaultTree();
         if (tag == "Universe") _ = InitializeUniverseAsync();
+        if (tag == "Sharing") RefreshSharingScreen();
     }
 
     // ═══════════════════════════════════════
@@ -8993,6 +9003,575 @@ public partial class MainWindow : Window
                     Margin = new Thickness(0, 0, 0, 4)
                 });
             }
+        }
+    }
+
+    // ═══════════════════════════════════════
+    // SCOPE MANAGEMENT (Phase 3 Phase 2 UI) — who can see what
+    // ═══════════════════════════════════════
+    //
+    // The user grants each peer a ShareScope describing the exact slice of
+    // their vault that peer is allowed to see. Default-deny: peers see
+    // nothing until a scope is granted. The Add/Edit dialog overlays the
+    // Sharing tab so the user never loses context.
+    //
+    // Order on screen:
+    //   1. My brain address card (so user can copy + share with peers)
+    //   2. Peers with access list (one card per scope)
+    //   3. Add/Edit dialog (overlay)
+    //   4. Incoming requests (existing)
+    //   5. Recent activity / audit (existing)
+
+    /// <summary>Refresh the address text + reload scopes from the hub.</summary>
+    private async void RefreshSharingScreen()
+    {
+        if (SharingMyAddressText != null && _identity != null)
+            SharingMyAddressText.Text = _identity.Address;
+
+        await RefreshScopesView();
+    }
+
+    /// <summary>Pull the current scope list from the hub and re-render the peer cards.</summary>
+    private async Task RefreshScopesView()
+    {
+        if (SharingScopesList == null) return;
+        SharingScopesList.Children.Clear();
+
+        // If we're not connected, RefreshSharingScreen still runs on tab
+        // open — show a calm offline state instead of throwing.
+        if (!_network.IsConnected)
+        {
+            _myScopes = [];
+            SharingScopeCountBadge.Text = "0";
+            SharingEmptyState.Visibility = Visibility.Visible;
+            var offline = new TextBlock
+            {
+                Text = "Not connected to the network. Join first to see your scopes.",
+                FontSize = 11,
+                Foreground = (SolidColorBrush)FindResource("TextMutedBrush"),
+                FontStyle = FontStyles.Italic,
+                Margin = new Thickness(0, 6, 0, 0)
+            };
+            SharingScopesList.Children.Add(offline);
+            return;
+        }
+
+        try
+        {
+            _myScopes = await _network.GetMyScopesAsync();
+        }
+        catch (Exception ex)
+        {
+            _myScopes = [];
+            SharingScopeCountBadge.Text = "0";
+            SharingEmptyState.Visibility = Visibility.Visible;
+            SharingScopesList.Children.Add(new TextBlock
+            {
+                Text = $"Failed to load scopes: {ex.Message}",
+                FontSize = 11,
+                Foreground = (SolidColorBrush)FindResource("DangerBrush"),
+                FontStyle = FontStyles.Italic,
+                Margin = new Thickness(0, 6, 0, 0),
+                TextWrapping = TextWrapping.Wrap
+            });
+            return;
+        }
+
+        SharingScopeCountBadge.Text = _myScopes.Count.ToString();
+        SharingEmptyState.Visibility = _myScopes.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+
+        foreach (var scope in _myScopes.OrderByDescending(s => s.UpdatedAt))
+            SharingScopesList.Children.Add(BuildScopeCard(scope));
+    }
+
+    /// <summary>Render one scope as a card. The card surfaces risk signals
+    /// (Full level, auto-accept, no expiry) so a user can spot dangerous
+    /// grants at a glance.</summary>
+    private Border BuildScopeCard(ShareScope scope)
+    {
+        var card = new Border
+        {
+            Background = (SolidColorBrush)FindResource("SurfaceBrush"),
+            CornerRadius = new CornerRadius(8),
+            Padding = new Thickness(14, 10, 14, 10),
+            Margin = new Thickness(0, 6, 0, 0),
+            BorderThickness = new Thickness(1)
+        };
+
+        // Border tint = highest-risk colour applied (Full → magenta;
+        // expired → danger red; otherwise transparent).
+        var (levelColor, levelText) = LevelDisplay(scope.Level);
+        var isExpired = scope.ExpiresAt.HasValue && scope.ExpiresAt.Value < DateTime.UtcNow;
+        if (isExpired)
+            card.BorderBrush = (SolidColorBrush)FindResource("DangerBrush");
+        else if (scope.Level == ShareLevel.Full || scope.Level == ShareLevel.ReadWrite)
+            card.BorderBrush = (SolidColorBrush)FindResource("ElectricPurpleBrush");
+        else
+            card.BorderBrush = (SolidColorBrush)FindResource("SurfaceLightBrush");
+
+        var grid = new Grid();
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        // Row 0 — peer address + level badge
+        var peerInfo = _network.Peers.FirstOrDefault(p => p.BrainAddress == scope.PeerAddress);
+        var peerHeader = new StackPanel { Orientation = Orientation.Vertical };
+        peerHeader.Children.Add(new TextBlock
+        {
+            Text = peerInfo?.DisplayName ?? "(offline peer)",
+            FontSize = 13,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = (SolidColorBrush)FindResource("TextPrimaryBrush")
+        });
+        peerHeader.Children.Add(new TextBlock
+        {
+            Text = scope.PeerAddress,
+            FontSize = 11,
+            FontFamily = (FontFamily)FindResource("MonoFont"),
+            Foreground = (SolidColorBrush)FindResource("TextMutedBrush")
+        });
+        Grid.SetRow(peerHeader, 0); Grid.SetColumn(peerHeader, 0);
+        grid.Children.Add(peerHeader);
+
+        var levelBadge = new Border
+        {
+            Background = new SolidColorBrush(levelColor) { Opacity = 0.18 },
+            BorderBrush = new SolidColorBrush(levelColor),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(4),
+            Padding = new Thickness(8, 2, 8, 2),
+            VerticalAlignment = VerticalAlignment.Top,
+            Child = new TextBlock
+            {
+                Text = levelText,
+                FontSize = 11,
+                FontWeight = FontWeights.Bold,
+                Foreground = new SolidColorBrush(levelColor)
+            }
+        };
+        Grid.SetRow(levelBadge, 0); Grid.SetColumn(levelBadge, 1);
+        grid.Children.Add(levelBadge);
+
+        // Row 1 — what's allowed summary + risk indicators
+        var summary = new WrapPanel { Margin = new Thickness(0, 8, 0, 0) };
+        AddSummaryPill(summary, $"Categories: {scope.AllowCategories.Count}",
+            scope.AllowCategories.Count > 0 ? "NeonCyanBrush" : "TextMutedBrush");
+        AddSummaryPill(summary, $"Tags: {scope.AllowTags.Count}",
+            scope.AllowTags.Count > 0 ? "NeonCyanBrush" : "TextMutedBrush");
+        AddSummaryPill(summary, $"Folders: {scope.AllowFolders.Count}",
+            scope.AllowFolders.Count > 0 ? "NeonCyanBrush" : "TextMutedBrush");
+        if (scope.NoteIdAllowlist.Count > 0)
+            AddSummaryPill(summary, $"Notes: +{scope.NoteIdAllowlist.Count}", "NeonGreenBrush");
+        if (scope.NoteIdBlocklist.Count > 0)
+            AddSummaryPill(summary, $"Blocked: {scope.NoteIdBlocklist.Count}", "DangerBrush");
+        if (scope.DenyTags.Count > 0 || scope.DenyFolders.Count > 0)
+            AddSummaryPill(summary, $"Deny: {scope.DenyTags.Count + scope.DenyFolders.Count}", "DangerBrush");
+        Grid.SetRow(summary, 1); Grid.SetColumn(summary, 0);
+        Grid.SetColumnSpan(summary, 2);
+        grid.Children.Add(summary);
+
+        // Row 2 — expiry + flags + action buttons
+        var bottomGrid = new Grid { Margin = new Thickness(0, 8, 0, 0) };
+        bottomGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        bottomGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var flags = new WrapPanel();
+        flags.Children.Add(new TextBlock
+        {
+            Text = scope.ExpiresAt.HasValue
+                ? (isExpired
+                    ? $"⚠ EXPIRED ({scope.ExpiresAt.Value:yyyy-MM-dd})"
+                    : $"Expires {RelativeTime(scope.ExpiresAt.Value)}")
+                : "⚠ No expiry",
+            FontSize = 11,
+            Foreground = (SolidColorBrush)FindResource(
+                isExpired ? "DangerBrush"
+                : !scope.ExpiresAt.HasValue ? "DangerBrush"
+                : "TextSecondaryBrush"),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 12, 0)
+        });
+        if (!scope.RequirePerNoteApproval)
+        {
+            var autoBadge = new Border
+            {
+                Background = new SolidColorBrush(((SolidColorBrush)FindResource("DangerBrush")).Color) { Opacity = 0.2 },
+                CornerRadius = new CornerRadius(3),
+                Padding = new Thickness(6, 1, 6, 1),
+                VerticalAlignment = VerticalAlignment.Center,
+                Child = new TextBlock
+                {
+                    Text = "⚠ AUTO-ACCEPT",
+                    FontSize = 9,
+                    FontWeight = FontWeights.Bold,
+                    Foreground = (SolidColorBrush)FindResource("DangerBrush")
+                }
+            };
+            flags.Children.Add(autoBadge);
+        }
+        Grid.SetColumn(flags, 0);
+        bottomGrid.Children.Add(flags);
+
+        var actions = new StackPanel { Orientation = Orientation.Horizontal };
+        var editBtn = new Button
+        {
+            Content = "Edit",
+            Style = (Style)FindResource("NavButton"),
+            Padding = new Thickness(10, 4, 10, 4),
+            FontSize = 11,
+            Margin = new Thickness(0, 0, 6, 0)
+        };
+        editBtn.Click += (_, _) => OpenScopeDialog(scope);
+        actions.Children.Add(editBtn);
+
+        var revokeBtn = new Button
+        {
+            Content = "Revoke",
+            Style = (Style)FindResource("NavButton"),
+            Padding = new Thickness(10, 4, 10, 4),
+            FontSize = 11,
+            Foreground = (SolidColorBrush)FindResource("DangerBrush"),
+            BorderBrush = (SolidColorBrush)FindResource("DangerBrush")
+        };
+        revokeBtn.Click += async (_, _) => await RevokeScope(scope);
+        actions.Children.Add(revokeBtn);
+
+        Grid.SetColumn(actions, 1);
+        bottomGrid.Children.Add(actions);
+
+        Grid.SetRow(bottomGrid, 2); Grid.SetColumn(bottomGrid, 0);
+        Grid.SetColumnSpan(bottomGrid, 2);
+        grid.Children.Add(bottomGrid);
+
+        card.Child = grid;
+        return card;
+    }
+
+    private void AddSummaryPill(WrapPanel host, string text, string brushKey)
+    {
+        host.Children.Add(new Border
+        {
+            Background = (SolidColorBrush)FindResource("SurfaceLightBrush"),
+            CornerRadius = new CornerRadius(3),
+            Padding = new Thickness(6, 1, 6, 1),
+            Margin = new Thickness(0, 0, 6, 4),
+            Child = new TextBlock
+            {
+                Text = text,
+                FontSize = 10,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = (SolidColorBrush)FindResource(brushKey)
+            }
+        });
+    }
+
+    /// <summary>Map ShareLevel to a display string + colour. Colour reflects
+    /// exposure: green=safe (None), cyan=metadata, blue=preview, magenta=full.</summary>
+    private (System.Windows.Media.Color, string) LevelDisplay(ShareLevel level) => level switch
+    {
+        ShareLevel.None         => (((SolidColorBrush)FindResource("TextMutedBrush")).Color, "PAUSED"),
+        ShareLevel.MetadataOnly => (((SolidColorBrush)FindResource("NeonCyanBrush")).Color, "METADATA"),
+        ShareLevel.Preview      => (((SolidColorBrush)FindResource("NeonGreenBrush")).Color, "PREVIEW"),
+        ShareLevel.Full         => (((SolidColorBrush)FindResource("ElectricPurpleBrush")).Color, "FULL"),
+        ShareLevel.ReadWrite    => (((SolidColorBrush)FindResource("DangerBrush")).Color, "READ/WRITE"),
+        _ => (((SolidColorBrush)FindResource("TextMutedBrush")).Color, level.ToString().ToUpperInvariant())
+    };
+
+    /// <summary>Friendly "in 3 days" / "in 2 hours" / "5 minutes ago" formatter
+    /// for expiry timestamps. Stays compact so the card row doesn't wrap.</summary>
+    private static string RelativeTime(DateTime utc)
+    {
+        var delta = utc - DateTime.UtcNow;
+        var abs = delta.Duration();
+        var prefix = delta.TotalSeconds >= 0 ? "in " : "";
+        var suffix = delta.TotalSeconds < 0 ? " ago" : "";
+        string body = abs.TotalDays >= 1 ? $"{(int)abs.TotalDays} day{(abs.TotalDays >= 2 ? "s" : "")}"
+                    : abs.TotalHours >= 1 ? $"{(int)abs.TotalHours} hour{(abs.TotalHours >= 2 ? "s" : "")}"
+                    : $"{Math.Max(1, (int)abs.TotalMinutes)} minute{(abs.TotalMinutes >= 2 ? "s" : "")}";
+        return prefix + body + suffix;
+    }
+
+    // ── Action: copy my address ──────────────────────────────────────────
+
+    private void SharingCopyAddrBtn_Click(object sender, RoutedEventArgs e)
+    {
+        if (_identity == null) return;
+        try { Clipboard.SetText(_identity.Address); }
+        catch { /* clipboard can be locked by other apps — ignore */ }
+        StatusText.Text = "Brain address copied";
+    }
+
+    // ── Action: open Add dialog ──────────────────────────────────────────
+
+    private void SharingAddScopeBtn_Click(object sender, RoutedEventArgs e)
+    {
+        OpenScopeDialog(null);
+    }
+
+    /// <summary>Show the Add/Edit overlay. <paramref name="existing"/> = null →
+    /// blank form (Add mode); non-null → pre-populate with this scope's fields
+    /// (Edit mode).</summary>
+    private void OpenScopeDialog(ShareScope? existing)
+    {
+        _editingScope = existing;
+        ScopeDialogTitle.Text = existing == null ? "Grant access" : "Edit access";
+        ScopeDialogSaveBtn.Content = existing == null ? "Save & Grant" : "Save changes";
+        ScopeDialogError.Text = "";
+
+        // Reset peer address: blank for add, locked for edit
+        ScopeDialogPeerAddress.Text = existing?.PeerAddress ?? "";
+        ScopeDialogPeerAddress.IsReadOnly = existing != null;
+        ScopeDialogPeerHint.Text = existing == null
+            ? "Use 'Pick online…' for a peer that's currently connected."
+            : "Peer address can't be changed — revoke and re-grant if needed.";
+
+        // Level
+        var lvl = existing?.Level ?? ShareLevel.Preview;
+        ScopeLevelNone.IsChecked = lvl == ShareLevel.None;
+        ScopeLevelMetadata.IsChecked = lvl == ShareLevel.MetadataOnly;
+        ScopeLevelPreview.IsChecked = lvl == ShareLevel.Preview;
+        ScopeLevelFull.IsChecked = lvl == ShareLevel.Full;
+
+        // Category chips — rebuild based on current state
+        ScopeDialogCategoryChips.Children.Clear();
+        foreach (KnowledgeCategory cat in Enum.GetValues<KnowledgeCategory>())
+        {
+            var isOn = existing?.AllowCategories.Contains(cat) ?? false;
+            var chip = new ToggleButton
+            {
+                Content = cat.ToString().Replace("_", " "),
+                IsChecked = isOn,
+                Tag = cat,
+                Margin = new Thickness(0, 0, 6, 6),
+                Padding = new Thickness(10, 4, 10, 4),
+                Background = (SolidColorBrush)FindResource("SurfaceBrush"),
+                Foreground = (SolidColorBrush)FindResource("TextPrimaryBrush"),
+                BorderBrush = (SolidColorBrush)FindResource("SurfaceLightBrush"),
+                BorderThickness = new Thickness(1),
+                FontSize = 11,
+                Cursor = System.Windows.Input.Cursors.Hand
+            };
+            // Toggle visual: when checked, light up with cyan border + glow
+            chip.Checked += (_, _) =>
+            {
+                chip.BorderBrush = (SolidColorBrush)FindResource("NeonCyanBrush");
+                chip.Background = (SolidColorBrush)FindResource("SurfaceLightBrush");
+            };
+            chip.Unchecked += (_, _) =>
+            {
+                chip.BorderBrush = (SolidColorBrush)FindResource("SurfaceLightBrush");
+                chip.Background = (SolidColorBrush)FindResource("SurfaceBrush");
+            };
+            if (isOn)
+            {
+                chip.BorderBrush = (SolidColorBrush)FindResource("NeonCyanBrush");
+                chip.Background = (SolidColorBrush)FindResource("SurfaceLightBrush");
+            }
+            ScopeDialogCategoryChips.Children.Add(chip);
+        }
+
+        // Tag / folder lists
+        ScopeDialogAllowTags.Text = string.Join(", ", existing?.AllowTags ?? []);
+        ScopeDialogAllowFolders.Text = string.Join(", ", existing?.AllowFolders ?? []);
+        ScopeDialogDenyTags.Text = string.Join(", ", existing?.DenyTags ?? []);
+        ScopeDialogDenyFolders.Text = string.Join(", ", existing?.DenyFolders ?? []);
+        ScopeDialogNoteAllowlist.Text = string.Join(", ", existing?.NoteIdAllowlist ?? []);
+        ScopeDialogNoteBlocklist.Text = string.Join(", ", existing?.NoteIdBlocklist ?? []);
+
+        // Expiry — find closest preset or default to 30d
+        var daysRemaining = existing?.ExpiresAt is { } exp
+            ? (int)Math.Max(0, (exp - DateTime.UtcNow).TotalDays)
+            : 30;
+        var defaultIdx = 1; // 30 days
+        if (existing?.ExpiresAt == null) defaultIdx = 1;
+        else if (daysRemaining <= 7) defaultIdx = 0;
+        else if (daysRemaining <= 30) defaultIdx = 1;
+        else if (daysRemaining <= 90) defaultIdx = 2;
+        else defaultIdx = 3;
+        ScopeDialogExpiry.SelectedIndex = defaultIdx;
+
+        // Per-note approval
+        var perNote = existing?.RequirePerNoteApproval ?? true;
+        ScopeDialogPerNote.IsChecked = perNote;
+        UpdateAutoApproveWarning();
+        ScopeDialogPerNote.Checked -= ScopeDialogPerNote_Changed;
+        ScopeDialogPerNote.Unchecked -= ScopeDialogPerNote_Changed;
+        ScopeDialogPerNote.Checked += ScopeDialogPerNote_Changed;
+        ScopeDialogPerNote.Unchecked += ScopeDialogPerNote_Changed;
+
+        ScopeDialogOverlay.Visibility = Visibility.Visible;
+    }
+
+    private void ScopeDialogPerNote_Changed(object sender, RoutedEventArgs e) => UpdateAutoApproveWarning();
+
+    private void UpdateAutoApproveWarning()
+    {
+        var perNote = ScopeDialogPerNote.IsChecked ?? true;
+        ScopeDialogAutoApproveWarn.Visibility = perNote ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private void ScopeDialogClose_Click(object sender, RoutedEventArgs e)
+    {
+        ScopeDialogOverlay.Visibility = Visibility.Collapsed;
+        _editingScope = null;
+    }
+
+    // ── Action: pick from online peers ────────────────────────────────────
+
+    private void ScopeDialogPickPeer_Click(object sender, RoutedEventArgs e)
+    {
+        var others = _network.Peers
+            .Where(p => p.Status == PeerStatus.Online && p.BrainAddress != _identity?.Address)
+            .ToList();
+        if (others.Count == 0)
+        {
+            ScopeDialogPeerHint.Text = "No online peers right now. Paste an address manually.";
+            ScopeDialogPeerHint.Foreground = (SolidColorBrush)FindResource("DangerBrush");
+            return;
+        }
+
+        // Tiny popup menu — keeps the dialog lightweight; a full sub-window
+        // would be heavier than the value of this picker.
+        var menu = new System.Windows.Controls.ContextMenu();
+        foreach (var p in others)
+        {
+            var label = $"{p.DisplayName} — {p.BrainAddress}";
+            var item = new System.Windows.Controls.MenuItem { Header = label };
+            var picked = p;
+            item.Click += (_, _) =>
+            {
+                ScopeDialogPeerAddress.Text = picked.BrainAddress;
+                ScopeDialogPeerHint.Text = $"Selected: {picked.DisplayName}";
+                ScopeDialogPeerHint.Foreground = (SolidColorBrush)FindResource("TextMutedBrush");
+            };
+            menu.Items.Add(item);
+        }
+        menu.PlacementTarget = (UIElement)sender;
+        menu.IsOpen = true;
+    }
+
+    // ── Action: save the dialog ───────────────────────────────────────────
+
+    private async void ScopeDialogSave_Click(object sender, RoutedEventArgs e)
+    {
+        ScopeDialogError.Text = "";
+
+        // Validate peer address
+        var peerAddr = (ScopeDialogPeerAddress.Text ?? "").Trim();
+        if (string.IsNullOrEmpty(peerAddr) || !peerAddr.StartsWith("0xBRAIN-", StringComparison.OrdinalIgnoreCase))
+        {
+            ScopeDialogError.Text = "Peer address must start with 0xBRAIN-";
+            return;
+        }
+        if (_identity != null && string.Equals(peerAddr, _identity.Address, StringComparison.OrdinalIgnoreCase))
+        {
+            ScopeDialogError.Text = "Can't grant access to yourself.";
+            return;
+        }
+
+        // Read level
+        ShareLevel level = ShareLevel.Preview;
+        if (ScopeLevelNone.IsChecked == true) level = ShareLevel.None;
+        else if (ScopeLevelMetadata.IsChecked == true) level = ShareLevel.MetadataOnly;
+        else if (ScopeLevelPreview.IsChecked == true) level = ShareLevel.Preview;
+        else if (ScopeLevelFull.IsChecked == true) level = ShareLevel.Full;
+
+        // Build scope
+        var scope = _editingScope ?? new ShareScope
+        {
+            OwnerAddress = _identity?.Address ?? "",
+            PeerAddress = peerAddr,
+            CreatedAt = DateTime.UtcNow
+        };
+        scope.OwnerAddress = _identity?.Address ?? "";
+        scope.PeerAddress = peerAddr; // safe to re-assign — same value in edit mode
+        scope.Level = level;
+        scope.AllowCategories = ScopeDialogCategoryChips.Children
+            .OfType<ToggleButton>()
+            .Where(t => t.IsChecked == true && t.Tag is KnowledgeCategory)
+            .Select(t => (KnowledgeCategory)t.Tag!)
+            .ToList();
+        scope.AllowTags = SplitCsv(ScopeDialogAllowTags.Text);
+        scope.AllowFolders = SplitCsv(ScopeDialogAllowFolders.Text);
+        scope.DenyTags = SplitCsv(ScopeDialogDenyTags.Text);
+        scope.DenyFolders = SplitCsv(ScopeDialogDenyFolders.Text);
+        scope.NoteIdAllowlist = SplitCsv(ScopeDialogNoteAllowlist.Text);
+        scope.NoteIdBlocklist = SplitCsv(ScopeDialogNoteBlocklist.Text);
+
+        // Expiry
+        var sel = ScopeDialogExpiry.SelectedItem as System.Windows.Controls.ComboBoxItem;
+        var tag = (sel?.Tag as string) ?? "30";
+        if (int.TryParse(tag, out var days) && days > 0)
+            scope.ExpiresAt = DateTime.UtcNow.AddDays(days);
+        else
+            scope.ExpiresAt = null;
+
+        scope.RequirePerNoteApproval = ScopeDialogPerNote.IsChecked ?? true;
+
+        // Danger confirmation — Full + auto-accept + no expiry is the worst
+        // combo. Two of these three trips a "are you sure?" gate.
+        var risk = 0;
+        if (scope.Level >= ShareLevel.Full) risk++;
+        if (!scope.RequirePerNoteApproval) risk++;
+        if (!scope.ExpiresAt.HasValue) risk++;
+        if (risk >= 2)
+        {
+            var detail = $"Level: {scope.Level}\n" +
+                         (scope.RequirePerNoteApproval ? "" : "Auto-accept ON\n") +
+                         (scope.ExpiresAt.HasValue ? $"Expires: {scope.ExpiresAt:yyyy-MM-dd}" : "No expiry");
+            var confirm = MessageBox.Show(
+                $"This grant is high-exposure:\n\n{detail}\n\nProceed?",
+                "High-exposure scope",
+                MessageBoxButton.OKCancel,
+                MessageBoxImage.Warning);
+            if (confirm != MessageBoxResult.OK) return;
+        }
+
+        try
+        {
+            await _network.SetScopeAsync(scope);
+            _shareHistory.Add($"[SCOPE {(_editingScope == null ? "GRANTED" : "UPDATED")}] {scope.Level} → {peerAddr[..Math.Min(20, peerAddr.Length)]}...");
+            ScopeDialogOverlay.Visibility = Visibility.Collapsed;
+            _editingScope = null;
+            await RefreshScopesView();
+            RefreshSharingView();
+        }
+        catch (Exception ex)
+        {
+            ScopeDialogError.Text = $"Save failed: {ex.Message}";
+        }
+    }
+
+    private static List<string> SplitCsv(string? text) =>
+        string.IsNullOrWhiteSpace(text)
+            ? []
+            : text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+
+    // ── Action: revoke ────────────────────────────────────────────────────
+
+    private async Task RevokeScope(ShareScope scope)
+    {
+        var shortPeer = scope.PeerAddress.Length > 22 ? scope.PeerAddress[..22] + "…" : scope.PeerAddress;
+        var confirm = MessageBox.Show(
+            $"Revoke ALL access for {shortPeer}?\n\nThe peer will be back to default-deny.",
+            "Confirm revoke",
+            MessageBoxButton.OKCancel,
+            MessageBoxImage.Warning);
+        if (confirm != MessageBoxResult.OK) return;
+
+        try
+        {
+            await _network.RevokeScopeAsync(scope.PeerAddress);
+            _shareHistory.Add($"[SCOPE REVOKED] → {shortPeer}");
+            await RefreshScopesView();
+            RefreshSharingView();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Revoke failed: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
